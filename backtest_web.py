@@ -32,7 +32,7 @@ from pybit.unified_trading import HTTP
 # CONFIG (override via environment variable kalau perlu)
 # ============================================================
 PORT             = int(os.environ.get('PORT', 8080))
-INITIAL_BALANCE  = float(os.environ.get('INITIAL_BALANCE', '30.0'))   # modal awal PER COIN
+INITIAL_BALANCE  = float(os.environ.get('INITIAL_BALANCE', '30.0'))   # modal awal, 1 AKUN BERSAMA (bukan per coin)
 RISK_PCT         = float(os.environ.get('RISK_PCT', '0.01'))          # risk 1% balance/trade (compound)
 FEE_PCT          = float(os.environ.get('FEE_PCT', '0.00055'))        # taker fee per sisi (Bybit USDT perp)
 EMA_FAST         = int(os.environ.get('EMA_FAST', '4'))
@@ -41,6 +41,8 @@ TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '6.0'))        # trailing
 TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar trailing = 1x dist
 MIN_DIST_PCT     = float(os.environ.get('MIN_DIST_PCT', '0.002'))     # floor SL minimum 0.2%
 BACKTEST_DAYS    = int(os.environ.get('BACKTEST_DAYS', '300'))        # rentang histori H1 yang di-backtest
+MAX_CONCURRENT   = int(os.environ.get('MAX_CONCURRENT', '10'))        # slot global (aktif+pending) lintas SEMUA koin
+ALLOW_HEDGE      = os.environ.get('ALLOW_HEDGE', 'true').lower() == 'true'  # Long & Short boleh bareng per koin
 
 SYMBOLS = [
     'XPLUSDT', 'MNTUSDT', 'PLUMEUSDT', 'HYPEUSDT', 'BNBUSDT', 'BELUSDT', 'BERAUSDT', 'DASHUSDT',
@@ -62,6 +64,10 @@ _log        = []
 _phase      = 'running'     # running | done | error
 _results    = []            # list per-coin dict
 _all_trades = []            # semua trade, semua coin (utk CSV & agregat)
+_combined_result = {         # ringkasan hasil simulasi gabungan (1 balance, 1 pool slot)
+    'n_trades': 0, 'n_win': 0, 'n_loss': 0, 'wr': 0, 'total_pnl': 0, 'roi': 0,
+    'total_r': 0, 'avg_r': 0, 'final_balance': INITIAL_BALANCE, 'blocked_by_slot': 0,
+}
 
 
 def _ts():
@@ -162,16 +168,16 @@ def find_sr_events(df):
 
 
 # ============================================================
-# BACKTEST ENGINE per coin (EMA cross reversal + wick entry + flip protection)
+# PERSIAPAN PER-KOIN (precompute EMA + support/resistance events)
 # ============================================================
 
-def backtest_coin(symbol, df):
+def prepare_coin(symbol, df):
+    """Precompute semua yang dibutuhkan simulasi utk 1 koin. None kalau data kurang."""
     n = len(df)
     warmup = EMA_SLOW + 5
     if n < warmup + 10:
-        return {'symbol': symbol, 'status': 'skip', 'reason': 'data kurang', 'trades': []}
-
-    O, H, L, C = df['open'].values, df['high'].values, df['low'].values, df['close'].values
+        return None
+    O = df['open'].values; H = df['high'].values; L = df['low'].values; C = df['close'].values
     TS = df['ts'].values
     ema_fast = df['close'].ewm(span=EMA_FAST, adjust=False).mean().values
     ema_slow = df['close'].ewm(span=EMA_SLOW, adjust=False).mean().values
@@ -179,16 +185,45 @@ def backtest_coin(symbol, df):
     events_by_c3 = {}
     for e in events:
         events_by_c3.setdefault(e['c3'], []).append(e)
+    return {
+        'symbol': symbol, 'O': O, 'H': H, 'L': L, 'C': C, 'TS': TS,
+        'ema_fast': ema_fast, 'ema_slow': ema_slow, 'events_by_c3': events_by_c3,
+        'n': n, 'warmup': warmup,
+        'ts_to_idx': {int(TS[i]): i for i in range(n)},
+    }
 
-    armed   = {'Short': None, 'Long': None}
-    pending = {'Short': None, 'Long': None}
-    active  = {'Short': None, 'Long': None}
-    trades  = []
+
+# ============================================================
+# SIMULASI GABUNGAN — SEMUA KOIN BERBARENGAN, 1 BALANCE (COMPOUNDING),
+# 1 POOL MAX_CONCURRENT (persis seperti bot live: satu akun, slot terbatas
+# dipakai bersama oleh semua koin, bukan simulasi per-koin terisolasi)
+# ============================================================
+
+def run_combined_backtest(coins: dict) -> dict:
+    """coins: {symbol: prepared_dict dari prepare_coin()}"""
+    # ── timeline global: semua timestamp dari semua koin, urut kronologis ──
+    all_ts = set()
+    for c in coins.values():
+        all_ts.update(int(t) for t in c['TS'][c['warmup']: c['n'] - 1])
+    timeline = sorted(all_ts)
+
     balance = INITIAL_BALANCE
+    armed             = {}   # f"{symbol}|Short"/"Long" -> {'c1_ts'}
+    pending           = {}   # f"{symbol}|Long"/"Short" -> {...}
+    active_positions  = {}   # f"{symbol}|Long"/"Short" -> {...}
+    trades            = []
+    blocked_by_slot   = 0    # counter: berapa kali sinyal valid terpaksa dilewati krn slot penuh
 
-    def close_trade(direction, exit_price, reason, i):
+    def _akey(symbol, direction):
+        return f"{symbol}|{direction}" if ALLOW_HEDGE else symbol
+
+    def _slots_used():
+        return len(active_positions) + len(pending)
+
+    def close_trade(symbol, direction, exit_price, reason, exit_ts):
         nonlocal balance
-        pos = active[direction]
+        key = _akey(symbol, direction)
+        pos = active_positions[key]
         entry, dist, qty = pos['entry'], pos['dist'], pos['qty']
         pnl_gross = (exit_price - entry) * qty if direction == 'Long' else (entry - exit_price) * qty
         fee = (entry * qty + exit_price * qty) * FEE_PCT
@@ -198,102 +233,143 @@ def backtest_coin(symbol, df):
         trades.append({
             'symbol': symbol, 'direction': direction, 'entry': entry, 'sl': pos['sl'],
             'exit': exit_price, 'reason': reason, 'r_mult': r_mult, 'pnl_usd': pnl_net,
-            'entry_ts': pos['entry_ts'], 'exit_ts': int(TS[i]), 'balance_after': balance,
+            'entry_ts': pos['entry_ts'], 'exit_ts': exit_ts, 'balance_after': balance,
         })
-        active[direction] = None
+        del active_positions[key]
 
-    for i in range(warmup, n - 1):
-        death_cross  = ema_fast[i-1] >= ema_slow[i-1] and ema_fast[i] < ema_slow[i]
-        golden_cross = ema_fast[i-1] <= ema_slow[i-1] and ema_fast[i] > ema_slow[i]
+    n_ts = len(timeline)
+    for step, ts in enumerate(timeline):
+        if step % 500 == 0:
+            _log_msg(f"   ⏱️  Simulasi gabungan: {step}/{n_ts} timestamp | "
+                      f"balance ${balance:.2f} | slot {_slots_used()}/{MAX_CONCURRENT} | trade {len(trades)}")
 
-        # 1) FLIP PROTECTION
-        if death_cross and active['Long'] is not None:
-            close_trade('Long', O[i+1], 'FLIP', i)
-        if death_cross:
-            pending['Long'] = None
-        if golden_cross and active['Short'] is not None:
-            close_trade('Short', O[i+1], 'FLIP', i)
-        if golden_cross:
-            pending['Short'] = None
+        for symbol, c in coins.items():
+            idx = c['ts_to_idx'].get(ts)
+            if idx is None or idx < c['warmup'] or idx >= c['n'] - 1:
+                continue   # koin ini tidak punya candle di jam ini, atau di luar rentang valid
+            i = idx
+            O, H, L, C_, TS = c['O'], c['H'], c['L'], c['C'], c['TS']
+            ema_fast, ema_slow = c['ema_fast'], c['ema_slow']
 
-        # 2) SL / trailing normal
-        for direction in ('Short', 'Long'):
-            pos = active[direction]
-            if pos is None:
-                continue
-            h, l = H[i], L[i]
-            if direction == 'Long':
-                if l <= pos['stop']:
-                    reason = 'TRAIL' if pos['trail_active'] else 'SL'
-                    close_trade('Long', pos['stop'], reason, i)
+            death_cross  = ema_fast[i-1] >= ema_slow[i-1] and ema_fast[i] < ema_slow[i]
+            golden_cross = ema_fast[i-1] <= ema_slow[i-1] and ema_fast[i] > ema_slow[i]
+
+            key_long  = _akey(symbol, 'Long')
+            key_short = _akey(symbol, 'Short')
+
+            # ── 1) FLIP PROTECTION ──
+            if death_cross and key_long in active_positions:
+                close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
+            if death_cross:
+                pending.pop(key_long, None)
+            if golden_cross and key_short in active_positions:
+                close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
+            if golden_cross:
+                pending.pop(key_short, None)
+
+            # ── 2) SL / trailing normal ──
+            for direction, key in (('Short', key_short), ('Long', key_long)):
+                pos = active_positions.get(key)
+                if pos is None:
                     continue
-                pos['peak'] = max(pos['peak'], h)
-                if not pos['trail_active'] and pos['peak'] >= pos['act_price']:
-                    pos['trail_active'] = True
-                if pos['trail_active']:
-                    pos['stop'] = max(pos['stop'], pos['peak'] - TRAIL_STOP * pos['dist'])
-            else:
-                if h >= pos['stop']:
-                    reason = 'TRAIL' if pos['trail_active'] else 'SL'
-                    close_trade('Short', pos['stop'], reason, i)
+                h, l = H[i], L[i]
+                if direction == 'Long':
+                    if l <= pos['stop']:
+                        reason = 'TRAIL' if pos['trail_active'] else 'SL'
+                        close_trade(symbol, 'Long', pos['stop'], reason, int(TS[i]))
+                        continue
+                    pos['peak'] = max(pos['peak'], h)
+                    if not pos['trail_active'] and pos['peak'] >= pos['act_price']:
+                        pos['trail_active'] = True
+                    if pos['trail_active']:
+                        pos['stop'] = max(pos['stop'], pos['peak'] - TRAIL_STOP * pos['dist'])
+                else:
+                    if h >= pos['stop']:
+                        reason = 'TRAIL' if pos['trail_active'] else 'SL'
+                        close_trade(symbol, 'Short', pos['stop'], reason, int(TS[i]))
+                        continue
+                    pos['peak'] = min(pos['peak'], l)
+                    if not pos['trail_active'] and pos['peak'] <= pos['act_price']:
+                        pos['trail_active'] = True
+                    if pos['trail_active']:
+                        pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
+
+            # ── 3) cek fill pending (limit di wick) ──
+            for direction, key in (('Short', key_short), ('Long', key_long)):
+                p = pending.get(key)
+                if p is not None and key not in active_positions:
+                    filled = (H[i] >= p['entry']) if direction == 'Short' else (L[i] <= p['entry'])
+                    if filled:
+                        dist = p['dist']
+                        min_dist = p['entry'] * MIN_DIST_PCT
+                        if dist < min_dist:
+                            dist = min_dist
+                        risk_usd = balance * RISK_PCT   # <-- COMPOUNDING: 1% dari balance TERKINI (shared)
+                        qty = risk_usd / dist if dist > 0 else 0
+                        act_price = (p['entry'] + TRAIL_ACT_R * dist) if direction == 'Long' \
+                                    else (p['entry'] - TRAIL_ACT_R * dist)
+                        active_positions[key] = {
+                            'entry': p['entry'], 'sl': p['sl'], 'dist': dist, 'stop': p['sl'],
+                            'trail_active': False, 'peak': p['entry'], 'act_price': act_price,
+                            'qty': qty, 'entry_ts': int(TS[i]),
+                        }
+                        del pending[key]
+
+            # ── 4) daftarkan support/resistance valid baru -> armed (bias arah, tetap hidup) ──
+            for e in c['events_by_c3'].get(i, []):
+                if not e['valid']:
                     continue
-                pos['peak'] = min(pos['peak'], l)
-                if not pos['trail_active'] and pos['peak'] <= pos['act_price']:
-                    pos['trail_active'] = True
-                if pos['trail_active']:
-                    pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
+                if e['type'] == 'support':
+                    armed[key_short] = {'c1_ts': e['c1_ts']}
+                else:
+                    armed[key_long] = {'c1_ts': e['c1_ts']}
 
-        # 3) cek fill pending (limit di wick)
-        for direction in ('Short', 'Long'):
-            p = pending[direction]
-            if p is not None and active[direction] is None:
-                filled = (H[i] >= p['entry']) if direction == 'Short' else (L[i] <= p['entry'])
-                if filled:
-                    dist = p['dist']
-                    min_dist = p['entry'] * MIN_DIST_PCT
-                    if dist < min_dist:
-                        dist = min_dist
-                    risk_usd = balance * RISK_PCT
-                    qty = risk_usd / dist if dist > 0 else 0
-                    act_price = (p['entry'] + TRAIL_ACT_R * dist) if direction == 'Long' \
-                                else (p['entry'] - TRAIL_ACT_R * dist)
-                    active[direction] = {
-                        'entry': p['entry'], 'sl': p['sl'], 'dist': dist, 'stop': p['sl'],
-                        'trail_active': False, 'peak': p['entry'], 'act_price': act_price,
-                        'qty': qty, 'entry_ts': int(TS[i]),
-                    }
-                    pending[direction] = None
+            # ── 5) cross SEARAH -> pasang/ganti limit di wick, TUNDUK ke MAX_CONCURRENT GLOBAL ──
+            if death_cross and key_short in armed and key_short not in active_positions:
+                wick = H[i]; old_dist = wick - C_[i]
+                if old_dist > 0:
+                    if key_short not in pending and _slots_used() >= MAX_CONCURRENT:
+                        blocked_by_slot += 1
+                    else:
+                        pending[key_short] = {'entry': wick, 'sl': wick + old_dist, 'dist': old_dist}
 
-        # 4) daftarkan support/resistance valid baru -> armed (bias arah, tetap hidup)
-        for e in events_by_c3.get(i, []):
-            if not e['valid']:
-                continue
-            if e['type'] == 'support':
-                armed['Short'] = {'c1_ts': e['c1_ts']}
-            else:
-                armed['Long'] = {'c1_ts': e['c1_ts']}
+            if golden_cross and key_long in armed and key_long not in active_positions:
+                wick = L[i]; old_dist = C_[i] - wick
+                if old_dist > 0:
+                    if key_long not in pending and _slots_used() >= MAX_CONCURRENT:
+                        blocked_by_slot += 1
+                    else:
+                        pending[key_long] = {'entry': wick, 'sl': wick - old_dist, 'dist': old_dist}
 
-        # 5) cross SEARAH -> pasang/ganti limit di wick
-        if death_cross and armed['Short'] is not None and active['Short'] is None:
-            wick = H[i]; old_dist = wick - C[i]
-            if old_dist > 0:
-                pending['Short'] = {'entry': wick, 'sl': wick + old_dist, 'dist': old_dist}
-        if golden_cross and armed['Long'] is not None and active['Long'] is None:
-            wick = L[i]; old_dist = C[i] - wick
-            if old_dist > 0:
-                pending['Long'] = {'entry': wick, 'sl': wick - old_dist, 'dist': old_dist}
-
-    wins  = [t for t in trades if t['r_mult'] > 0]
+    wins = [t for t in trades if t['r_mult'] > 0]
     total_pnl = sum(t['pnl_usd'] for t in trades)
     return {
-        'symbol': symbol, 'status': 'ok', 'trades': trades,
+        'trades': trades, 'final_balance': balance, 'blocked_by_slot': blocked_by_slot,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
-        'total_pnl': total_pnl, 'final_balance': balance,
+        'total_pnl': total_pnl,
         'roi': (total_pnl / INITIAL_BALANCE * 100) if INITIAL_BALANCE else 0,
         'total_r': sum(t['r_mult'] for t in trades),
         'avg_r': (sum(t['r_mult'] for t in trades) / len(trades)) if trades else 0,
     }
+
+
+def per_symbol_breakdown(trades):
+    """Ringkas per-koin dari trade list gabungan (utk tabel per-coin di dashboard)."""
+    by_sym = {}
+    for t in trades:
+        by_sym.setdefault(t['symbol'], []).append(t)
+    out = []
+    for sym, ts_ in by_sym.items():
+        wins = [t for t in ts_ if t['r_mult'] > 0]
+        pnl  = sum(t['pnl_usd'] for t in ts_)
+        out.append({
+            'symbol': sym, 'status': 'ok', 'n_trades': len(ts_), 'n_win': len(wins),
+            'n_loss': len(ts_) - len(wins), 'wr': (len(wins) / len(ts_) * 100) if ts_ else 0,
+            'total_pnl': pnl, 'roi': None,
+            'avg_r': (sum(t['r_mult'] for t in ts_) / len(ts_)) if ts_ else 0,
+        })
+    return out
 
 
 # ============================================================
@@ -301,35 +377,50 @@ def backtest_coin(symbol, df):
 # ============================================================
 
 def _run():
-    global _phase
-    _log_msg(f"🚀 Mulai backtest {len(SYMBOLS)} coin | H1 | {BACKTEST_DAYS} hari terakhir | "
-              f"EMA {EMA_FAST}/{EMA_SLOW} | Trail 1:{TRAIL_ACT_R:.0f} | Risk {RISK_PCT*100:.0f}%/trade")
+    global _phase, _combined_result
+    _log_msg(f"🚀 Mulai backtest GABUNGAN {len(SYMBOLS)} coin | H1 | {BACKTEST_DAYS} hari terakhir")
+    _log_msg(f"   EMA {EMA_FAST}/{EMA_SLOW} | Trail 1:{TRAIL_ACT_R:.0f} | Risk {RISK_PCT*100:.0f}%/trade "
+              f"(compounding, 1 balance bersama) | MAX_CONCURRENT {MAX_CONCURRENT} slot (global, semua koin) | "
+              f"Modal awal ${INITIAL_BALANCE:.0f}")
+
+    coins = {}
     for sym in SYMBOLS:
         try:
             _log_msg(f"📥 {sym}: mengambil data H1 dari Bybit...")
             df = fetch_bybit_h1(sym)
             if df.empty:
                 _log_msg(f"   ⚠ {sym}: data kosong, skip.")
-                with _lock:
-                    _results.append({'symbol': sym, 'status': 'skip', 'reason': 'no data', 'trades': []})
                 continue
-            _log_msg(f"   {len(df):,} candle H1 diperoleh. Menjalankan backtest...")
-            result = backtest_coin(sym, df)
-            with _lock:
-                _results.append(result)
-                _all_trades.extend(result.get('trades', []))
-            if result['status'] == 'ok':
-                _log_msg(f"   ✅ {sym}: {result['n_trades']} trade | WR {result['wr']:.1f}% | "
-                          f"PnL ${result['total_pnl']:+.2f} | ROI {result['roi']:+.1f}%")
-            else:
-                _log_msg(f"   ⚠ {sym}: {result.get('reason','skip')}")
+            prepared = prepare_coin(sym, df)
+            if prepared is None:
+                _log_msg(f"   ⚠ {sym}: data kurang ({len(df)} candle), skip.")
+                continue
+            coins[sym] = prepared
+            _log_msg(f"   {len(df):,} candle H1 diperoleh & siap.")
         except Exception as e:
-            _log_msg(f"   ❌ {sym}: error — {e}")
-            with _lock:
-                _results.append({'symbol': sym, 'status': 'error', 'reason': str(e), 'trades': []})
+            _log_msg(f"   ❌ {sym}: error fetch — {e}")
+
+    if not coins:
+        _log_msg("❌ Tidak ada data koin sama sekali, backtest dibatalkan.")
+        with _lock:
+            _phase = 'error'
+        return
+
+    _log_msg(f"✅ {len(coins)}/{len(SYMBOLS)} koin siap. Menjalankan SIMULASI GABUNGAN "
+              f"(semua koin berbarengan sesuai waktu, 1 balance, {MAX_CONCURRENT} slot global)...")
+
+    result = run_combined_backtest(coins)
+
     with _lock:
+        _combined_result.update(result)
+        _all_trades.extend(result['trades'])
+        _results.extend(per_symbol_breakdown(result['trades']))
         _phase = 'done'
-    _log_msg("🏁 Backtest semua coin selesai.")
+
+    _log_msg(f"🏁 Selesai! {result['n_trades']} trade | WR {result['wr']:.1f}% | "
+              f"PnL ${result['total_pnl']:+.2f} | ROI {result['roi']:+.1f}% | "
+              f"Balance akhir ${result['final_balance']:.2f} | "
+              f"{result['blocked_by_slot']} sinyal terlewat krn MAX_CONCURRENT penuh")
 
 
 # ============================================================
@@ -374,33 +465,34 @@ def _render_html() -> bytes:
         res_cp  = list(_results)
         log_cp  = list(_log)
         trades_cp = list(_all_trades)
+        cr = dict(_combined_result)
 
     refresh = '<meta http-equiv="refresh" content="5">' if phase == 'running' else ''
     chip_cls = {'running': 'running', 'done': 'done', 'error': 'error'}.get(phase, 'running')
     chip_txt = {'running': '⏳ Sedang berjalan...', 'done': '✅ Selesai', 'error': '❌ Error'}.get(phase, phase)
 
-    ok_results = [r for r in res_cp if r.get('status') == 'ok']
     n_done, n_total = len(res_cp), len(SYMBOLS)
 
-    # ── ringkasan gabungan ──
-    total_trades = sum(r['n_trades'] for r in ok_results)
-    total_win    = sum(r['n_win'] for r in ok_results)
-    total_pnl    = sum(r['total_pnl'] for r in ok_results)
-    total_r      = sum(r['total_r'] for r in ok_results)
-    wr_overall   = (total_win / total_trades * 100) if total_trades else 0
-    avg_r        = (total_r / total_trades) if total_trades else 0
-    invested     = INITIAL_BALANCE * len(SYMBOLS)
-    roi_overall  = (total_pnl / invested * 100) if invested else 0
+    # ── ringkasan gabungan: dari SIMULASI GABUNGAN (1 balance, 1 pool slot), bukan jumlah per-coin ──
+    total_trades = cr.get('n_trades', 0)
+    total_win    = cr.get('n_win', 0)
+    total_pnl    = cr.get('total_pnl', 0)
+    wr_overall   = cr.get('wr', 0)
+    avg_r        = cr.get('avg_r', 0)
+    roi_overall  = cr.get('roi', 0)
+    final_bal    = cr.get('final_balance', INITIAL_BALANCE)
+    blocked      = cr.get('blocked_by_slot', 0)
 
     gross_win  = sum(t['pnl_usd'] for t in trades_cp if t['pnl_usd'] > 0)
     gross_loss = abs(sum(t['pnl_usd'] for t in trades_cp if t['pnl_usd'] < 0))
     pf = (gross_win / gross_loss) if gross_loss > 0 else float('inf')
 
     summary_html = f'''
-    <h2>Ringkasan Gabungan ({n_done}/{n_total} coin selesai)</h2>
+    <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
     <table>
       <tr><th>Total Trade</th><th>Win</th><th>Loss</th><th>WR%</th><th>Total PnL</th>
-          <th>ROI%</th><th>Avg R/trade</th><th>Profit Factor</th></tr>
+          <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
+          <th>Sinyal Terblokir (slot penuh)</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
@@ -408,17 +500,19 @@ def _render_html() -> bytes:
         <td class="{'g' if wr_overall>=40 else ('y' if wr_overall>=25 else 'r')}">{wr_overall:.1f}%</td>
         <td class="{'g' if total_pnl>=0 else 'r'}">${total_pnl:+.2f}</td>
         <td class="{'g' if roi_overall>=0 else 'r'}">{roi_overall:+.1f}%</td>
+        <td>${final_bal:.2f}</td>
         <td class="{'g' if avg_r>=0 else 'r'}">{avg_r:+.3f}</td>
         <td>{pf:.2f}</td>
+        <td class="y">{blocked}</td>
       </tr>
     </table>
     '''
 
-    # ── tabel per coin ──
+    # ── tabel per coin (kontribusi PnL masing-masing dari balance BERSAMA di atas) ──
     rows = ''
     for r in sorted(res_cp, key=lambda x: -(x.get('total_pnl', -1e18) if x.get('status')=='ok' else -1e18)):
         if r.get('status') != 'ok':
-            rows += (f'<tr><td>{r["symbol"]}</td><td colspan="7" class="y">'
+            rows += (f'<tr><td>{r["symbol"]}</td><td colspan="6" class="y">'
                       f'{r.get("reason","skip")}</td></tr>\n')
             continue
         pnl_c = 'g' if r['total_pnl'] >= 0 else 'r'
@@ -430,14 +524,13 @@ def _render_html() -> bytes:
             f'<td class="r">{r["n_loss"]}</td>'
             f'<td class="{wr_c}">{r["wr"]:.1f}%</td>'
             f'<td class="{pnl_c}">${r["total_pnl"]:+.2f}</td>'
-            f'<td class="{pnl_c}">{r["roi"]:+.1f}%</td>'
             f'<td>{r["avg_r"]:+.3f}</td></tr>\n'
         )
     coin_table = f'''
     <table>
       <tr><th>Coin</th><th>Trade</th><th>Win</th><th>Loss</th><th>WR%</th>
-          <th>PnL$</th><th>ROI%</th><th>Avg R</th></tr>
-      {rows or '<tr><td colspan="8" class="y">Menunggu hasil...</td></tr>'}
+          <th>Kontribusi PnL$</th><th>Avg R</th></tr>
+      {rows or '<tr><td colspan="7" class="y">Menunggu hasil...</td></tr>'}
     </table>
     '''
 
@@ -455,7 +548,8 @@ def _render_html() -> bytes:
 <body>
   <h1>🤖 Backtest EMA-Cross Reversal + Flip Protection ({len(SYMBOLS)} coin, H1)</h1>
   <p>
-    Modal: <b>${INITIAL_BALANCE:.0f}/coin</b> &nbsp;|&nbsp;
+    Modal awal: <b>${INITIAL_BALANCE:.0f}</b> (1 akun bersama, bukan per-coin) &nbsp;|&nbsp;
+    Slot maksimum: <b>{MAX_CONCURRENT}</b> (global, dipakai bersama semua koin) &nbsp;|&nbsp;
     Rentang: <b>{BACKTEST_DAYS} hari terakhir</b> &nbsp;|&nbsp;
     EMA <b>{EMA_FAST}/{EMA_SLOW}</b> &nbsp;|&nbsp;
     Trail aktif <b>1:{TRAIL_ACT_R:.0f}</b> &nbsp;|&nbsp;
@@ -464,7 +558,7 @@ def _render_html() -> bytes:
 
   {summary_html}
 
-  <h2>Hasil Per Coin</h2>
+  <h2>Kontribusi Per Coin</h2>
   <div class="tbl-wrap">{coin_table}</div>
 
   <div class="note">
@@ -472,6 +566,9 @@ def _render_html() -> bytes:
     jarak yang sama. Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
     Flip protection: cross berlawanan → keluar/batal seketika, tunggu cross searah lagi.
     Trailing aktif di rasio 1:{TRAIL_ACT_R:.0f}, lebar {TRAIL_STOP:.1f}x dist.
+    <br>⚙️ Risk {RISK_PCT*100:.0f}% dihitung dari balance TERKINI (compounding, 1 akun bersama —
+    bukan modal terpisah per coin). Kalau slot ({MAX_CONCURRENT}) penuh saat sinyal valid baru
+    muncul di koin lain, sinyal itu dilewati (lihat kolom "Sinyal Terblokir" di ringkasan).
     <br>Unduh semua trade: <a href="/trades.csv">/trades.csv</a> &nbsp;|&nbsp;
     Log mentah: <a href="/logs">/logs</a>
   </div>
