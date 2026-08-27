@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment file lokal — JANGAN di-commit ke GitHub
+.env
+
+# Log & state file
+bot.log
+entries.log
+bot_state.json
+
+# OS
+.DS_Store
+Thumbs.db
