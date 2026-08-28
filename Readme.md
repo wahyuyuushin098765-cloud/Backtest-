@@ -14,8 +14,10 @@ Default `Procfile`/`railway.toml` di repo ini menjalankan **`backtest_web.py`** 
 Hasil riset & backtest paling optimal sejauh ini (XRPUSDT 10 bulan H1, simulasi solo): **Total +249.45R, win rate 42.7%, avg +1.07R/trade**. Dashboard ini menjalankan simulasi **gabungan sungguhan** — bukan per-koin terisolasi:
 
 - **1 balance bersama** (compounding) — risk tiap trade dihitung dari % balance TERKINI, dipakai gantian oleh semua koin, persis seperti 1 akun trading beneran.
-- **1 pool `MAX_CONCURRENT`** — default **tanpa batas**, bisa diisi angka lewat Railway Variables (mis. `MAX_CONCURRENT=10`) kalau mau membatasi slot global lagi. Slot diperebutkan oleh SEMUA koin sekaligus sesuai urutan waktu asli — kalau dibatasi dan penuh saat sinyal valid baru muncul di koin lain, sinyal itu dilewati (dashboard menampilkan berapa kali ini terjadi).
-- **Analisis indikator saat cross** — tiap trade mencatat kondisi volume, ATR, jarak EMA, tren besar (vs EMA50), dan jarak SL persis di candle penyebab cross. Dashboard menampilkan rata-rata tiap indikator saat WIN vs LOSS, plus win rate per kelompok (Rendah/Sedang/Tinggi) — untuk membantu menemukan filter yang bisa menyaring sinyal yang cenderung kalah.
+- **1 pool `MAX_CONCURRENT`** — default **tanpa batas**, bisa diisi angka lewat Railway Variables (mis. `MAX_CONCURRENT=10`) kalau mau membatasi slot global lagi. Slot diperebutkan oleh SEMUA koin sekaligus sesuai urutan waktu asli.
+- **Portfolio Risk Cap** — total $ risiko dari SEMUA posisi terbuka bersamaan dibatasi persentase tertentu dari balance (default 20%, `MAX_PORTFOLIO_RISK_PCT`). Ini yang mencegah compounding meledak tak wajar saat `MAX_CONCURRENT` tanpa batas dan banyak posisi paralel dibuka bersamaan.
+- **Filter indikator opsional** (`FILTER_MIN_ATR_RATIO`, `FILTER_MIN_VOL_RATIO`, `FILTER_MAX_EMA_GAP_PCT`) — bisa diisi berdasarkan hasil tabel "Analisis Indikator saat Cross" di dashboard untuk menyaring sinyal yang cenderung kalah.
+- **Analisis indikator saat cross** — tiap trade mencatat kondisi volume, ATR, jarak EMA, tren besar (vs EMA50), dan jarak SL persis di candle penyebab cross. Dashboard menampilkan rata-rata tiap indikator saat WIN vs LOSS, win rate per kelompok (Rendah/Sedang/Tinggi), plus nilai ambang batas aktualnya — langsung bisa dipakai sebagai nilai `FILTER_*` di atas.
 
 1. **Deteksi support/resistance** (basis body candle H1):
    - Support: candle turun → candle naik → candle ketiga tidak boleh close/wick lebih rendah dari level support.
@@ -90,5 +92,6 @@ python bot_ema_flip.py     # jalankan bot live (butuh API_KEY/API_SECRET)
 
 - Backtest historis **tidak menjamin** performa live — sudah termasuk simulasi fee taker Bybit (0.055%/sisi) tapi belum termasuk slippage realistis dan kondisi likuiditas order book aktual.
 - Ini strategi agresif: win rate menengah (±40%), mengandalkan winner yang lari jauh via trailing untuk menutup banyak trade yang kena SL kecil.
+- **`MAX_CONCURRENT` tanpa batas + compounding bisa menghasilkan angka yang tidak realistis** kalau banyak koin bergerak sangat berkorelasi (naik-turun bersamaan) — `MAX_PORTFOLIO_RISK_PCT` (default 20%) membatasi ini, tapi tetap perhatikan angka ROI/Balance Akhir dengan skeptis kalau modal awal sangat kecil ($3-30) dan periode backtest panjang; fokus utama untuk menilai kualitas strategi tetap di **Win Rate** dan **Avg R/trade**, bukan angka dolar mentah.
 - Selalu mulai live dengan `RISK_PCT` kecil dan `MAX_CONCURRENT` terbatas.
 - Backtest awal dilakukan di 1 koin (XRPUSDT) — dashboard ini untuk memvalidasi ulang di **semua** koin sebelum live.

@@ -50,6 +50,20 @@ MAX_CONCURRENT = float('inf') if _mc_raw in ('', '0', 'unlimited', 'inf') else i
 
 ALLOW_HEDGE      = os.environ.get('ALLOW_HEDGE', 'true').lower() == 'true'  # Long & Short boleh bareng per koin
 
+# PORTFOLIO RISK CAP: total risiko $ dari SEMUA posisi terbuka bersamaan (dihitung dari
+# jarak entry->SL awal x qty tiap posisi -- estimasi kerugian kalau SEMUA kena SL sekaligus)
+# tidak boleh melebihi persentase ini dari balance. Ini yg mencegah compounding meledak
+# tak terkendali saat MAX_CONCURRENT tanpa batas (banyak posisi paralel, masing2 1% balance
+# yg sama, bisa jadi puluhan % risiko sesaat kalau tak dibatasi). Independen dari MAX_CONCURRENT
+# (yg cuma membatasi JUMLAH slot, bukan total $ risiko).
+MAX_PORTFOLIO_RISK_PCT = float(os.environ.get('MAX_PORTFOLIO_RISK_PCT', '0.20'))   # default 20%
+
+# FILTER OPSIONAL berbasis indikator saat cross (default semua nonaktif/0 = tidak memfilter).
+# Diisi berdasarkan hasil analisis "Analisis Indikator saat Cross" di dashboard.
+FILTER_MIN_ATR_RATIO   = float(os.environ.get('FILTER_MIN_ATR_RATIO', '0'))     # 0 = nonaktif
+FILTER_MIN_VOL_RATIO   = float(os.environ.get('FILTER_MIN_VOL_RATIO', '0'))     # 0 = nonaktif
+FILTER_MAX_EMA_GAP_PCT = float(os.environ.get('FILTER_MAX_EMA_GAP_PCT', '0'))   # 0 = nonaktif
+
 SYMBOLS = [
     'XPLUSDT', 'MNTUSDT', 'PLUMEUSDT', 'HYPEUSDT', 'BNBUSDT', 'BELUSDT', 'BERAUSDT', 'DASHUSDT',
     'DOGEUSDT', 'USUALUSDT', 'TAOUSDT', 'ESPORTSUSDT', 'LABUSDT', 'HUSDT', 'AVAXUSDT', 'REUSDT',
@@ -72,7 +86,8 @@ _results    = []            # list per-coin dict
 _all_trades = []            # semua trade, semua coin (utk CSV & agregat)
 _combined_result = {         # ringkasan hasil simulasi gabungan (1 balance, 1 pool slot)
     'n_trades': 0, 'n_win': 0, 'n_loss': 0, 'wr': 0, 'total_pnl': 0, 'roi': 0,
-    'total_r': 0, 'avg_r': 0, 'final_balance': INITIAL_BALANCE, 'blocked_by_slot': 0,
+    'total_r': 0, 'avg_r': 0, 'final_balance': INITIAL_BALANCE,
+    'blocked_by_slot': 0, 'blocked_by_risk': 0, 'blocked_by_filter': 0,
 }
 _indicator_result = {}      # hasil analisis indikator saat cross (win vs loss)
 
@@ -256,12 +271,27 @@ def run_combined_backtest(coins: dict) -> dict:
     active_positions  = {}   # f"{symbol}|Long"/"Short" -> {...}
     trades            = []
     blocked_by_slot   = 0    # counter: berapa kali sinyal valid terpaksa dilewati krn slot penuh
+    blocked_by_risk   = 0    # counter: dilewati krn total risiko portofolio sudah mentok
+    blocked_by_filter = 0    # counter: dilewati krn tidak lolos filter indikator
 
     def _akey(symbol, direction):
         return f"{symbol}|{direction}" if ALLOW_HEDGE else symbol
 
     def _slots_used():
         return len(active_positions) + len(pending)
+
+    def _current_portfolio_risk():
+        """Total $ yg akan hilang kalau SEMUA posisi terbuka kena SL awal sekaligus."""
+        return sum(p['dist'] * p['qty'] for p in active_positions.values())
+
+    def _passes_filters(ind):
+        if FILTER_MIN_ATR_RATIO > 0 and (ind.get('atr_ratio') or 0) < FILTER_MIN_ATR_RATIO:
+            return False
+        if FILTER_MIN_VOL_RATIO > 0 and (ind.get('vol_ratio') or 0) < FILTER_MIN_VOL_RATIO:
+            return False
+        if FILTER_MAX_EMA_GAP_PCT > 0 and (ind.get('ema_gap_pct') or 999) > FILTER_MAX_EMA_GAP_PCT:
+            return False
+        return True
 
     def close_trade(symbol, direction, exit_price, reason, exit_ts):
         nonlocal balance
@@ -339,7 +369,7 @@ def run_combined_backtest(coins: dict) -> dict:
                     if pos['trail_active']:
                         pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
 
-            # ── 3) cek fill pending (limit di wick) ──
+            # ── 3) cek fill pending (limit di wick), TUNDUK ke PORTFOLIO RISK CAP ──
             for direction, key in (('Short', key_short), ('Long', key_long)):
                 p = pending.get(key)
                 if p is not None and key not in active_positions:
@@ -351,6 +381,15 @@ def run_combined_backtest(coins: dict) -> dict:
                             dist = min_dist
                         risk_usd = balance * RISK_PCT   # <-- COMPOUNDING: 1% dari balance TERKINI (shared)
                         qty = risk_usd / dist if dist > 0 else 0
+
+                        # PORTFOLIO RISK CAP: kalau nambah posisi ini bikin total risiko terbuka
+                        # (estimasi rugi kalau SEMUA kena SL sekaligus) melebihi cap -> batalkan fill.
+                        prospective_risk = _current_portfolio_risk() + dist * qty
+                        if prospective_risk > balance * MAX_PORTFOLIO_RISK_PCT:
+                            blocked_by_risk += 1
+                            del pending[key]
+                            continue
+
                         act_price = (p['entry'] + TRAIL_ACT_R * dist) if direction == 'Long' \
                                     else (p['entry'] - TRAIL_ACT_R * dist)
                         ind = dict(p.get('ind') or {})
@@ -371,34 +410,40 @@ def run_combined_backtest(coins: dict) -> dict:
                 else:
                     armed[key_long] = {'c1_ts': e['c1_ts']}
 
-            # ── 5) cross SEARAH -> pasang/ganti limit di wick, TUNDUK ke MAX_CONCURRENT GLOBAL ──
-            # Tangkap indikator PERSIS di candle cross ini -> dipakai nanti utk analisis win/loss.
+            # ── 5) cross SEARAH -> pasang/ganti limit di wick, TUNDUK ke MAX_CONCURRENT & FILTER ──
+            # Tangkap indikator PERSIS di candle cross ini -> dipakai jg utk filter & analisis win/loss.
             if death_cross and key_short in armed and key_short not in active_positions:
                 wick = H[i]; old_dist = wick - C_[i]
                 if old_dist > 0:
-                    if key_short not in pending and _slots_used() >= MAX_CONCURRENT:
+                    ind = _capture_indicators(c, i)
+                    if not _passes_filters(ind):
+                        blocked_by_filter += 1
+                    elif key_short not in pending and _slots_used() >= MAX_CONCURRENT:
                         blocked_by_slot += 1
                     else:
                         pending[key_short] = {
-                            'entry': wick, 'sl': wick + old_dist, 'dist': old_dist,
-                            'ind': _capture_indicators(c, i),
+                            'entry': wick, 'sl': wick + old_dist, 'dist': old_dist, 'ind': ind,
                         }
 
             if golden_cross and key_long in armed and key_long not in active_positions:
                 wick = L[i]; old_dist = C_[i] - wick
                 if old_dist > 0:
-                    if key_long not in pending and _slots_used() >= MAX_CONCURRENT:
+                    ind = _capture_indicators(c, i)
+                    if not _passes_filters(ind):
+                        blocked_by_filter += 1
+                    elif key_long not in pending and _slots_used() >= MAX_CONCURRENT:
                         blocked_by_slot += 1
                     else:
                         pending[key_long] = {
-                            'entry': wick, 'sl': wick - old_dist, 'dist': old_dist,
-                            'ind': _capture_indicators(c, i),
+                            'entry': wick, 'sl': wick - old_dist, 'dist': old_dist, 'ind': ind,
                         }
 
     wins = [t for t in trades if t['r_mult'] > 0]
     total_pnl = sum(t['pnl_usd'] for t in trades)
     return {
-        'trades': trades, 'final_balance': balance, 'blocked_by_slot': blocked_by_slot,
+        'trades': trades, 'final_balance': balance,
+        'blocked_by_slot': blocked_by_slot, 'blocked_by_risk': blocked_by_risk,
+        'blocked_by_filter': blocked_by_filter,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
         'total_pnl': total_pnl,
@@ -528,7 +573,8 @@ def _run():
     _log_msg(f"🏁 Selesai! {result['n_trades']} trade | WR {result['wr']:.1f}% | "
               f"PnL ${result['total_pnl']:+.2f} | ROI {result['roi']:+.1f}% | "
               f"Balance akhir ${result['final_balance']:.2f} | "
-              f"{result['blocked_by_slot']} sinyal terlewat krn MAX_CONCURRENT penuh")
+              f"blocked: {result['blocked_by_slot']} (slot), {result['blocked_by_risk']} (risk cap), "
+              f"{result['blocked_by_filter']} (filter indikator)")
 
 
 # ============================================================
@@ -596,25 +642,40 @@ def _render_html() -> bytes:
     gross_loss = abs(sum(t['pnl_usd'] for t in trades_cp if t['pnl_usd'] < 0))
     pf = (gross_win / gross_loss) if gross_loss > 0 else float('inf')
 
+    blocked_slot   = cr.get('blocked_by_slot', 0)
+    blocked_risk   = cr.get('blocked_by_risk', 0)
+    blocked_filter = cr.get('blocked_by_filter', 0)
+
     summary_html = f'''
     <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
     <table>
       <tr><th>Total Trade</th><th>Win</th><th>Loss</th><th>WR%</th><th>Total PnL</th>
           <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
-          <th>Sinyal Terblokir (slot penuh)</th></tr>
+          <th>Blokir: Slot</th><th>Blokir: Risk Cap</th><th>Blokir: Filter</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
         <td class="r">{total_trades-total_win}</td>
         <td class="{'g' if wr_overall>=40 else ('y' if wr_overall>=25 else 'r')}">{wr_overall:.1f}%</td>
-        <td class="{'g' if total_pnl>=0 else 'r'}">${total_pnl:+.2f}</td>
-        <td class="{'g' if roi_overall>=0 else 'r'}">{roi_overall:+.1f}%</td>
-        <td>${final_bal:.2f}</td>
+        <td class="{'g' if total_pnl>=0 else 'r'}">${total_pnl:+,.2f}</td>
+        <td class="{'g' if roi_overall>=0 else 'r'}">{roi_overall:+,.1f}%</td>
+        <td>${final_bal:,.2f}</td>
         <td class="{'g' if avg_r>=0 else 'r'}">{avg_r:+.3f}</td>
         <td>{pf:.2f}</td>
-        <td class="y">{blocked}</td>
+        <td class="y">{blocked_slot}</td>
+        <td class="y">{blocked_risk}</td>
+        <td class="y">{blocked_filter}</td>
       </tr>
     </table>
+    <p style="font-size:12px;color:#8b949e">Portfolio risk cap: maksimal <b>{MAX_PORTFOLIO_RISK_PCT*100:.0f}%</b> dari balance boleh
+    berisiko bersamaan (dari SEMUA posisi terbuka). Filter aktif: {
+        ', '.join(f
+        for f in [
+            f'ATR≥{FILTER_MIN_ATR_RATIO}x' if FILTER_MIN_ATR_RATIO > 0 else '',
+            f'Vol≥{FILTER_MIN_VOL_RATIO}x' if FILTER_MIN_VOL_RATIO > 0 else '',
+            f'EMA gap≤{FILTER_MAX_EMA_GAP_PCT}%' if FILTER_MAX_EMA_GAP_PCT > 0 else '',
+        ] if f
+    ) or 'tidak ada (semua nonaktif)'}</p>
     '''
 
     # ── tabel per coin (kontribusi PnL masing-masing dari balance BERSAMA di atas) ──
@@ -651,8 +712,10 @@ def _render_html() -> bytes:
         fmt = d['fmt']
         avg_win_s  = fmt.format(d['avg_win']) if d['avg_win'] is not None else '-'
         avg_loss_s = fmt.format(d['avg_loss']) if d['avg_loss'] is not None else '-'
+        t1_s = fmt.format(d['t1'])
+        t2_s = fmt.format(d['t2'])
         b = d['buckets']
-        def _bucket_cell(name, thr_label):
+        def _bucket_cell(name):
             info = b[name]
             if info['wr'] is None:
                 return f'<td class="y">-</td>'
@@ -662,16 +725,18 @@ def _render_html() -> bytes:
             f'<tr><td>{d["label"]}</td>'
             f'<td class="g">{avg_win_s}</td>'
             f'<td class="r">{avg_loss_s}</td>'
-            f'{_bucket_cell("Rendah", d["t1"])}'
-            f'{_bucket_cell("Sedang", d["t2"])}'
-            f'{_bucket_cell("Tinggi", None)}'
+            f'{_bucket_cell("Rendah")}'
+            f'{_bucket_cell("Sedang")}'
+            f'{_bucket_cell("Tinggi")}'
+            f'<td style="color:#8b949e">≤{t1_s} / ≤{t2_s}</td>'
             f'</tr>\n'
         )
     ind_table = f'''
     <table>
       <tr><th>Indikator (saat candle cross)</th><th>Avg saat WIN</th><th>Avg saat LOSS</th>
-          <th>WR% - Rendah</th><th>WR% - Sedang</th><th>WR% - Tinggi</th></tr>
-      {ind_rows or '<tr><td colspan="6" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
+          <th>WR% - Rendah</th><th>WR% - Sedang</th><th>WR% - Tinggi</th>
+          <th>Batas Rendah/Sedang</th></tr>
+      {ind_rows or '<tr><td colspan="7" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
     </table>
     ''' if ind_cp else '<p class="note">Belum ada data indikator.</p>'
 
@@ -706,8 +771,12 @@ def _render_html() -> bytes:
     💡 Cara baca: bandingkan kolom "Avg saat WIN" vs "Avg saat LOSS" — kalau beda jauh, indikator itu
     berpotensi jadi FILTER. Kolom WR%-Rendah/Sedang/Tinggi membagi SEMUA trade jadi 3 kelompok
     (tercile) berdasarkan nilai indikator itu saat cross, lalu tunjukkan win rate tiap kelompok.
-    Kalau satu kelompok jauh lebih tinggi WR-nya, itu sinyal kuat buat filter (misal: "cuma entry
-    kalau volume saat cross Tinggi").
+    Kolom "Batas Rendah/Sedang" adalah nilai ambang aktual pembagi tercile (mis. "≤1.05x / ≤1.40x"
+    artinya Rendah = sampai 1.05x, Sedang = 1.05x-1.40x, Tinggi = di atas 1.40x).
+    <br>Kalau mau menerapkan filter berdasarkan hasil ini, isi env var di Railway:
+    <code>FILTER_MIN_ATR_RATIO</code>, <code>FILTER_MIN_VOL_RATIO</code>, atau
+    <code>FILTER_MAX_EMA_GAP_PCT</code> (nilai ambang batas Sedang/Tinggi di atas), lalu jalankan
+    ulang backtest untuk lihat dampaknya ke Total R & WR keseluruhan (bukan cuma tercile).
   </div>
 
   <div class="note">
