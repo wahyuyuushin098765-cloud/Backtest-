@@ -41,7 +41,13 @@ TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '6.0'))        # trailing
 TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar trailing = 1x dist
 MIN_DIST_PCT     = float(os.environ.get('MIN_DIST_PCT', '0.002'))     # floor SL minimum 0.2%
 BACKTEST_DAYS    = int(os.environ.get('BACKTEST_DAYS', '300'))        # rentang histori H1 yang di-backtest
-MAX_CONCURRENT   = int(os.environ.get('MAX_CONCURRENT', '10'))        # slot global (aktif+pending) lintas SEMUA koin
+
+# MAX_CONCURRENT: default TANPA BATAS (seperti sebelumnya). Isi angka di Railway
+# Variables (mis. MAX_CONCURRENT=10) kalau mau membatasi slot global lagi.
+# 0 / kosong / 'unlimited' = tanpa batas.
+_mc_raw = os.environ.get('MAX_CONCURRENT', '0').strip().lower()
+MAX_CONCURRENT = float('inf') if _mc_raw in ('', '0', 'unlimited', 'inf') else int(_mc_raw)
+
 ALLOW_HEDGE      = os.environ.get('ALLOW_HEDGE', 'true').lower() == 'true'  # Long & Short boleh bareng per koin
 
 SYMBOLS = [
@@ -68,6 +74,7 @@ _combined_result = {         # ringkasan hasil simulasi gabungan (1 balance, 1 p
     'n_trades': 0, 'n_win': 0, 'n_loss': 0, 'wr': 0, 'total_pnl': 0, 'roi': 0,
     'total_r': 0, 'avg_r': 0, 'final_balance': INITIAL_BALANCE, 'blocked_by_slot': 0,
 }
+_indicator_result = {}      # hasil analisis indikator saat cross (win vs loss)
 
 
 def _ts():
@@ -168,26 +175,62 @@ def find_sr_events(df):
 
 
 # ============================================================
-# PERSIAPAN PER-KOIN (precompute EMA + support/resistance events)
+# PERSIAPAN PER-KOIN (precompute EMA + support/resistance events + indikator)
 # ============================================================
 
+VOL_MA_PERIOD  = int(os.environ.get('VOL_MA_PERIOD', '20'))   # rata-rata volume utk hitung rasio
+ATR_PERIOD     = int(os.environ.get('ATR_PERIOD', '14'))
+EMA_TREND      = int(os.environ.get('EMA_TREND', '50'))       # EMA konteks tren (filter arah besar)
+
+def _calc_atr(H, L, C, period):
+    prev_close = np.roll(C, 1)
+    prev_close[0] = C[0]
+    tr = np.maximum(H - L, np.maximum(np.abs(H - prev_close), np.abs(L - prev_close)))
+    return pd.Series(tr).rolling(period, min_periods=1).mean().values
+
+
+# ============================================================
+# INDIKATOR SAAT CROSS (utk analisis pola menang/kalah)
+# ============================================================
+
+def _capture_indicators(c, i):
+    """Ambil snapshot indikator persis di candle i (candle penyebab EMA cross)."""
+    close_i = c['C'][i]
+    vol_ma  = c['vol_ma'][i]
+    atr_i   = c['atr'][i]
+    rng     = c['H'][i] - c['L'][i]
+    return {
+        'vol_ratio': (c['V'][i] / vol_ma) if vol_ma > 0 else None,          # volume vs rata2 20 candle
+        'atr_ratio': (rng / atr_i) if atr_i > 0 else None,                  # besar candle vs volatilitas normal
+        'ema_gap_pct': (abs(c['ema_fast'][i] - c['ema_slow'][i]) / close_i * 100) if close_i else None,
+        'trend_pct': ((close_i - c['ema_trend'][i]) / c['ema_trend'][i] * 100) if c['ema_trend'][i] else None,
+        'dist_pct': None,   # diisi setelah dist final diketahui (lihat di bawah)
+    }
+
+
 def prepare_coin(symbol, df):
-    """Precompute semua yang dibutuhkan simulasi utk 1 koin. None kalau data kurang."""
+    """Precompute semua yang dibutuhkan simulasi + indikator (utk analisis win/loss) utk 1 koin.
+    None kalau data kurang."""
     n = len(df)
-    warmup = EMA_SLOW + 5
+    warmup = max(EMA_SLOW, EMA_TREND, VOL_MA_PERIOD, ATR_PERIOD) + 10
     if n < warmup + 10:
         return None
     O = df['open'].values; H = df['high'].values; L = df['low'].values; C = df['close'].values
+    V = df['vol'].values if 'vol' in df.columns else np.zeros(n)
     TS = df['ts'].values
     ema_fast = df['close'].ewm(span=EMA_FAST, adjust=False).mean().values
     ema_slow = df['close'].ewm(span=EMA_SLOW, adjust=False).mean().values
+    ema_trend = df['close'].ewm(span=EMA_TREND, adjust=False).mean().values
+    vol_ma = pd.Series(V).rolling(VOL_MA_PERIOD, min_periods=1).mean().values
+    atr = _calc_atr(H, L, C, ATR_PERIOD)
     events = find_sr_events(df)
     events_by_c3 = {}
     for e in events:
         events_by_c3.setdefault(e['c3'], []).append(e)
     return {
-        'symbol': symbol, 'O': O, 'H': H, 'L': L, 'C': C, 'TS': TS,
-        'ema_fast': ema_fast, 'ema_slow': ema_slow, 'events_by_c3': events_by_c3,
+        'symbol': symbol, 'O': O, 'H': H, 'L': L, 'C': C, 'V': V, 'TS': TS,
+        'ema_fast': ema_fast, 'ema_slow': ema_slow, 'ema_trend': ema_trend,
+        'vol_ma': vol_ma, 'atr': atr, 'events_by_c3': events_by_c3,
         'n': n, 'warmup': warmup,
         'ts_to_idx': {int(TS[i]): i for i in range(n)},
     }
@@ -230,11 +273,13 @@ def run_combined_backtest(coins: dict) -> dict:
         pnl_net = pnl_gross - fee
         balance += pnl_net
         r_mult = pnl_gross / (dist * qty) if dist * qty else 0
-        trades.append({
+        trade = {
             'symbol': symbol, 'direction': direction, 'entry': entry, 'sl': pos['sl'],
             'exit': exit_price, 'reason': reason, 'r_mult': r_mult, 'pnl_usd': pnl_net,
             'entry_ts': pos['entry_ts'], 'exit_ts': exit_ts, 'balance_after': balance,
-        })
+        }
+        trade.update(pos.get('ind') or {})
+        trades.append(trade)
         del active_positions[key]
 
     n_ts = len(timeline)
@@ -308,10 +353,12 @@ def run_combined_backtest(coins: dict) -> dict:
                         qty = risk_usd / dist if dist > 0 else 0
                         act_price = (p['entry'] + TRAIL_ACT_R * dist) if direction == 'Long' \
                                     else (p['entry'] - TRAIL_ACT_R * dist)
+                        ind = dict(p.get('ind') or {})
+                        ind['dist_pct'] = (dist / p['entry'] * 100) if p['entry'] else None
                         active_positions[key] = {
                             'entry': p['entry'], 'sl': p['sl'], 'dist': dist, 'stop': p['sl'],
                             'trail_active': False, 'peak': p['entry'], 'act_price': act_price,
-                            'qty': qty, 'entry_ts': int(TS[i]),
+                            'qty': qty, 'entry_ts': int(TS[i]), 'ind': ind,
                         }
                         del pending[key]
 
@@ -325,13 +372,17 @@ def run_combined_backtest(coins: dict) -> dict:
                     armed[key_long] = {'c1_ts': e['c1_ts']}
 
             # ── 5) cross SEARAH -> pasang/ganti limit di wick, TUNDUK ke MAX_CONCURRENT GLOBAL ──
+            # Tangkap indikator PERSIS di candle cross ini -> dipakai nanti utk analisis win/loss.
             if death_cross and key_short in armed and key_short not in active_positions:
                 wick = H[i]; old_dist = wick - C_[i]
                 if old_dist > 0:
                     if key_short not in pending and _slots_used() >= MAX_CONCURRENT:
                         blocked_by_slot += 1
                     else:
-                        pending[key_short] = {'entry': wick, 'sl': wick + old_dist, 'dist': old_dist}
+                        pending[key_short] = {
+                            'entry': wick, 'sl': wick + old_dist, 'dist': old_dist,
+                            'ind': _capture_indicators(c, i),
+                        }
 
             if golden_cross and key_long in armed and key_long not in active_positions:
                 wick = L[i]; old_dist = C_[i] - wick
@@ -339,7 +390,10 @@ def run_combined_backtest(coins: dict) -> dict:
                     if key_long not in pending and _slots_used() >= MAX_CONCURRENT:
                         blocked_by_slot += 1
                     else:
-                        pending[key_long] = {'entry': wick, 'sl': wick - old_dist, 'dist': old_dist}
+                        pending[key_long] = {
+                            'entry': wick, 'sl': wick - old_dist, 'dist': old_dist,
+                            'ind': _capture_indicators(c, i),
+                        }
 
     wins = [t for t in trades if t['r_mult'] > 0]
     total_pnl = sum(t['pnl_usd'] for t in trades)
@@ -373,14 +427,66 @@ def per_symbol_breakdown(trades):
 
 
 # ============================================================
+# ANALISIS INDIKATOR SAAT CROSS — pola apa yg cenderung menang/kalah
+# ============================================================
+
+INDICATOR_INFO = {
+    'vol_ratio':   {'label': 'Volume saat cross (vs rata² 20 candle)', 'fmt': '{:.2f}x'},
+    'atr_ratio':   {'label': 'Ukuran candle cross (vs ATR14)',         'fmt': '{:.2f}x'},
+    'ema_gap_pct': {'label': 'Jarak EMA4-EMA10 saat cross',            'fmt': '{:.3f}%'},
+    'trend_pct':   {'label': 'Posisi close vs EMA50 (tren besar)',     'fmt': '{:+.2f}%'},
+    'dist_pct':    {'label': 'Jarak SL dari entry',                    'fmt': '{:.3f}%'},
+}
+
+def indicator_analysis(trades):
+    """Utk tiap indikator: avg saat WIN vs LOSS, + win rate per bucket (Rendah/Sedang/Tinggi)."""
+    out = {}
+    for key, info in INDICATOR_INFO.items():
+        pairs = [(t[key], t['r_mult'] > 0) for t in trades if t.get(key) is not None]
+        if len(pairs) < 6:
+            continue
+        win_vals  = [v for v, w in pairs if w]
+        loss_vals = [v for v, w in pairs if not w]
+        vals_sorted = sorted(v for v, _ in pairs)
+        n = len(vals_sorted)
+        t1 = vals_sorted[n // 3]
+        t2 = vals_sorted[(2 * n) // 3]
+        buckets = {'Rendah': [], 'Sedang': [], 'Tinggi': []}
+        for v, w in pairs:
+            if v <= t1:
+                buckets['Rendah'].append(w)
+            elif v <= t2:
+                buckets['Sedang'].append(w)
+            else:
+                buckets['Tinggi'].append(w)
+        out[key] = {
+            'label': info['label'], 'fmt': info['fmt'],
+            'avg_win': (sum(win_vals) / len(win_vals)) if win_vals else None,
+            'avg_loss': (sum(loss_vals) / len(loss_vals)) if loss_vals else None,
+            'n': len(pairs), 't1': t1, 't2': t2,
+            'buckets': {
+                name: {
+                    'wr': (sum(ws) / len(ws) * 100) if ws else None,
+                    'n': len(ws),
+                } for name, ws in buckets.items()
+            },
+        }
+    return out
+
+
+# ============================================================
 # BACKGROUND RUNNER
 # ============================================================
 
+def _fmt_max_concurrent():
+    return "TANPA BATAS" if MAX_CONCURRENT == float('inf') else str(int(MAX_CONCURRENT))
+
+
 def _run():
-    global _phase, _combined_result
+    global _phase, _combined_result, _indicator_result
     _log_msg(f"🚀 Mulai backtest GABUNGAN {len(SYMBOLS)} coin | H1 | {BACKTEST_DAYS} hari terakhir")
     _log_msg(f"   EMA {EMA_FAST}/{EMA_SLOW} | Trail 1:{TRAIL_ACT_R:.0f} | Risk {RISK_PCT*100:.0f}%/trade "
-              f"(compounding, 1 balance bersama) | MAX_CONCURRENT {MAX_CONCURRENT} slot (global, semua koin) | "
+              f"(compounding, 1 balance bersama) | MAX_CONCURRENT {_fmt_max_concurrent()} slot (global, semua koin) | "
               f"Modal awal ${INITIAL_BALANCE:.0f}")
 
     coins = {}
@@ -407,14 +513,16 @@ def _run():
         return
 
     _log_msg(f"✅ {len(coins)}/{len(SYMBOLS)} koin siap. Menjalankan SIMULASI GABUNGAN "
-              f"(semua koin berbarengan sesuai waktu, 1 balance, {MAX_CONCURRENT} slot global)...")
+              f"(semua koin berbarengan sesuai waktu, 1 balance, {_fmt_max_concurrent()} slot global)...")
 
     result = run_combined_backtest(coins)
+    ind_analysis = indicator_analysis(result['trades'])
 
     with _lock:
         _combined_result.update(result)
         _all_trades.extend(result['trades'])
         _results.extend(per_symbol_breakdown(result['trades']))
+        _indicator_result.update(ind_analysis)
         _phase = 'done'
 
     _log_msg(f"🏁 Selesai! {result['n_trades']} trade | WR {result['wr']:.1f}% | "
@@ -466,6 +574,7 @@ def _render_html() -> bytes:
         log_cp  = list(_log)
         trades_cp = list(_all_trades)
         cr = dict(_combined_result)
+        ind_cp = dict(_indicator_result)
 
     refresh = '<meta http-equiv="refresh" content="5">' if phase == 'running' else ''
     chip_cls = {'running': 'running', 'done': 'done', 'error': 'error'}.get(phase, 'running')
@@ -536,6 +645,36 @@ def _render_html() -> bytes:
 
     log_html = '\n'.join(log_cp[-400:])
 
+    # ── tabel analisis indikator (win vs loss) ──
+    ind_rows = ''
+    for key, d in ind_cp.items():
+        fmt = d['fmt']
+        avg_win_s  = fmt.format(d['avg_win']) if d['avg_win'] is not None else '-'
+        avg_loss_s = fmt.format(d['avg_loss']) if d['avg_loss'] is not None else '-'
+        b = d['buckets']
+        def _bucket_cell(name, thr_label):
+            info = b[name]
+            if info['wr'] is None:
+                return f'<td class="y">-</td>'
+            cls = 'g' if info['wr'] >= 45 else ('y' if info['wr'] >= 30 else 'r')
+            return f'<td class="{cls}">{info["wr"]:.1f}% <span style="color:#8b949e">(n={info["n"]})</span></td>'
+        ind_rows += (
+            f'<tr><td>{d["label"]}</td>'
+            f'<td class="g">{avg_win_s}</td>'
+            f'<td class="r">{avg_loss_s}</td>'
+            f'{_bucket_cell("Rendah", d["t1"])}'
+            f'{_bucket_cell("Sedang", d["t2"])}'
+            f'{_bucket_cell("Tinggi", None)}'
+            f'</tr>\n'
+        )
+    ind_table = f'''
+    <table>
+      <tr><th>Indikator (saat candle cross)</th><th>Avg saat WIN</th><th>Avg saat LOSS</th>
+          <th>WR% - Rendah</th><th>WR% - Sedang</th><th>WR% - Tinggi</th></tr>
+      {ind_rows or '<tr><td colspan="6" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
+    </table>
+    ''' if ind_cp else '<p class="note">Belum ada data indikator.</p>'
+
     return f'''<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -549,7 +688,7 @@ def _render_html() -> bytes:
   <h1>🤖 Backtest EMA-Cross Reversal + Flip Protection ({len(SYMBOLS)} coin, H1)</h1>
   <p>
     Modal awal: <b>${INITIAL_BALANCE:.0f}</b> (1 akun bersama, bukan per-coin) &nbsp;|&nbsp;
-    Slot maksimum: <b>{MAX_CONCURRENT}</b> (global, dipakai bersama semua koin) &nbsp;|&nbsp;
+    Slot maksimum: <b>{_fmt_max_concurrent()}</b> (global, dipakai bersama semua koin) &nbsp;|&nbsp;
     Rentang: <b>{BACKTEST_DAYS} hari terakhir</b> &nbsp;|&nbsp;
     EMA <b>{EMA_FAST}/{EMA_SLOW}</b> &nbsp;|&nbsp;
     Trail aktif <b>1:{TRAIL_ACT_R:.0f}</b> &nbsp;|&nbsp;
@@ -560,6 +699,16 @@ def _render_html() -> bytes:
 
   <h2>Kontribusi Per Coin</h2>
   <div class="tbl-wrap">{coin_table}</div>
+
+  <h2>Analisis Indikator saat Cross — Pola Menang vs Kalah</h2>
+  <div class="tbl-wrap">{ind_table}</div>
+  <div class="note">
+    💡 Cara baca: bandingkan kolom "Avg saat WIN" vs "Avg saat LOSS" — kalau beda jauh, indikator itu
+    berpotensi jadi FILTER. Kolom WR%-Rendah/Sedang/Tinggi membagi SEMUA trade jadi 3 kelompok
+    (tercile) berdasarkan nilai indikator itu saat cross, lalu tunjukkan win rate tiap kelompok.
+    Kalau satu kelompok jauh lebih tinggi WR-nya, itu sinyal kuat buat filter (misal: "cuma entry
+    kalau volume saat cross Tinggi").
+  </div>
 
   <div class="note">
     💡 Entry = LIMIT di wick candle penyebab EMA cross. SL = wick diperpanjang sejauh
@@ -586,7 +735,9 @@ def _trades_csv() -> bytes:
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=[
         'symbol', 'direction', 'entry', 'sl', 'exit', 'reason', 'r_mult',
-        'pnl_usd', 'entry_ts', 'exit_ts', 'balance_after'])
+        'pnl_usd', 'entry_ts', 'exit_ts', 'balance_after',
+        'vol_ratio', 'atr_ratio', 'ema_gap_pct', 'trend_pct', 'dist_pct'],
+        extrasaction='ignore')
     writer.writeheader()
     for t in trades_cp:
         writer.writerow(t)

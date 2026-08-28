@@ -14,7 +14,8 @@ Default `Procfile`/`railway.toml` di repo ini menjalankan **`backtest_web.py`** 
 Hasil riset & backtest paling optimal sejauh ini (XRPUSDT 10 bulan H1, simulasi solo): **Total +249.45R, win rate 42.7%, avg +1.07R/trade**. Dashboard ini menjalankan simulasi **gabungan sungguhan** — bukan per-koin terisolasi:
 
 - **1 balance bersama** (compounding) — risk tiap trade dihitung dari % balance TERKINI, dipakai gantian oleh semua koin, persis seperti 1 akun trading beneran.
-- **1 pool `MAX_CONCURRENT`** — slot posisi/limit terbatas dan diperebutkan oleh SEMUA koin sekaligus sesuai urutan waktu asli. Kalau slot penuh saat sinyal valid baru muncul di koin lain, sinyal itu dilewati (dashboard menampilkan berapa kali ini terjadi).
+- **1 pool `MAX_CONCURRENT`** — default **tanpa batas**, bisa diisi angka lewat Railway Variables (mis. `MAX_CONCURRENT=10`) kalau mau membatasi slot global lagi. Slot diperebutkan oleh SEMUA koin sekaligus sesuai urutan waktu asli — kalau dibatasi dan penuh saat sinyal valid baru muncul di koin lain, sinyal itu dilewati (dashboard menampilkan berapa kali ini terjadi).
+- **Analisis indikator saat cross** — tiap trade mencatat kondisi volume, ATR, jarak EMA, tren besar (vs EMA50), dan jarak SL persis di candle penyebab cross. Dashboard menampilkan rata-rata tiap indikator saat WIN vs LOSS, plus win rate per kelompok (Rendah/Sedang/Tinggi) — untuk membantu menemukan filter yang bisa menyaring sinyal yang cenderung kalah.
 
 1. **Deteksi support/resistance** (basis body candle H1):
    - Support: candle turun → candle naik → candle ketiga tidak boleh close/wick lebih rendah dari level support.
