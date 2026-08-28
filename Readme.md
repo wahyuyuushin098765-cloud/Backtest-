@@ -15,9 +15,10 @@ Hasil riset & backtest paling optimal sejauh ini (XRPUSDT 10 bulan H1, simulasi 
 
 - **1 balance bersama** (compounding) — risk tiap trade dihitung dari % balance TERKINI, dipakai gantian oleh semua koin, persis seperti 1 akun trading beneran.
 - **1 pool `MAX_CONCURRENT`** — default **tanpa batas**, bisa diisi angka lewat Railway Variables (mis. `MAX_CONCURRENT=10`) kalau mau membatasi slot global lagi. Slot diperebutkan oleh SEMUA koin sekaligus sesuai urutan waktu asli.
-- **Portfolio Risk Cap** — total $ risiko dari SEMUA posisi terbuka bersamaan dibatasi persentase tertentu dari balance (default 20%, `MAX_PORTFOLIO_RISK_PCT`). Ini yang mencegah compounding meledak tak wajar saat `MAX_CONCURRENT` tanpa batas dan banyak posisi paralel dibuka bersamaan.
-- **Filter indikator opsional** (`FILTER_MIN_ATR_RATIO`, `FILTER_MIN_VOL_RATIO`, `FILTER_MAX_EMA_GAP_PCT`) — bisa diisi berdasarkan hasil tabel "Analisis Indikator saat Cross" di dashboard untuk menyaring sinyal yang cenderung kalah.
-- **Analisis indikator saat cross** — tiap trade mencatat kondisi volume, ATR, jarak EMA, tren besar (vs EMA50), dan jarak SL persis di candle penyebab cross. Dashboard menampilkan rata-rata tiap indikator saat WIN vs LOSS, win rate per kelompok (Rendah/Sedang/Tinggi), plus nilai ambang batas aktualnya — langsung bisa dipakai sebagai nilai `FILTER_*` di atas.
+- **Margin & Leverage (constraint paling realistis)** — tiap posisi butuh margin = notional/leverage, dan total margin dari SEMUA posisi terbuka dibatasi persentase balance (`MARGIN_USAGE_CAP`, default 90%). Ini meniru batasan asli Bybit: risk 1% BUKAN berarti ada "99 kesempatan lagi" — begitu margin habis, order baru otomatis ditolak, sama seperti akun beneran.
+- **Filter indikator** (`FILTER_MIN_ATR_RATIO`, `FILTER_MIN_VOL_RATIO`, `FILTER_MAX_EMA_GAP_PCT`) — default **ATR ratio ≥ 1.0 sudah aktif** (indikator dengan spread win-rate paling kuat dari hasil riset). Bisa diubah/dimatikan berdasarkan tabel "Analisis Indikator saat Cross" di dashboard.
+- **Analisis indikator saat cross** — tiap trade mencatat kondisi volume, ATR, jarak EMA, tren besar (vs EMA50), dan jarak SL persis di candle penyebab cross. Dashboard menampilkan rata-rata tiap indikator saat WIN vs LOSS, win rate per kelompok (Rendah/Sedang/Tinggi), plus nilai ambang batas aktualnya.
+- **Rentang backtest FIX** (`BACKTEST_START_DATE` — `BACKTEST_END_DATE`, default 1 Agustus 2025 — 31 Juli 2026), bukan rolling "N hari terakhir" — supaya data bisa **di-cache** dan tidak perlu fetch ulang dari Bybit tiap kali kamu ubah variable strategi.
 
 1. **Deteksi support/resistance** (basis body candle H1):
    - Support: candle turun → candle naik → candle ketiga tidak boleh close/wick lebih rendah dari level support.
@@ -48,13 +49,23 @@ Hasil riset & backtest paling optimal sejauh ini (XRPUSDT 10 bulan H1, simulasi 
 2. Buat project baru di [Railway](https://railway.app), connect ke repo.
 3. Railway otomatis jalankan `python backtest_web.py` (dari `railway.toml`/`Procfile`).
 4. **Tidak perlu isi API key apapun** — data candle diambil dari endpoint publik Bybit.
-5. (Opsional) atur env var di tab Variables — lihat `.env.example` untuk daftar lengkap: `BACKTEST_DAYS`, `TRAIL_ACT_R`, `RISK_PCT`, `INITIAL_BALANCE`, dll.
+5. (Opsional) atur env var di tab Variables — lihat `.env.example` untuk daftar lengkap: `BACKTEST_START_DATE`, `BACKTEST_END_DATE`, `TRAIL_ACT_R`, `RISK_PCT`, `INITIAL_BALANCE`, `LEVERAGE`, `FILTER_MIN_ATR_RATIO`, dll.
 6. Deploy. Buka domain Railway kamu di browser — dashboard akan menampilkan progress backtest tiap coin secara realtime (auto-refresh tiap 5 detik selama masih berjalan), lalu ringkasan Win Rate, Total PnL, ROI, Profit Factor, dan breakdown per-coin begitu selesai.
 7. Endpoint tambahan:
    - `/trades.csv` — unduh semua trade hasil backtest (untuk analisis lebih lanjut)
    - `/logs` — log mentah proses backtest
 
-**Catatan:** backtest butuh waktu (tergantung jumlah coin & `BACKTEST_DAYS`) karena fetch data H1 dari Bybit satu per satu. Untuk 44 coin × 300 hari, biasanya selesai dalam beberapa menit. Halaman dashboard bisa dibiarkan terbuka sambil menunggu (auto-refresh).
+**Catatan:** backtest butuh waktu (tergantung jumlah coin) karena fetch data H1 dari Bybit satu per satu — untuk 45 coin biasanya belasan menit di run PERTAMA. Halaman dashboard bisa dibiarkan terbuka sambil menunggu (auto-refresh).
+
+### Setup cache persisten (Railway Volume) — sangat disarankan
+
+Rentang backtest sekarang **fix** (`BACKTEST_START_DATE` — `BACKTEST_END_DATE`, default 1 Agustus 2025 s/d 31 Juli 2026), bukan rolling "N hari terakhir" — supaya data H1 yang sudah diambil bisa disimpan (cache) dan dipakai ulang. Tanpa Volume, cache tetap jalan tapi hilang tiap redeploy container.
+
+1. Di project Railway, buka service backtest → tab **Settings** → **Volumes** → **New Volume**.
+2. Mount path: `/data`
+3. Tambah env var: `CACHE_DIR=/data/cache`
+4. Redeploy sekali (fetch pertama tetap perlu waktu, hasilnya disimpan ke volume).
+5. Setelah itu, **ubah variable strategi apapun** (`TRAIL_ACT_R`, `FILTER_MIN_ATR_RATIO`, `RISK_PCT`, `LEVERAGE`, dll — kecuali `BACKTEST_START_DATE`/`BACKTEST_END_DATE`) **dan redeploy akan langsung pakai cache** — backtest selesai dalam hitungan detik, bukan belasan menit.
 
 ---
 
@@ -90,8 +101,8 @@ python bot_ema_flip.py     # jalankan bot live (butuh API_KEY/API_SECRET)
 
 ## Peringatan
 
-- Backtest historis **tidak menjamin** performa live — sudah termasuk simulasi fee taker Bybit (0.055%/sisi) tapi belum termasuk slippage realistis dan kondisi likuiditas order book aktual.
-- Ini strategi agresif: win rate menengah (±40%), mengandalkan winner yang lari jauh via trailing untuk menutup banyak trade yang kena SL kecil.
-- **`MAX_CONCURRENT` tanpa batas + compounding bisa menghasilkan angka yang tidak realistis** kalau banyak koin bergerak sangat berkorelasi (naik-turun bersamaan) — `MAX_PORTFOLIO_RISK_PCT` (default 20%) membatasi ini, tapi tetap perhatikan angka ROI/Balance Akhir dengan skeptis kalau modal awal sangat kecil ($3-30) dan periode backtest panjang; fokus utama untuk menilai kualitas strategi tetap di **Win Rate** dan **Avg R/trade**, bukan angka dolar mentah.
+- Backtest historis **tidak menjamin** performa live — sudah termasuk simulasi fee taker Bybit (0.055%/sisi) dan constraint margin/leverage realistis, tapi belum termasuk slippage aktual dan kondisi likuiditas order book.
+- Ini strategi agresif: win rate menengah (±40-50% tergantung filter), mengandalkan winner yang lari jauh via trailing untuk menutup banyak trade yang kena SL kecil.
+- `MAX_CONCURRENT` tanpa batas sekarang **aman** dipakai — constraint `LEVERAGE`/`MARGIN_USAGE_CAP` akan otomatis menahan pertumbuhan balance kalau margin sudah habis, persis seperti akun Bybit beneran (order baru ditolak, bukan compounding tanpa batas).
 - Selalu mulai live dengan `RISK_PCT` kecil dan `MAX_CONCURRENT` terbatas.
 - Backtest awal dilakukan di 1 koin (XRPUSDT) — dashboard ini untuk memvalidasi ulang di **semua** koin sebelum live.

@@ -40,29 +40,41 @@ EMA_SLOW         = int(os.environ.get('EMA_SLOW', '10'))
 TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '6.0'))        # trailing aktif di rasio 1:6
 TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar trailing = 1x dist
 MIN_DIST_PCT     = float(os.environ.get('MIN_DIST_PCT', '0.002'))     # floor SL minimum 0.2%
-BACKTEST_DAYS    = int(os.environ.get('BACKTEST_DAYS', '300'))        # rentang histori H1 yang di-backtest
+
+# Rentang backtest: FIX (bukan "N hari terakhir") supaya data bisa di-cache & tidak
+# perlu fetch ulang dari Bybit tiap kali variable diubah. Format: YYYY-MM-DD.
+BACKTEST_START_DATE = os.environ.get('BACKTEST_START_DATE', '2025-08-01')
+BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', '2026-07-31')
+
+# LEVERAGE & MARGIN: constraint paling realistis dari exchange asli. Risk 1% BUKAN berarti
+# ada "99 kesempatan lagi" -- tiap posisi tetap butuh MARGIN (notional/leverage), dan kalau
+# margin yg dipakai SEMUA posisi terbuka sudah habis, Bybit tidak akan izinkan order baru
+# sampai ada yg closed. Constraint inilah yg secara alami membatasi berapa banyak posisi
+# bisa dibuka bersamaan -- BUKAN cuma persentase risiko semata.
+LEVERAGE           = float(os.environ.get('LEVERAGE', '25'))
+MARGIN_USAGE_CAP    = float(os.environ.get('MARGIN_USAGE_CAP', '0.90'))   # max 90% balance dipakai jd margin
 
 # MAX_CONCURRENT: default TANPA BATAS (seperti sebelumnya). Isi angka di Railway
 # Variables (mis. MAX_CONCURRENT=10) kalau mau membatasi slot global lagi.
-# 0 / kosong / 'unlimited' = tanpa batas.
+# 0 / kosong / 'unlimited' = tanpa batas. Dengan constraint MARGIN di atas, batas alami
+# akan tetap muncul dari margin habis, bukan cuma dari MAX_CONCURRENT.
 _mc_raw = os.environ.get('MAX_CONCURRENT', '0').strip().lower()
 MAX_CONCURRENT = float('inf') if _mc_raw in ('', '0', 'unlimited', 'inf') else int(_mc_raw)
 
 ALLOW_HEDGE      = os.environ.get('ALLOW_HEDGE', 'true').lower() == 'true'  # Long & Short boleh bareng per koin
 
-# PORTFOLIO RISK CAP: total risiko $ dari SEMUA posisi terbuka bersamaan (dihitung dari
-# jarak entry->SL awal x qty tiap posisi -- estimasi kerugian kalau SEMUA kena SL sekaligus)
-# tidak boleh melebihi persentase ini dari balance. Ini yg mencegah compounding meledak
-# tak terkendali saat MAX_CONCURRENT tanpa batas (banyak posisi paralel, masing2 1% balance
-# yg sama, bisa jadi puluhan % risiko sesaat kalau tak dibatasi). Independen dari MAX_CONCURRENT
-# (yg cuma membatasi JUMLAH slot, bukan total $ risiko).
-MAX_PORTFOLIO_RISK_PCT = float(os.environ.get('MAX_PORTFOLIO_RISK_PCT', '0.20'))   # default 20%
+# FILTER berbasis indikator saat cross. Default AKTIF di ATR ratio >= 1.0 (candle cross harus
+# minimal sebesar volatilitas normalnya) -- dari hasil analisis, ini indikator dgn spread WR
+# paling konsisten & kuat (34.7% -> 47.2%). Override / matikan (isi 0) lewat Railway Variables.
+FILTER_MIN_ATR_RATIO   = float(os.environ.get('FILTER_MIN_ATR_RATIO', '1.0'))    # 0 = nonaktif
+FILTER_MIN_VOL_RATIO   = float(os.environ.get('FILTER_MIN_VOL_RATIO', '0'))      # 0 = nonaktif
+FILTER_MAX_EMA_GAP_PCT = float(os.environ.get('FILTER_MAX_EMA_GAP_PCT', '0'))    # 0 = nonaktif
 
-# FILTER OPSIONAL berbasis indikator saat cross (default semua nonaktif/0 = tidak memfilter).
-# Diisi berdasarkan hasil analisis "Analisis Indikator saat Cross" di dashboard.
-FILTER_MIN_ATR_RATIO   = float(os.environ.get('FILTER_MIN_ATR_RATIO', '0'))     # 0 = nonaktif
-FILTER_MIN_VOL_RATIO   = float(os.environ.get('FILTER_MIN_VOL_RATIO', '0'))     # 0 = nonaktif
-FILTER_MAX_EMA_GAP_PCT = float(os.environ.get('FILTER_MAX_EMA_GAP_PCT', '0'))   # 0 = nonaktif
+# CACHE data candle H1 ke disk supaya tidak perlu fetch ulang dari Bybit tiap kali variable
+# strategi diubah. Arahkan CACHE_DIR ke mount point Railway Volume (mis. /data/cache) biar
+# persisten lintas redeploy. Tanpa Volume, cache tetap jalan tapi hilang tiap redeploy.
+CACHE_DIR = os.environ.get('CACHE_DIR', './data_cache')
+os.makedirs(CACHE_DIR, exist_ok=True)
 
 SYMBOLS = [
     'XPLUSDT', 'MNTUSDT', 'PLUMEUSDT', 'HYPEUSDT', 'BNBUSDT', 'BELUSDT', 'BERAUSDT', 'DASHUSDT',
@@ -73,8 +85,12 @@ SYMBOLS = [
     '1000PEPEUSDT', 'TIAUSDT', 'GALAUSDT', 'APEUSDT', 'FLOWUSDT',
 ]
 
-_END_MS   = int(time.time() * 1000)
-_START_MS = _END_MS - BACKTEST_DAYS * 86400 * 1000
+def _date_to_ms(date_str):
+    dt = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+_START_MS = _date_to_ms(BACKTEST_START_DATE)
+_END_MS   = _date_to_ms(BACKTEST_END_DATE) + 86400 * 1000 - 1   # sampai akhir hari BACKTEST_END_DATE
 
 # ============================================================
 # GLOBAL STATE (dibaca oleh HTTP handler, ditulis oleh background thread)
@@ -87,7 +103,7 @@ _all_trades = []            # semua trade, semua coin (utk CSV & agregat)
 _combined_result = {         # ringkasan hasil simulasi gabungan (1 balance, 1 pool slot)
     'n_trades': 0, 'n_win': 0, 'n_loss': 0, 'wr': 0, 'total_pnl': 0, 'roi': 0,
     'total_r': 0, 'avg_r': 0, 'final_balance': INITIAL_BALANCE,
-    'blocked_by_slot': 0, 'blocked_by_risk': 0, 'blocked_by_filter': 0,
+    'blocked_by_slot': 0, 'blocked_by_margin': 0, 'blocked_by_filter': 0,
 }
 _indicator_result = {}      # hasil analisis indikator saat cross (win vs loss)
 
@@ -103,10 +119,39 @@ def _log_msg(msg: str):
 
 
 # ============================================================
-# FETCH DATA H1 DARI BYBIT
+# FETCH DATA H1 DARI BYBIT (dgn CACHE ke disk supaya tak fetch ulang tiap kali)
 # ============================================================
 
+def _cache_path(symbol: str) -> str:
+    # nama file menyertakan rentang tanggal -> otomatis fetch ulang kalau rentang berubah
+    return os.path.join(CACHE_DIR, f"{symbol}_{BACKTEST_START_DATE}_{BACKTEST_END_DATE}.csv")
+
+
+def _load_cache(symbol: str):
+    path = _cache_path(symbol)
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path)
+            if not df.empty and {'ts', 'open', 'high', 'low', 'close', 'vol'}.issubset(df.columns):
+                return df
+        except Exception as e:
+            _log_msg(f"   ⚠ {symbol}: cache korup ({e}), fetch ulang dari Bybit.")
+    return None
+
+
+def _save_cache(symbol: str, df: pd.DataFrame):
+    try:
+        df.to_csv(_cache_path(symbol), index=False)
+    except Exception as e:
+        _log_msg(f"   ⚠ {symbol}: gagal simpan cache — {e}")
+
+
 def fetch_bybit_h1(symbol: str) -> pd.DataFrame:
+    cached = _load_cache(symbol)
+    if cached is not None:
+        _log_msg(f"   💾 {symbol}: pakai cache ({len(cached):,} candle, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}) — skip fetch Bybit.")
+        return cached
+
     session = HTTP(testnet=False)
     rows, cur_end, n_call = [], _END_MS, 0
     while True:
@@ -137,6 +182,7 @@ def fetch_bybit_h1(symbol: str) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows).drop_duplicates(subset='ts').sort_values('ts').reset_index(drop=True)
+    _save_cache(symbol, df)
     return df
 
 
@@ -271,7 +317,7 @@ def run_combined_backtest(coins: dict) -> dict:
     active_positions  = {}   # f"{symbol}|Long"/"Short" -> {...}
     trades            = []
     blocked_by_slot   = 0    # counter: berapa kali sinyal valid terpaksa dilewati krn slot penuh
-    blocked_by_risk   = 0    # counter: dilewati krn total risiko portofolio sudah mentok
+    blocked_by_margin = 0    # counter: dilewati krn margin (leverage) sudah habis -- constraint ASLI Bybit
     blocked_by_filter = 0    # counter: dilewati krn tidak lolos filter indikator
 
     def _akey(symbol, direction):
@@ -280,9 +326,11 @@ def run_combined_backtest(coins: dict) -> dict:
     def _slots_used():
         return len(active_positions) + len(pending)
 
-    def _current_portfolio_risk():
-        """Total $ yg akan hilang kalau SEMUA posisi terbuka kena SL awal sekaligus."""
-        return sum(p['dist'] * p['qty'] for p in active_positions.values())
+    def _current_margin_used():
+        """Total margin yg sedang dipakai SEMUA posisi terbuka (notional/leverage) --
+        persis seperti akun Bybit riil, ini yg membatasi berapa banyak posisi bisa
+        dibuka bersamaan, BUKAN sekadar persentase risiko."""
+        return sum((p['entry'] * p['qty']) / LEVERAGE for p in active_positions.values())
 
     def _passes_filters(ind):
         if FILTER_MIN_ATR_RATIO > 0 and (ind.get('atr_ratio') or 0) < FILTER_MIN_ATR_RATIO:
@@ -369,7 +417,7 @@ def run_combined_backtest(coins: dict) -> dict:
                     if pos['trail_active']:
                         pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
 
-            # ── 3) cek fill pending (limit di wick), TUNDUK ke PORTFOLIO RISK CAP ──
+            # ── 3) cek fill pending (limit di wick), TUNDUK ke MARGIN (leverage) ──
             for direction, key in (('Short', key_short), ('Long', key_long)):
                 p = pending.get(key)
                 if p is not None and key not in active_positions:
@@ -382,11 +430,13 @@ def run_combined_backtest(coins: dict) -> dict:
                         risk_usd = balance * RISK_PCT   # <-- COMPOUNDING: 1% dari balance TERKINI (shared)
                         qty = risk_usd / dist if dist > 0 else 0
 
-                        # PORTFOLIO RISK CAP: kalau nambah posisi ini bikin total risiko terbuka
-                        # (estimasi rugi kalau SEMUA kena SL sekaligus) melebihi cap -> batalkan fill.
-                        prospective_risk = _current_portfolio_risk() + dist * qty
-                        if prospective_risk > balance * MAX_PORTFOLIO_RISK_PCT:
-                            blocked_by_risk += 1
+                        # MARGIN CHECK (persis Bybit asli): notional = qty*entry, margin = notional/leverage.
+                        # Kalau margin yg sudah dipakai + margin posisi baru ini > batas (mis. 90% balance),
+                        # order DITOLAK exchange -- risk 1% tidak berarti "99 kesempatan lagi", karena
+                        # margin-nya sendiri yg akan habis duluan jauh sebelum itu.
+                        margin_needed = (p['entry'] * qty) / LEVERAGE
+                        if _current_margin_used() + margin_needed > balance * MARGIN_USAGE_CAP:
+                            blocked_by_margin += 1
                             del pending[key]
                             continue
 
@@ -442,7 +492,7 @@ def run_combined_backtest(coins: dict) -> dict:
     total_pnl = sum(t['pnl_usd'] for t in trades)
     return {
         'trades': trades, 'final_balance': balance,
-        'blocked_by_slot': blocked_by_slot, 'blocked_by_risk': blocked_by_risk,
+        'blocked_by_slot': blocked_by_slot, 'blocked_by_margin': blocked_by_margin,
         'blocked_by_filter': blocked_by_filter,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
@@ -529,7 +579,7 @@ def _fmt_max_concurrent():
 
 def _run():
     global _phase, _combined_result, _indicator_result
-    _log_msg(f"🚀 Mulai backtest GABUNGAN {len(SYMBOLS)} coin | H1 | {BACKTEST_DAYS} hari terakhir")
+    _log_msg(f"🚀 Mulai backtest GABUNGAN {len(SYMBOLS)} coin | H1 | {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
     _log_msg(f"   EMA {EMA_FAST}/{EMA_SLOW} | Trail 1:{TRAIL_ACT_R:.0f} | Risk {RISK_PCT*100:.0f}%/trade "
               f"(compounding, 1 balance bersama) | MAX_CONCURRENT {_fmt_max_concurrent()} slot (global, semua koin) | "
               f"Modal awal ${INITIAL_BALANCE:.0f}")
@@ -573,7 +623,7 @@ def _run():
     _log_msg(f"🏁 Selesai! {result['n_trades']} trade | WR {result['wr']:.1f}% | "
               f"PnL ${result['total_pnl']:+.2f} | ROI {result['roi']:+.1f}% | "
               f"Balance akhir ${result['final_balance']:.2f} | "
-              f"blocked: {result['blocked_by_slot']} (slot), {result['blocked_by_risk']} (risk cap), "
+              f"blocked: {result['blocked_by_slot']} (slot), {result['blocked_by_margin']} (margin), "
               f"{result['blocked_by_filter']} (filter indikator)")
 
 
@@ -636,14 +686,13 @@ def _render_html() -> bytes:
     avg_r        = cr.get('avg_r', 0)
     roi_overall  = cr.get('roi', 0)
     final_bal    = cr.get('final_balance', INITIAL_BALANCE)
-    blocked      = cr.get('blocked_by_slot', 0)
 
     gross_win  = sum(t['pnl_usd'] for t in trades_cp if t['pnl_usd'] > 0)
     gross_loss = abs(sum(t['pnl_usd'] for t in trades_cp if t['pnl_usd'] < 0))
     pf = (gross_win / gross_loss) if gross_loss > 0 else float('inf')
 
     blocked_slot   = cr.get('blocked_by_slot', 0)
-    blocked_risk   = cr.get('blocked_by_risk', 0)
+    blocked_margin = cr.get('blocked_by_margin', 0)
     blocked_filter = cr.get('blocked_by_filter', 0)
 
     summary_html = f'''
@@ -651,7 +700,7 @@ def _render_html() -> bytes:
     <table>
       <tr><th>Total Trade</th><th>Win</th><th>Loss</th><th>WR%</th><th>Total PnL</th>
           <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
-          <th>Blokir: Slot</th><th>Blokir: Risk Cap</th><th>Blokir: Filter</th></tr>
+          <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
@@ -663,12 +712,13 @@ def _render_html() -> bytes:
         <td class="{'g' if avg_r>=0 else 'r'}">{avg_r:+.3f}</td>
         <td>{pf:.2f}</td>
         <td class="y">{blocked_slot}</td>
-        <td class="y">{blocked_risk}</td>
+        <td class="y">{blocked_margin}</td>
         <td class="y">{blocked_filter}</td>
       </tr>
     </table>
-    <p style="font-size:12px;color:#8b949e">Portfolio risk cap: maksimal <b>{MAX_PORTFOLIO_RISK_PCT*100:.0f}%</b> dari balance boleh
-    berisiko bersamaan (dari SEMUA posisi terbuka). Filter aktif: {
+    <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
+    <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
+    terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Filter aktif: {
         ', '.join(f
         for f in [
             f'ATR≥{FILTER_MIN_ATR_RATIO}x' if FILTER_MIN_ATR_RATIO > 0 else '',
@@ -754,7 +804,7 @@ def _render_html() -> bytes:
   <p>
     Modal awal: <b>${INITIAL_BALANCE:.0f}</b> (1 akun bersama, bukan per-coin) &nbsp;|&nbsp;
     Slot maksimum: <b>{_fmt_max_concurrent()}</b> (global, dipakai bersama semua koin) &nbsp;|&nbsp;
-    Rentang: <b>{BACKTEST_DAYS} hari terakhir</b> &nbsp;|&nbsp;
+    Rentang: <b>{BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}</b> &nbsp;|&nbsp;
     EMA <b>{EMA_FAST}/{EMA_SLOW}</b> &nbsp;|&nbsp;
     Trail aktif <b>1:{TRAIL_ACT_R:.0f}</b> &nbsp;|&nbsp;
     Status: <span class="chip {chip_cls}">{chip_txt}</span>

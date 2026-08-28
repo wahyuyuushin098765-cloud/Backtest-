@@ -10,6 +10,9 @@ bot.log
 entries.log
 bot_state.json
 
+# Cache data candle (kalau tidak pakai Railway Volume, biar tidak ikut ke-commit)
+data_cache/
+
 # OS
 .DS_Store
 Thumbs.db
