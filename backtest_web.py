@@ -741,12 +741,17 @@ INDICATOR_INFO = {
 
 def indicator_analysis(trades):
     """Utk tiap indikator: avg saat WIN vs LOSS, WR & win/loss count utk SEMUA trade (agregat),
-    + win rate & win/loss count per bucket Rendah/Sedang/Tinggi.
+    + win rate & win/loss count per bucket KUMULATIF Rendah/Sedang/Tinggi.
 
-    PENTING: bucket dibagi berdasarkan RENTANG NILAI (min..max indikator dibagi 3 sama rata),
-    BUKAN berdasarkan jumlah trade rata (tercile). Jadi jumlah trade di tiap bucket bisa
-    beda jauh -- itu memang tujuannya: kelihatan langsung rentang nilai mana yang paling
-    SERING terjadi dan paling banyak menangnya, bukan cuma dipaksa rata 1/3-1/3-1/3."""
+    PENTING - definisi bucket (KUMULATIF, bukan partisi/rentang terpisah):
+      Rendah  = SEMUA trade dgn nilai indikator <= t1  (spt filter "maks t1")
+      Sedang  = SEMUA trade dgn nilai indikator <= t2  (spt filter "maks t2", t2 > t1
+                jadi Sedang selalu superset dari Rendah, BUKAN cuma yg di antara t1-t2)
+      Tinggi  = SEMUA trade, tanpa batas atas (= sama dgn "Semua Trade")
+    Ketiganya dievaluasi terhadap TOTAL trade yang sama (n identik = jumlah trade
+    keseluruhan yg punya nilai indikator ini), bukan dipecah jadi 3 kelompok terpisah.
+    Tujuannya: lihat langsung "kalau saya pasang threshold di t1 (atau t2), berapa
+    trade yang lolos dan berapa yang MENANG secara absolut" -- bukan proporsi bucket."""
     out = {}
     for key, info in INDICATOR_INFO.items():
         pairs = [(t[key], t['r_mult'] > 0) for t in trades if t.get(key) is not None]
@@ -762,14 +767,21 @@ def indicator_analysis(trades):
         else:
             t1 = vmin + span / 3
             t2 = vmin + 2 * span / 3
-        buckets = {'Rendah': [], 'Sedang': [], 'Tinggi': []}
-        for v, w in pairs:
-            if v <= t1:
-                buckets['Rendah'].append(w)
-            elif v <= t2:
-                buckets['Sedang'].append(w)
-            else:
-                buckets['Tinggi'].append(w)
+
+        def _cum_bucket(threshold, no_limit=False):
+            ws = [w for v, w in pairs if no_limit or v <= threshold]
+            return {
+                'wr': (sum(ws) / len(ws) * 100) if ws else None,
+                'n': len(ws),
+                'n_win': sum(1 for w in ws if w),
+                'n_loss': sum(1 for w in ws if not w),
+            }
+
+        buckets = {
+            'Rendah': _cum_bucket(t1),
+            'Sedang': _cum_bucket(t2),
+            'Tinggi': _cum_bucket(None, no_limit=True),
+        }
         n_win_all = len(win_vals)
         n_loss_all = len(loss_vals)
         out[key] = {
@@ -779,14 +791,7 @@ def indicator_analysis(trades):
             'n': len(pairs), 't1': t1, 't2': t2,
             'n_win_all': n_win_all, 'n_loss_all': n_loss_all,
             'wr_all': (n_win_all / len(pairs) * 100) if pairs else None,
-            'buckets': {
-                name: {
-                    'wr': (sum(ws) / len(ws) * 100) if ws else None,
-                    'n': len(ws),
-                    'n_win': sum(1 for w in ws if w),
-                    'n_loss': sum(1 for w in ws if not w),
-                } for name, ws in buckets.items()
-            },
+            'buckets': buckets,
         }
     return out
 
@@ -1078,16 +1083,10 @@ def _render_html() -> bytes:
                     f'<td style="color:#8b949e">{info["n"]} '
                     f'(<span class="g">{info["n_win"]}M</span>/<span class="r">{info["n_loss"]}K</span>)</td>')
 
-        wr_all_cls = 'g' if (d['wr_all'] or 0) >= 45 else ('y' if (d['wr_all'] or 0) >= 30 else 'r')
-        all_cell = (f'<td class="{wr_all_cls}">{d["wr_all"]:.1f}%</td>'
-                    f'<td style="color:#8b949e">{d["n"]} '
-                    f'(<span class="g">{d["n_win_all"]}M</span>/<span class="r">{d["n_loss_all"]}K</span>)</td>')
-
         ind_rows += (
             f'<tr><td>{d["label"]}</td>'
             f'<td class="g">{avg_win_s}</td>'
             f'<td class="r">{avg_loss_s}</td>'
-            f'{all_cell}'
             f'{_bucket_cell("Rendah")}'
             f'{_bucket_cell("Sedang")}'
             f'{_bucket_cell("Tinggi")}'
@@ -1097,12 +1096,11 @@ def _render_html() -> bytes:
     ind_table = f'''
     <table>
       <tr><th rowspan="2">Indikator (saat candle cross)</th><th rowspan="2">Avg saat WIN</th><th rowspan="2">Avg saat LOSS</th>
-          <th colspan="2">Semua Trade</th>
-          <th colspan="2">Rendah</th><th colspan="2">Sedang</th><th colspan="2">Tinggi</th>
-          <th rowspan="2">Batas Rendah/Sedang</th></tr>
+          <th colspan="2">Rendah (≤ t1)</th><th colspan="2">Sedang (≤ t2)</th><th colspan="2">Tinggi (semua, tanpa batas)</th>
+          <th rowspan="2">t1 / t2</th></tr>
       <tr><th>WR%</th><th>N (Menang/Kalah)</th>
-          <th>WR%</th><th>N (Menang/Kalah)</th><th>WR%</th><th>N (Menang/Kalah)</th><th>WR%</th><th>N (Menang/Kalah)</th></tr>
-      {ind_rows or '<tr><td colspan="12" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
+          <th>WR%</th><th>N (Menang/Kalah)</th><th>WR%</th><th>N (Menang/Kalah)</th></tr>
+      {ind_rows or '<tr><td colspan="10" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
     </table>
     ''' if ind_cp else '<p class="note">Belum ada data indikator.</p>'
 
@@ -1136,24 +1134,26 @@ def _render_html() -> bytes:
   <h2>Analisis Indikator saat Cross — Pola Menang vs Kalah</h2>
   <div class="tbl-wrap">{ind_table}</div>
   <div class="note">
-    💡 Cara baca: kolom <b>"Semua Trade"</b> = total trade yang punya nilai indikator ini, TIDAK dipecah
-    (jumlah win/loss & WR% dari seluruh trade sekaligus). Kolom Rendah/Sedang/Tinggi membagi RENTANG NILAI
-    indikator itu (dari nilai minimum sampai maksimum yang pernah terjadi saat cross) jadi 3 bagian SAMA
-    RATA secara nilai — bukan dipaksa rata jumlah trade-nya. Karena itu jumlah trade di tiap bucket bisa
-    beda jauh (misal Rendah cuma 50 trade sementara Tinggi 400 trade) — itu memang tujuannya: langsung
-    kelihatan rentang nilai mana yang paling sering terjadi DAN paling banyak menangnya secara absolut,
-    bukan cuma persentase. "N (Menang/Kalah)" di tiap kelompok menunjukkan jumlah trade menang (M) dan
-    kalah (K) secara eksplisit.
+    💡 Cara baca: ketiga kolom ini KUMULATIF, bukan pembagian rentang terpisah — ketiganya dievaluasi
+    terhadap SEMUA trade yang sama (persis seperti menguji sebuah filter beneran):
+    <br>• <b>Rendah</b> = kalau kamu HANYA ambil trade dengan nilai indikator ini ≤ t1 (kolom paling kanan),
+    berapa yang menang & kalah?
+    <br>• <b>Sedang</b> = kalau kamu HANYA ambil trade dengan nilai ≤ t2 (batas lebih longgar dari t1),
+    berapa yang menang & kalah? (Sedang selalu MENCAKUP Rendah, karena t2 > t1 — bukan kelompok terpisah)
+    <br>• <b>Tinggi</b> = SEMUA trade tanpa batas apapun — ini baseline "tanpa filter" utk pembanding.
+    <br>Karena itu N di kolom Tinggi selalu = total trade keseluruhan, dan N di Rendah/Sedang biasanya
+    lebih kecil (subset). Yang perlu dicari: apakah WR% naik dan jumlah <b>Menang absolut</b> tetap besar
+    saat kamu perketat ke Rendah/Sedang dibanding Tinggi — kalau WR naik tapi n Menang-nya turun drastis,
+    filter itu membuang lebih banyak peluang menang daripada yang disisakan.
     Bandingkan juga kolom "Avg saat WIN" vs "Avg saat LOSS" — kalau beda jauh, indikator itu berpotensi
-    jadi FILTER. Kolom "Batas Rendah/Sedang" adalah nilai ambang pembagi rentang (mis. "≤1.05x / ≤1.40x"
-    artinya Rendah = sampai 1.05x, Sedang = 1.05x-1.40x, Tinggi = di atas 1.40x).
+    jadi FILTER. Kolom "t1 / t2" adalah nilai ambang aktualnya (mis. "≤1.05x / ≤1.40x").
     <br>Kalau mau menerapkan filter berdasarkan hasil ini, isi env var di Railway:
     <code>FILTER_MIN_ATR_RATIO</code>, <code>FILTER_MIN_VOL_RATIO</code>, atau
     <code>FILTER_MAX_EMA_GAP_PCT</code> (nilai ambang batas Sedang/Tinggi di atas), lalu jalankan
     ulang backtest untuk lihat dampaknya ke Total R & WR keseluruhan (bukan cuma per-bucket).
-    <br>⚠️ Kolom <b>N trade</b> di tiap bucket penting dicek sebelum aktifkan filter — WR tinggi di
-    bucket "Tinggi" tidak ada gunanya kalau isinya cuma 5 trade dari total 300 (bisa kebetulan/noise),
-    dan mengunci filter di bucket itu bisa memblokir mayoritas sinyal.
+    <br>⚠️ Kolom <b>N trade</b> di Rendah/Sedang penting dicek sebelum aktifkan filter — WR tinggi di
+    bucket "Rendah" tidak ada gunanya kalau isinya cuma 5 trade dari total 300 (bisa kebetulan/noise),
+    dan menerapkan filter seketat itu bisa membuang mayoritas sinyal & trade menang yang sebenarnya ada.
   </div>
 
   <div class="note">
