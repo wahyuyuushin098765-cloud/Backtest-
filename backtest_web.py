@@ -740,8 +740,13 @@ INDICATOR_INFO = {
 }
 
 def indicator_analysis(trades):
-    """Utk tiap indikator: avg saat WIN vs LOSS, WR & win/loss count utk SEMUA trade (agregat,
-    tidak dipecah), + win rate & win/loss count per bucket (Rendah/Sedang/Tinggi) sbg pola tambahan."""
+    """Utk tiap indikator: avg saat WIN vs LOSS, WR & win/loss count utk SEMUA trade (agregat),
+    + win rate & win/loss count per bucket Rendah/Sedang/Tinggi.
+
+    PENTING: bucket dibagi berdasarkan RENTANG NILAI (min..max indikator dibagi 3 sama rata),
+    BUKAN berdasarkan jumlah trade rata (tercile). Jadi jumlah trade di tiap bucket bisa
+    beda jauh -- itu memang tujuannya: kelihatan langsung rentang nilai mana yang paling
+    SERING terjadi dan paling banyak menangnya, bukan cuma dipaksa rata 1/3-1/3-1/3."""
     out = {}
     for key, info in INDICATOR_INFO.items():
         pairs = [(t[key], t['r_mult'] > 0) for t in trades if t.get(key) is not None]
@@ -749,10 +754,14 @@ def indicator_analysis(trades):
             continue
         win_vals  = [v for v, w in pairs if w]
         loss_vals = [v for v, w in pairs if not w]
-        vals_sorted = sorted(v for v, _ in pairs)
-        n = len(vals_sorted)
-        t1 = vals_sorted[n // 3]
-        t2 = vals_sorted[(2 * n) // 3]
+        vmin = min(v for v, _ in pairs)
+        vmax = max(v for v, _ in pairs)
+        span = vmax - vmin
+        if span <= 0:
+            t1 = t2 = vmin
+        else:
+            t1 = vmin + span / 3
+            t2 = vmin + 2 * span / 3
         buckets = {'Rendah': [], 'Sedang': [], 'Tinggi': []}
         for v, w in pairs:
             if v <= t1:
@@ -1015,7 +1024,7 @@ def _render_html() -> bytes:
           <code>FILTER_MIN_MACD_HIST_PCT</code>, <code>FILTER_MAX_MACD_HIST_PCT</code>,
           <code>FILTER_MIN_SAR_DIST_PCT</code>, <code>FILTER_MAX_SAR_DIST_PCT</code>
           (isi salah satu sisi saja utk filter satu-arah, isi MIN+MAX utk filter "range"/tengah,
-          kosongkan/hapus utk nonaktifkan sisi itu). Lihat nilai ambang batas tercile per-indikator
+          kosongkan/hapus utk nonaktifkan sisi itu). Lihat nilai ambang batas per-indikator
           di tabel "Analisis Indikator" di bawah sebagai referensi angka.
           <br>Simulasi pembanding ini dijalankan otomatis SEKALI di awal saat filter terdeteksi aktif —
           jalankan ulang backtest (restart service) setelah mengubah env var utk lihat dampak barunya.
@@ -1128,17 +1137,20 @@ def _render_html() -> bytes:
   <div class="tbl-wrap">{ind_table}</div>
   <div class="note">
     💡 Cara baca: kolom <b>"Semua Trade"</b> = total trade yang punya nilai indikator ini, TIDAK dipecah
-    (jumlah win/loss & WR% dari seluruh trade sekaligus). Kolom Rendah/Sedang/Tinggi membagi trade yang
-    sama itu jadi 3 kelompok (tercile) berdasarkan nilai indikator saat cross, supaya kelihatan POLA-nya —
-    misal apakah WR makin naik seiring nilai indikator makin tinggi. "N (Menang/Kalah)" di tiap kelompok
-    menunjukkan jumlah trade menang (M) dan kalah (K) secara eksplisit, bukan cuma persentase.
+    (jumlah win/loss & WR% dari seluruh trade sekaligus). Kolom Rendah/Sedang/Tinggi membagi RENTANG NILAI
+    indikator itu (dari nilai minimum sampai maksimum yang pernah terjadi saat cross) jadi 3 bagian SAMA
+    RATA secara nilai — bukan dipaksa rata jumlah trade-nya. Karena itu jumlah trade di tiap bucket bisa
+    beda jauh (misal Rendah cuma 50 trade sementara Tinggi 400 trade) — itu memang tujuannya: langsung
+    kelihatan rentang nilai mana yang paling sering terjadi DAN paling banyak menangnya secara absolut,
+    bukan cuma persentase. "N (Menang/Kalah)" di tiap kelompok menunjukkan jumlah trade menang (M) dan
+    kalah (K) secara eksplisit.
     Bandingkan juga kolom "Avg saat WIN" vs "Avg saat LOSS" — kalau beda jauh, indikator itu berpotensi
-    jadi FILTER. Kolom "Batas Rendah/Sedang" adalah nilai ambang aktual pembagi tercile (mis. "≤1.05x / ≤1.40x"
+    jadi FILTER. Kolom "Batas Rendah/Sedang" adalah nilai ambang pembagi rentang (mis. "≤1.05x / ≤1.40x"
     artinya Rendah = sampai 1.05x, Sedang = 1.05x-1.40x, Tinggi = di atas 1.40x).
     <br>Kalau mau menerapkan filter berdasarkan hasil ini, isi env var di Railway:
     <code>FILTER_MIN_ATR_RATIO</code>, <code>FILTER_MIN_VOL_RATIO</code>, atau
     <code>FILTER_MAX_EMA_GAP_PCT</code> (nilai ambang batas Sedang/Tinggi di atas), lalu jalankan
-    ulang backtest untuk lihat dampaknya ke Total R & WR keseluruhan (bukan cuma tercile).
+    ulang backtest untuk lihat dampaknya ke Total R & WR keseluruhan (bukan cuma per-bucket).
     <br>⚠️ Kolom <b>N trade</b> di tiap bucket penting dicek sebelum aktifkan filter — WR tinggi di
     bucket "Tinggi" tidak ada gunanya kalau isinya cuma 5 trade dari total 300 (bisa kebetulan/noise),
     dan mengunci filter di bucket itu bisa memblokir mayoritas sinyal.
