@@ -80,8 +80,9 @@ Kalau setelah lihat hasil backtest kamu mau lanjut live:
    ```
 3. Isi env var wajib: `API_KEY`, `API_SECRET` (lihat bagian bawah `.env.example`).
 4. `ALLOW_HEDGE=true` wajib — bot otomatis coba switch akun ke Hedge Mode saat start.
-5. **Sangat disarankan tes di Testnet dulu** (`TESTNET=true`) sebelum live.
-6. Endpoint sama seperti backtest: `/view` (log per koin), `/logs` (log mentah), `/ohlc` (unduh data candle yang dilihat bot).
+5. Filter kualitas sinyal (`FILTER_MIN_ATR_RATIO=1.07` dkk) **sudah aktif juga di bot live**, sinkron dengan default di dashboard backtest — bisa diubah lewat env var yang sama.
+6. **Sangat disarankan tes di Testnet dulu** (`TESTNET=true`) sebelum live.
+7. Endpoint sama seperti backtest: `/view` (log per koin), `/logs` (log mentah), `/ohlc` (unduh data candle yang dilihat bot).
 
 ## Environment Variables
 

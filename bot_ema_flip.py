@@ -32,6 +32,10 @@ RINGKASAN STRATEGI
      SL = wick - jarak yang sama.
    - Kalau ada cross SEARAH baru sebelum limit lama sempat fill, limit lama
      diganti ke wick yang terbaru.
+   - FILTER ATR: sinyal cuma dieksekusi kalau ukuran candle penyebab cross
+     (high-low) >= FILTER_MIN_ATR_RATIO x ATR14 (default 1.07x) -- hasil riset
+     backtest 45 coin ~1 tahun H1 menunjukkan ini indikator dgn spread win-rate
+     paling konsisten & kuat. Bisa dimatikan (isi 0) via env var.
 
 4. FLIP PROTECTION:
    - Kalau sedang PENDING (limit belum fill) atau ACTIVE (posisi terbuka) untuk
@@ -324,6 +328,14 @@ ORDER_BUMP_FLOOR = 4.0
 MAX_CONCURRENT   = int(os.environ.get('MAX_CONCURRENT', 10))
 MIN_DIST_PCT     = 0.002    # floor keamanan SL minimum 0.2% dari entry
 
+# FILTER indikator saat cross (hasil riset backtest 45 coin, ~1 tahun H1): ATR ratio >= 1.07
+# (candle penyebab cross harus lebih besar dari volatilitas normalnya, ATR14) -- indikator
+# dgn spread win-rate paling konsisten & kuat dari analisis dashboard backtest. Bisa
+# dimatikan (isi 0) atau diisi juga batas atasnya via Railway Variables.
+ATR_PERIOD          = int(os.environ.get('ATR_PERIOD', 14))
+FILTER_MIN_ATR_RATIO = float(os.environ.get('FILTER_MIN_ATR_RATIO', 1.07))   # 0 = nonaktif
+FILTER_MAX_ATR_RATIO = float(os.environ.get('FILTER_MAX_ATR_RATIO', 0))      # 0 = nonaktif
+
 ALLOW_HEDGE = os.environ.get('ALLOW_HEDGE', 'true').lower() == 'true'
 def _pidx(side):
     return (1 if side == "Buy" else 2) if ALLOW_HEDGE else 0
@@ -503,6 +515,36 @@ def compute_ema_cross(df_closed):
     death_cross  = ema_fast[-2] >= ema_slow[-2] and ema_fast[-1] < ema_slow[-1]
     golden_cross = ema_fast[-2] <= ema_slow[-2] and ema_fast[-1] > ema_slow[-1]
     return death_cross, golden_cross
+
+
+def compute_atr_ratio(df_closed):
+    """Rasio ukuran candle TERAKHIR (high-low) terhadap ATR14 -- dipakai sbg filter kualitas
+    sinyal (hasil riset: candle penyebab cross yg lebih besar dari ATR normalnya punya win
+    rate jauh lebih tinggi). None kalau data belum cukup."""
+    if len(df_closed) < ATR_PERIOD + 2:
+        return None
+    h = df_closed['high'].values; l = df_closed['low'].values; c = df_closed['close'].values
+    prev_close = np.roll(c, 1)
+    prev_close[0] = c[0]
+    tr = np.maximum(h - l, np.maximum(np.abs(h - prev_close), np.abs(l - prev_close)))
+    atr = pd.Series(tr).rolling(ATR_PERIOD, min_periods=1).mean().values
+    last_range = h[-1] - l[-1]
+    if atr[-1] <= 0:
+        return None
+    return last_range / atr[-1]
+
+
+def passes_atr_filter(df_closed):
+    if FILTER_MIN_ATR_RATIO <= 0 and FILTER_MAX_ATR_RATIO <= 0:
+        return True   # filter nonaktif semua
+    ratio = compute_atr_ratio(df_closed)
+    if ratio is None:
+        return False   # data belum cukup utk ATR -> aman, jangan entry dulu
+    if FILTER_MIN_ATR_RATIO > 0 and ratio < FILTER_MIN_ATR_RATIO:
+        return False
+    if FILTER_MAX_ATR_RATIO > 0 and ratio > FILTER_MAX_ATR_RATIO:
+        return False
+    return True
 
 
 # ============================================================
@@ -816,40 +858,48 @@ def process_flip_and_entry(coin, df_closed, death_cross, golden_cross):
                       f"(belum sempat fill @ {p.get('entry',0):.6g}).")
             del pending[key_short]
 
-    # ---- 2) CROSS SEARAH -> pasang/ganti limit di wick ----
+    # ---- 2) CROSS SEARAH -> pasang/ganti limit di wick, TUNDUK ke FILTER ATR ----
+    atr_ok = passes_atr_filter(df_closed)   # dihitung sekali per candle, dipakai kedua arah
+
     if death_cross and key_short in armed and key_short not in active_positions:
-        wick = h[last_i]; old_entry = c[last_i]; old_dist = wick - old_entry
-        if old_dist > 0:
-            sl = wick + old_dist
-            if key_short in pending:
-                cancel_order(coin, pending[key_short]['order_id'])
-                del pending[key_short]
-            if _count_slots() < MAX_CONCURRENT:
-                result = place_limit_order(coin, "Sell", wick, sl)
-                if result is not None:
-                    order_id, qty, entry_r, sl_r, dist = result
-                    pending[key_short] = {'coin': coin, 'direction': 'Short',
-                                           'entry': entry_r, 'sl': sl_r, 'dist': dist, 'order_id': order_id}
-                    log_entry(f"📉 {coin} [Short]: Death cross — limit SELL @ wick {entry_r:.6g} SL {sl_r:.6g}")
-            else:
-                print(f"⏭️  {coin} [Short]: slot penuh ({MAX_CONCURRENT}), skip.")
+        if not atr_ok:
+            print(f"⏭️  {coin} [Short]: sinyal death cross tidak lolos filter ATR, skip.")
+        else:
+            wick = h[last_i]; old_entry = c[last_i]; old_dist = wick - old_entry
+            if old_dist > 0:
+                sl = wick + old_dist
+                if key_short in pending:
+                    cancel_order(coin, pending[key_short]['order_id'])
+                    del pending[key_short]
+                if _count_slots() < MAX_CONCURRENT:
+                    result = place_limit_order(coin, "Sell", wick, sl)
+                    if result is not None:
+                        order_id, qty, entry_r, sl_r, dist = result
+                        pending[key_short] = {'coin': coin, 'direction': 'Short',
+                                               'entry': entry_r, 'sl': sl_r, 'dist': dist, 'order_id': order_id}
+                        log_entry(f"📉 {coin} [Short]: Death cross — limit SELL @ wick {entry_r:.6g} SL {sl_r:.6g}")
+                else:
+                    print(f"⏭️  {coin} [Short]: slot penuh ({MAX_CONCURRENT}), skip.")
 
     if golden_cross and key_long in armed and key_long not in active_positions:
-        wick = l[last_i]; old_entry = c[last_i]; old_dist = old_entry - wick
-        if old_dist > 0:
-            sl = wick - old_dist
-            if key_long in pending:
-                cancel_order(coin, pending[key_long]['order_id'])
-                del pending[key_long]
-            if _count_slots() < MAX_CONCURRENT:
-                result = place_limit_order(coin, "Buy", wick, sl)
-                if result is not None:
-                    order_id, qty, entry_r, sl_r, dist = result
-                    pending[key_long] = {'coin': coin, 'direction': 'Long',
-                                          'entry': entry_r, 'sl': sl_r, 'dist': dist, 'order_id': order_id}
-                    log_entry(f"📈 {coin} [Long]: Golden cross — limit BUY @ wick {entry_r:.6g} SL {sl_r:.6g}")
-            else:
-                print(f"⏭️  {coin} [Long]: slot penuh ({MAX_CONCURRENT}), skip.")
+        if not atr_ok:
+            print(f"⏭️  {coin} [Long]: sinyal golden cross tidak lolos filter ATR, skip.")
+        else:
+            wick = l[last_i]; old_entry = c[last_i]; old_dist = old_entry - wick
+            if old_dist > 0:
+                sl = wick - old_dist
+                if key_long in pending:
+                    cancel_order(coin, pending[key_long]['order_id'])
+                    del pending[key_long]
+                if _count_slots() < MAX_CONCURRENT:
+                    result = place_limit_order(coin, "Buy", wick, sl)
+                    if result is not None:
+                        order_id, qty, entry_r, sl_r, dist = result
+                        pending[key_long] = {'coin': coin, 'direction': 'Long',
+                                              'entry': entry_r, 'sl': sl_r, 'dist': dist, 'order_id': order_id}
+                        log_entry(f"📈 {coin} [Long]: Golden cross — limit BUY @ wick {entry_r:.6g} SL {sl_r:.6g}")
+                else:
+                    print(f"⏭️  {coin} [Long]: slot penuh ({MAX_CONCURRENT}), skip.")
 
 
 def manage_pending(coin):
@@ -892,6 +942,12 @@ def run_bot():
     print(f"CONFIG | EMA {EMA_FAST}/{EMA_SLOW} | trail aktif 1:{TRAIL_ACT_R:.0f} | trail width {TRAIL_STOP:.1f}x | "
           f"risk {RISK_PCT*100:.0f}%/trade | lev {LEVERAGE}x | slot max {MAX_CONCURRENT} | "
           f"HEDGE {'ON' if ALLOW_HEDGE else 'off'}")
+    filter_desc = []
+    if FILTER_MIN_ATR_RATIO > 0:
+        filter_desc.append(f"ATR>={FILTER_MIN_ATR_RATIO}x")
+    if FILTER_MAX_ATR_RATIO > 0:
+        filter_desc.append(f"ATR<={FILTER_MAX_ATR_RATIO}x")
+    print(f"FILTER  | {', '.join(filter_desc) if filter_desc else 'tidak ada (semua nonaktif)'}")
     if not test_connection():
         print("⛔ Tidak bisa konek ke Bybit.")
         return

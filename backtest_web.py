@@ -63,12 +63,20 @@ MAX_CONCURRENT = float('inf') if _mc_raw in ('', '0', 'unlimited', 'inf') else i
 
 ALLOW_HEDGE      = os.environ.get('ALLOW_HEDGE', 'true').lower() == 'true'  # Long & Short boleh bareng per koin
 
-# FILTER berbasis indikator saat cross. Default AKTIF di ATR ratio >= 1.0 (candle cross harus
-# minimal sebesar volatilitas normalnya) -- dari hasil analisis, ini indikator dgn spread WR
-# paling konsisten & kuat (34.7% -> 47.2%). Override / matikan (isi 0) lewat Railway Variables.
-FILTER_MIN_ATR_RATIO   = float(os.environ.get('FILTER_MIN_ATR_RATIO', '1.0'))    # 0 = nonaktif
+# FILTER berbasis indikator saat cross. DEFAULT AKTIF: ATR ratio >= 1.07 (candle penyebab
+# cross harus minimal sebesar volatilitas normalnya) -- dari hasil analisis, ini indikator
+# dgn spread win-rate paling konsisten & kuat. Override / matikan (isi 0) lewat Railway
+# Variables. Tiap indikator sekarang punya MIN dan MAX (0 = sisi itu nonaktif) supaya bisa
+# bikin filter "range" (misal cuma ambil yg di tengah, bukan cuma "makin besar makin bagus"),
+# karena hasil riset menunjukkan pola bucket Rendah/Sedang/Tinggi TIDAK selalu monoton.
+FILTER_MIN_ATR_RATIO   = float(os.environ.get('FILTER_MIN_ATR_RATIO', '1.07'))   # 0 = nonaktif
+FILTER_MAX_ATR_RATIO   = float(os.environ.get('FILTER_MAX_ATR_RATIO', '0'))      # 0 = nonaktif
 FILTER_MIN_VOL_RATIO   = float(os.environ.get('FILTER_MIN_VOL_RATIO', '0'))      # 0 = nonaktif
+FILTER_MAX_VOL_RATIO   = float(os.environ.get('FILTER_MAX_VOL_RATIO', '0'))      # 0 = nonaktif
+FILTER_MIN_EMA_GAP_PCT = float(os.environ.get('FILTER_MIN_EMA_GAP_PCT', '0'))    # 0 = nonaktif
 FILTER_MAX_EMA_GAP_PCT = float(os.environ.get('FILTER_MAX_EMA_GAP_PCT', '0'))    # 0 = nonaktif
+FILTER_MIN_DIST_PCT    = float(os.environ.get('FILTER_MIN_DIST_PCT', '0'))       # 0 = nonaktif
+FILTER_MAX_DIST_PCT    = float(os.environ.get('FILTER_MAX_DIST_PCT', '0'))       # 0 = nonaktif
 
 # CACHE data candle H1 ke disk supaya tidak perlu fetch ulang dari Bybit tiap kali variable
 # strategi diubah. Arahkan CACHE_DIR ke mount point Railway Volume (mis. /data/cache) biar
@@ -191,6 +199,17 @@ def fetch_bybit_h1(symbol: str) -> pd.DataFrame:
 # ============================================================
 
 def find_sr_events(df):
+    """Versi O(n) — logika & hasil identik dgn versi lama (O(n^2)), hanya cara
+    cek 'broken' yang diubah dari re-scan mundur tiap event jadi single-pass maju.
+
+    Trik: setiap level di stack disimpan bersama 'broken_at' = index candle pertama
+    (j > c3 level itu) di mana harga menembus sl-nya. Nilai ini dihitung SEKALI saat
+    level baru masuk stack (scan maju dari c3+1 sampai ketemu candle yg break, atau
+    sampai akhir data), bukan diulang-ulang untuk tiap event baru yang muncul di
+    depannya. Saat butuh cek "level ini masih hidup di candle X?", tinggal bandingkan
+    broken_at > X -- O(1). Total kerja scan tetap O(n) sepanjang seluruh dataset
+    (tiap tumpukan sequence candle dilewati sekali per level, bukan berulang).
+    """
     o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     ts = df['ts'].values
     n = len(df)
@@ -207,21 +226,30 @@ def find_sr_events(df):
                 raw.append({'type': 'resistance', 'level': R, 'sl': max(h[i], h[i + 1]),
                             'c1': i, 'c2': i + 1, 'c3': i + 2, 'c1_ts': int(ts[i])})
     raw.sort(key=lambda e: e['c3'])
+
+    # Precompute, per tipe, kapan tiap kemungkinan level "sl" pertama kali ditembus
+    # kalau dipasang mulai dari index tertentu. Karena sl bisa beda2 per event, kita
+    # tetap hitung broken_at per-level individual, tapi HANYA SEKALI per level (saat
+    # level itu masuk stack) dgn scan maju yg berhenti begitu ketemu breach pertama --
+    # bukan diulang utk tiap event baru yg overlap sepertinya versi lama.
+    def _broken_at(ty, start_idx, sl_val):
+        if ty == 'support':
+            for j in range(start_idx, n):
+                if c[j] < sl_val - 1e-12:
+                    return j
+        else:
+            for j in range(start_idx, n):
+                if c[j] > sl_val + 1e-12:
+                    return j
+        return n  # tidak pernah break dalam data
+
     stack = {'support': [], 'resistance': []}
     events = []
     for e in raw:
         ty = e['type']; cutoff = e['c1']
-        alive = []
-        for ref in stack[ty]:
-            broken = False
-            for j in range(ref['c3'] + 1, cutoff + 1):
-                if ty == 'support' and c[j] < ref['sl'] - 1e-12:
-                    broken = True; break
-                if ty == 'resistance' and c[j] > ref['sl'] + 1e-12:
-                    broken = True; break
-            if not broken:
-                alive.append(ref)
-        stack[ty] = alive
+        # buang level yg sudah broken sebelum/at cutoff (O(1) per level krn broken_at
+        # sudah dihitung duluan)
+        stack[ty] = [ref for ref in stack[ty] if ref['broken_at'] > cutoff]
         prev = stack[ty][-1]['level'] if stack[ty] else None
         wick_extreme = e['sl']; S = e['level']
         if prev is None:
@@ -231,7 +259,8 @@ def find_sr_events(df):
         else:
             e['valid'] = (wick_extreme >= prev - 1e-12) and (prev >= S - 1e-12)
         events.append(e)
-        stack[ty].append({'level': S, 'sl': wick_extreme, 'c3': e['c3']})
+        broken_at = _broken_at(ty, e['c3'] + 1, wick_extreme)
+        stack[ty].append({'level': S, 'sl': wick_extreme, 'c3': e['c3'], 'broken_at': broken_at})
     return events
 
 
@@ -333,11 +362,25 @@ def run_combined_backtest(coins: dict) -> dict:
         return sum((p['entry'] * p['qty']) / LEVERAGE for p in active_positions.values())
 
     def _passes_filters(ind):
-        if FILTER_MIN_ATR_RATIO > 0 and (ind.get('atr_ratio') or 0) < FILTER_MIN_ATR_RATIO:
+        v = ind.get('atr_ratio')
+        if FILTER_MIN_ATR_RATIO > 0 and (v is None or v < FILTER_MIN_ATR_RATIO):
             return False
-        if FILTER_MIN_VOL_RATIO > 0 and (ind.get('vol_ratio') or 0) < FILTER_MIN_VOL_RATIO:
+        if FILTER_MAX_ATR_RATIO > 0 and (v is None or v > FILTER_MAX_ATR_RATIO):
             return False
-        if FILTER_MAX_EMA_GAP_PCT > 0 and (ind.get('ema_gap_pct') or 999) > FILTER_MAX_EMA_GAP_PCT:
+        v = ind.get('vol_ratio')
+        if FILTER_MIN_VOL_RATIO > 0 and (v is None or v < FILTER_MIN_VOL_RATIO):
+            return False
+        if FILTER_MAX_VOL_RATIO > 0 and (v is None or v > FILTER_MAX_VOL_RATIO):
+            return False
+        v = ind.get('ema_gap_pct')
+        if FILTER_MIN_EMA_GAP_PCT > 0 and (v is None or v < FILTER_MIN_EMA_GAP_PCT):
+            return False
+        if FILTER_MAX_EMA_GAP_PCT > 0 and (v is None or v > FILTER_MAX_EMA_GAP_PCT):
+            return False
+        v = ind.get('dist_pct_est')
+        if FILTER_MIN_DIST_PCT > 0 and (v is None or v < FILTER_MIN_DIST_PCT):
+            return False
+        if FILTER_MAX_DIST_PCT > 0 and (v is None or v > FILTER_MAX_DIST_PCT):
             return False
         return True
 
@@ -466,6 +509,7 @@ def run_combined_backtest(coins: dict) -> dict:
                 wick = H[i]; old_dist = wick - C_[i]
                 if old_dist > 0:
                     ind = _capture_indicators(c, i)
+                    ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
                     if not _passes_filters(ind):
                         blocked_by_filter += 1
                     elif key_short not in pending and _slots_used() >= MAX_CONCURRENT:
@@ -479,6 +523,7 @@ def run_combined_backtest(coins: dict) -> dict:
                 wick = L[i]; old_dist = C_[i] - wick
                 if old_dist > 0:
                     ind = _capture_indicators(c, i)
+                    ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
                     if not _passes_filters(ind):
                         blocked_by_filter += 1
                     elif key_long not in pending and _slots_used() >= MAX_CONCURRENT:
@@ -722,8 +767,13 @@ def _render_html() -> bytes:
         ', '.join(f
         for f in [
             f'ATR≥{FILTER_MIN_ATR_RATIO}x' if FILTER_MIN_ATR_RATIO > 0 else '',
+            f'ATR≤{FILTER_MAX_ATR_RATIO}x' if FILTER_MAX_ATR_RATIO > 0 else '',
             f'Vol≥{FILTER_MIN_VOL_RATIO}x' if FILTER_MIN_VOL_RATIO > 0 else '',
-            f'EMA gap≤{FILTER_MAX_EMA_GAP_PCT}%' if FILTER_MAX_EMA_GAP_PCT > 0 else '',
+            f'Vol≤{FILTER_MAX_VOL_RATIO}x' if FILTER_MAX_VOL_RATIO > 0 else '',
+            f'EMAgap≥{FILTER_MIN_EMA_GAP_PCT}%' if FILTER_MIN_EMA_GAP_PCT > 0 else '',
+            f'EMAgap≤{FILTER_MAX_EMA_GAP_PCT}%' if FILTER_MAX_EMA_GAP_PCT > 0 else '',
+            f'SLdist≥{FILTER_MIN_DIST_PCT}%' if FILTER_MIN_DIST_PCT > 0 else '',
+            f'SLdist≤{FILTER_MAX_DIST_PCT}%' if FILTER_MAX_DIST_PCT > 0 else '',
         ] if f
     ) or 'tidak ada (semua nonaktif)'}</p>
     '''
