@@ -338,15 +338,19 @@ MACD_SIGNAL      = int(os.environ.get('MACD_SIGNAL', '9'))
 SAR_STEP         = float(os.environ.get('SAR_STEP', '0.02'))
 SAR_MAX_STEP     = float(os.environ.get('SAR_MAX_STEP', '0.2'))
 
-# ── GATE RSI DUAL-PERIOD saat EMA cross (BUKAN filter statistik ambang batas -- ini kondisi
+# ── GATE RSI TUNGGAL saat EMA cross (BUKAN filter statistik ambang batas -- ini kondisi
 # STRUKTURAL yg dicek TEPAT di candle penyebab cross, sama level dgn syarat cross itu sendiri) ──
-# Golden cross (bias Long) valid HANYA jika RSI cepat (12) > RSI lambat (24) di candle itu.
-# Death cross  (bias Short) valid HANYA jika RSI cepat (12) < RSI lambat (24) di candle itu.
-# Alasan: RSI12 > RSI24 berarti momentum jangka-pendek sedang menguat lebih cepat drpd
-# jangka-menengah -- konfirmasi searah dgn golden cross, bukan cuma EMA yg kebetulan cross.
-RSI_GATE_ENABLED = os.environ.get('RSI_GATE_ENABLED', '1').strip() not in ('0', 'false', 'False', '')
-RSI_GATE_FAST    = int(os.environ.get('RSI_GATE_FAST', '12'))
-RSI_GATE_SLOW    = int(os.environ.get('RSI_GATE_SLOW', '24'))
+# RSI4 (periode pendek, reaktif thd harga). Logika DIBALIK dari RSI konvensional (yg biasanya
+# overbought=jangan-beli/mulai-jual, oversold=jangan-jual/mulai-beli): di sini overbought
+# JUSTRU dipakai sbg batas atas utk Long (tolak kalau RSI sudah kelewat tinggi drpd histori
+# jangka pendek), dan oversold dipakai sbg batas bawah utk Short (tolak kalau RSI sudah
+# kelewat rendah). Cocok utk strategi momentum/breakout spt ini -- bukan mean-reversion.
+# Golden cross (bias Long)  valid HANYA jika RSI4 <= RSI_GATE_MAX_LONG  (tolak kalau RSI > 70)
+# Death cross  (bias Short) valid HANYA jika RSI4 >= RSI_GATE_MIN_SHORT (tolak kalau RSI < 40)
+RSI_GATE_ENABLED   = os.environ.get('RSI_GATE_ENABLED', '1').strip() not in ('0', 'false', 'False', '')
+RSI_GATE_PERIOD    = int(os.environ.get('RSI_GATE_PERIOD', '4'))
+RSI_GATE_MAX_LONG  = float(os.environ.get('RSI_GATE_MAX_LONG', '70'))
+RSI_GATE_MIN_SHORT = float(os.environ.get('RSI_GATE_MIN_SHORT', '40'))
 
 
 def _calc_rsi(C, period):
@@ -431,8 +435,7 @@ def _capture_indicators(c, i):
     macd_i  = c['macd_hist'][i]
     sar_i   = c['sar'][i]
     sar_up  = c['sar_up'][i]
-    rsi12_i = c['rsi_gate_fast'][i]
-    rsi24_i = c['rsi_gate_slow'][i]
+    rsi_gate_i = c['rsi_gate'][i]
     return {
         'vol_ratio': (c['V'][i] / vol_ma) if vol_ma > 0 else None,          # volume vs rata2 20 candle
         'atr_ratio': (rng / atr_i) if atr_i > 0 else None,                  # besar candle vs volatilitas normal
@@ -442,27 +445,28 @@ def _capture_indicators(c, i):
         'rsi': (float(rsi_i) if not np.isnan(rsi_i) else None),             # RSI14 saat cross
         'macd_hist_pct': ((macd_i / close_i * 100) if close_i else None),   # histogram MACD, dinormalisasi ke % harga
         'sar_dist_pct': ((close_i - sar_i) / close_i * 100) if close_i else None,  # jarak close ke PSAR (%), + = di atas SAR (uptrend PSAR)
-        f'rsi{RSI_GATE_FAST}': (float(rsi12_i) if not np.isnan(rsi12_i) else None),  # RSI cepat (gate)
-        f'rsi{RSI_GATE_SLOW}': (float(rsi24_i) if not np.isnan(rsi24_i) else None),  # RSI lambat (gate)
+        f'rsi{RSI_GATE_PERIOD}': (float(rsi_gate_i) if not np.isnan(rsi_gate_i) else None),  # RSI gate (periode pendek)
     }
 
 
 def _passes_rsi_gate(c, i, direction):
-    """Gate RSI dual-period saat EMA cross (bukan filter statistik -- kondisi STRUKTURAL).
-    direction: 'Long' (golden cross) butuh RSI_cepat > RSI_lambat; 'Short' (death cross)
-    butuh RSI_cepat < RSI_lambat, persis di candle cross yg sama. True kalau gate nonaktif
-    ATAU salah satu nilai RSI belum tersedia (masih warmup) -- fail-open spy tidak diam-diam
-    menolak semua trade di awal data krn NaN."""
+    """Gate RSI TUNGGAL saat EMA cross (bukan filter statistik -- kondisi STRUKTURAL).
+    Logika DIBALIK dari RSI konvensional: dipakai sbg batas ATAS utk Long (tolak kalau RSI
+    sudah kelewat tinggi/jenuh-beli) dan batas BAWAH utk Short (tolak kalau RSI sudah kelewat
+    rendah/jenuh-jual) -- kebalikan dari overbought=jual/oversold=beli yg biasa dipakai
+    strategi mean-reversion. direction: 'Long' butuh RSI <= RSI_GATE_MAX_LONG; 'Short' butuh
+    RSI >= RSI_GATE_MIN_SHORT, persis di candle cross yg sama. True kalau gate nonaktif ATAU
+    nilai RSI belum tersedia (masih warmup) -- fail-open spy tidak diam-diam menolak semua
+    trade di awal data krn NaN."""
     if not RSI_GATE_ENABLED:
         return True
-    fast = c['rsi_gate_fast'][i]
-    slow = c['rsi_gate_slow'][i]
-    if np.isnan(fast) or np.isnan(slow):
+    v = c['rsi_gate'][i]
+    if np.isnan(v):
         return True
     if direction == 'Long':
-        return fast > slow
+        return v <= RSI_GATE_MAX_LONG
     else:
-        return fast < slow
+        return v >= RSI_GATE_MIN_SHORT
 
 
 def prepare_coin(symbol, df):
@@ -470,7 +474,7 @@ def prepare_coin(symbol, df):
     None kalau data kurang."""
     n = len(df)
     warmup = max(EMA_SLOW, EMA_TREND, VOL_MA_PERIOD, ATR_PERIOD, RSI_PERIOD, MACD_SLOW,
-                 RSI_GATE_FAST, RSI_GATE_SLOW) + 10
+                 RSI_GATE_PERIOD) + 10
     if n < warmup + 10:
         return None
     O = df['open'].values; H = df['high'].values; L = df['low'].values; C = df['close'].values
@@ -482,8 +486,7 @@ def prepare_coin(symbol, df):
     vol_ma = pd.Series(V).rolling(VOL_MA_PERIOD, min_periods=1).mean().values
     atr = _calc_atr(H, L, C, ATR_PERIOD)
     rsi = _calc_rsi(C, RSI_PERIOD)
-    rsi_gate_fast = _calc_rsi(C, RSI_GATE_FAST)   # RSI12 default -- utk gate cross, TERPISAH dari RSI_PERIOD analisis
-    rsi_gate_slow = _calc_rsi(C, RSI_GATE_SLOW)   # RSI24 default
+    rsi_gate = _calc_rsi(C, RSI_GATE_PERIOD)   # RSI4 default -- utk gate cross, TERPISAH dari RSI_PERIOD analisis
     _, _, macd_hist = _calc_macd(C, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     sar, sar_up = _calc_psar(H, L, C, SAR_STEP, SAR_MAX_STEP)
     events = find_sr_events(df)
@@ -493,7 +496,7 @@ def prepare_coin(symbol, df):
     return {
         'symbol': symbol, 'O': O, 'H': H, 'L': L, 'C': C, 'V': V, 'TS': TS,
         'ema_fast': ema_fast, 'ema_slow': ema_slow, 'ema_trend': ema_trend,
-        'rsi_gate_fast': rsi_gate_fast, 'rsi_gate_slow': rsi_gate_slow,
+        'rsi_gate': rsi_gate,
         'vol_ma': vol_ma, 'atr': atr, 'rsi': rsi, 'macd_hist': macd_hist,
         'sar': sar, 'sar_up': sar_up, 'events_by_c3': events_by_c3,
         'n': n, 'warmup': warmup,
@@ -911,7 +914,7 @@ def _run():
               f"Balance akhir ${result['final_balance']:.2f} | "
               f"blocked: {result['blocked_by_slot']} (slot), {result['blocked_by_margin']} (margin), "
               f"{result['blocked_by_filter']} (filter indikator), "
-              f"{result['blocked_by_rsi_gate']} (RSI{RSI_GATE_FAST}/{RSI_GATE_SLOW} gate)")
+              f"{result['blocked_by_rsi_gate']} (RSI{RSI_GATE_PERIOD} gate)")
 
 
 # ============================================================
@@ -1010,9 +1013,10 @@ def _render_html() -> bytes:
     <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
     terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Filter aktif: {
         ', '.join(_active_filter_summary()) or 'tidak ada (semua nonaktif)'}
-    <br>Gate RSI{RSI_GATE_FAST}/RSI{RSI_GATE_SLOW} saat cross: <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b>
-    (Golden cross butuh RSI{RSI_GATE_FAST} &gt; RSI{RSI_GATE_SLOW}, Death cross butuh RSI{RSI_GATE_FAST} &lt; RSI{RSI_GATE_SLOW}
-    — matikan via env var <code>RSI_GATE_ENABLED=0</code>, atau ubah periode via <code>RSI_GATE_FAST</code>/<code>RSI_GATE_SLOW</code>)</p>
+    <br>Gate RSI{RSI_GATE_PERIOD} saat cross (LOGIKA DIBALIK dari RSI konvensional): <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b>
+    (Golden cross/Long butuh RSI{RSI_GATE_PERIOD} &le; {RSI_GATE_MAX_LONG:.0f} — tolak kalau sudah overbought,
+    Death cross/Short butuh RSI{RSI_GATE_PERIOD} &ge; {RSI_GATE_MIN_SHORT:.0f} — tolak kalau sudah oversold
+    — matikan via env var <code>RSI_GATE_ENABLED=0</code>, atau ubah lewat <code>RSI_GATE_PERIOD</code>/<code>RSI_GATE_MAX_LONG</code>/<code>RSI_GATE_MIN_SHORT</code>)</p>
     '''
 
     # ── Dampak Filter Aktif: bandingkan DENGAN filter (hasil di atas) vs simulasi
@@ -1232,7 +1236,7 @@ def _trades_csv() -> bytes:
         'symbol', 'direction', 'entry', 'sl', 'exit', 'reason', 'r_mult',
         'pnl_usd', 'entry_ts', 'exit_ts', 'balance_after',
         'vol_ratio', 'atr_ratio', 'ema_gap_pct', 'trend_pct', 'dist_pct',
-        'rsi', 'macd_hist_pct', 'sar_dist_pct', f'rsi{RSI_GATE_FAST}', f'rsi{RSI_GATE_SLOW}'],
+        'rsi', 'macd_hist_pct', 'sar_dist_pct', f'rsi{RSI_GATE_PERIOD}'],
         extrasaction='ignore')
     writer.writeheader()
     for t in trades_cp:
