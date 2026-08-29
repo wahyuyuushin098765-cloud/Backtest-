@@ -338,6 +338,16 @@ MACD_SIGNAL      = int(os.environ.get('MACD_SIGNAL', '9'))
 SAR_STEP         = float(os.environ.get('SAR_STEP', '0.02'))
 SAR_MAX_STEP     = float(os.environ.get('SAR_MAX_STEP', '0.2'))
 
+# ── GATE RSI DUAL-PERIOD saat EMA cross (BUKAN filter statistik ambang batas -- ini kondisi
+# STRUKTURAL yg dicek TEPAT di candle penyebab cross, sama level dgn syarat cross itu sendiri) ──
+# Golden cross (bias Long) valid HANYA jika RSI cepat (12) > RSI lambat (24) di candle itu.
+# Death cross  (bias Short) valid HANYA jika RSI cepat (12) < RSI lambat (24) di candle itu.
+# Alasan: RSI12 > RSI24 berarti momentum jangka-pendek sedang menguat lebih cepat drpd
+# jangka-menengah -- konfirmasi searah dgn golden cross, bukan cuma EMA yg kebetulan cross.
+RSI_GATE_ENABLED = os.environ.get('RSI_GATE_ENABLED', '1').strip() not in ('0', 'false', 'False', '')
+RSI_GATE_FAST    = int(os.environ.get('RSI_GATE_FAST', '12'))
+RSI_GATE_SLOW    = int(os.environ.get('RSI_GATE_SLOW', '24'))
+
 
 def _calc_rsi(C, period):
     """RSI standar (Wilder smoothing via EWM alpha=1/period).
@@ -421,6 +431,8 @@ def _capture_indicators(c, i):
     macd_i  = c['macd_hist'][i]
     sar_i   = c['sar'][i]
     sar_up  = c['sar_up'][i]
+    rsi12_i = c['rsi_gate_fast'][i]
+    rsi24_i = c['rsi_gate_slow'][i]
     return {
         'vol_ratio': (c['V'][i] / vol_ma) if vol_ma > 0 else None,          # volume vs rata2 20 candle
         'atr_ratio': (rng / atr_i) if atr_i > 0 else None,                  # besar candle vs volatilitas normal
@@ -430,14 +442,35 @@ def _capture_indicators(c, i):
         'rsi': (float(rsi_i) if not np.isnan(rsi_i) else None),             # RSI14 saat cross
         'macd_hist_pct': ((macd_i / close_i * 100) if close_i else None),   # histogram MACD, dinormalisasi ke % harga
         'sar_dist_pct': ((close_i - sar_i) / close_i * 100) if close_i else None,  # jarak close ke PSAR (%), + = di atas SAR (uptrend PSAR)
+        f'rsi{RSI_GATE_FAST}': (float(rsi12_i) if not np.isnan(rsi12_i) else None),  # RSI cepat (gate)
+        f'rsi{RSI_GATE_SLOW}': (float(rsi24_i) if not np.isnan(rsi24_i) else None),  # RSI lambat (gate)
     }
+
+
+def _passes_rsi_gate(c, i, direction):
+    """Gate RSI dual-period saat EMA cross (bukan filter statistik -- kondisi STRUKTURAL).
+    direction: 'Long' (golden cross) butuh RSI_cepat > RSI_lambat; 'Short' (death cross)
+    butuh RSI_cepat < RSI_lambat, persis di candle cross yg sama. True kalau gate nonaktif
+    ATAU salah satu nilai RSI belum tersedia (masih warmup) -- fail-open spy tidak diam-diam
+    menolak semua trade di awal data krn NaN."""
+    if not RSI_GATE_ENABLED:
+        return True
+    fast = c['rsi_gate_fast'][i]
+    slow = c['rsi_gate_slow'][i]
+    if np.isnan(fast) or np.isnan(slow):
+        return True
+    if direction == 'Long':
+        return fast > slow
+    else:
+        return fast < slow
 
 
 def prepare_coin(symbol, df):
     """Precompute semua yang dibutuhkan simulasi + indikator (utk analisis win/loss) utk 1 koin.
     None kalau data kurang."""
     n = len(df)
-    warmup = max(EMA_SLOW, EMA_TREND, VOL_MA_PERIOD, ATR_PERIOD, RSI_PERIOD, MACD_SLOW) + 10
+    warmup = max(EMA_SLOW, EMA_TREND, VOL_MA_PERIOD, ATR_PERIOD, RSI_PERIOD, MACD_SLOW,
+                 RSI_GATE_FAST, RSI_GATE_SLOW) + 10
     if n < warmup + 10:
         return None
     O = df['open'].values; H = df['high'].values; L = df['low'].values; C = df['close'].values
@@ -449,6 +482,8 @@ def prepare_coin(symbol, df):
     vol_ma = pd.Series(V).rolling(VOL_MA_PERIOD, min_periods=1).mean().values
     atr = _calc_atr(H, L, C, ATR_PERIOD)
     rsi = _calc_rsi(C, RSI_PERIOD)
+    rsi_gate_fast = _calc_rsi(C, RSI_GATE_FAST)   # RSI12 default -- utk gate cross, TERPISAH dari RSI_PERIOD analisis
+    rsi_gate_slow = _calc_rsi(C, RSI_GATE_SLOW)   # RSI24 default
     _, _, macd_hist = _calc_macd(C, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
     sar, sar_up = _calc_psar(H, L, C, SAR_STEP, SAR_MAX_STEP)
     events = find_sr_events(df)
@@ -458,6 +493,7 @@ def prepare_coin(symbol, df):
     return {
         'symbol': symbol, 'O': O, 'H': H, 'L': L, 'C': C, 'V': V, 'TS': TS,
         'ema_fast': ema_fast, 'ema_slow': ema_slow, 'ema_trend': ema_trend,
+        'rsi_gate_fast': rsi_gate_fast, 'rsi_gate_slow': rsi_gate_slow,
         'vol_ma': vol_ma, 'atr': atr, 'rsi': rsi, 'macd_hist': macd_hist,
         'sar': sar, 'sar_up': sar_up, 'events_by_c3': events_by_c3,
         'n': n, 'warmup': warmup,
@@ -489,6 +525,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
     blocked_by_slot   = 0    # counter: berapa kali sinyal valid terpaksa dilewati krn slot penuh
     blocked_by_margin = 0    # counter: dilewati krn margin (leverage) sudah habis -- constraint ASLI Bybit
     blocked_by_filter = 0    # counter: dilewati krn tidak lolos filter indikator
+    blocked_by_rsi_gate = 0  # counter: dilewati krn gate RSI12 vs RSI24 tidak searah dgn cross
 
     def _akey(symbol, direction):
         return f"{symbol}|{direction}" if ALLOW_HEDGE else symbol
@@ -661,42 +698,48 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                 else:
                     armed[key_long] = {'c1_ts': e['c1_ts']}
 
-            # ── 5) cross SEARAH -> pasang/ganti limit di wick, TUNDUK ke MAX_CONCURRENT & FILTER ──
+            # ── 5) cross SEARAH -> pasang/ganti limit di wick, TUNDUK ke RSI GATE, MAX_CONCURRENT & FILTER ──
             # Tangkap indikator PERSIS di candle cross ini -> dipakai jg utk filter & analisis win/loss.
             if death_cross and key_short in armed and key_short not in active_positions:
                 wick = H[i]; old_dist = wick - C_[i]
                 if old_dist > 0:
-                    ind = _capture_indicators(c, i)
-                    ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
-                    if not _passes_filters(ind, filters_enabled):
-                        blocked_by_filter += 1
-                    elif key_short not in pending and _slots_used() >= MAX_CONCURRENT:
-                        blocked_by_slot += 1
+                    if not _passes_rsi_gate(c, i, 'Short'):
+                        blocked_by_rsi_gate += 1
                     else:
-                        pending[key_short] = {
-                            'entry': wick, 'sl': wick + old_dist, 'dist': old_dist, 'ind': ind,
-                        }
+                        ind = _capture_indicators(c, i)
+                        ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
+                        if not _passes_filters(ind, filters_enabled):
+                            blocked_by_filter += 1
+                        elif key_short not in pending and _slots_used() >= MAX_CONCURRENT:
+                            blocked_by_slot += 1
+                        else:
+                            pending[key_short] = {
+                                'entry': wick, 'sl': wick + old_dist, 'dist': old_dist, 'ind': ind,
+                            }
 
             if golden_cross and key_long in armed and key_long not in active_positions:
                 wick = L[i]; old_dist = C_[i] - wick
                 if old_dist > 0:
-                    ind = _capture_indicators(c, i)
-                    ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
-                    if not _passes_filters(ind, filters_enabled):
-                        blocked_by_filter += 1
-                    elif key_long not in pending and _slots_used() >= MAX_CONCURRENT:
-                        blocked_by_slot += 1
+                    if not _passes_rsi_gate(c, i, 'Long'):
+                        blocked_by_rsi_gate += 1
                     else:
-                        pending[key_long] = {
-                            'entry': wick, 'sl': wick - old_dist, 'dist': old_dist, 'ind': ind,
-                        }
+                        ind = _capture_indicators(c, i)
+                        ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
+                        if not _passes_filters(ind, filters_enabled):
+                            blocked_by_filter += 1
+                        elif key_long not in pending and _slots_used() >= MAX_CONCURRENT:
+                            blocked_by_slot += 1
+                        else:
+                            pending[key_long] = {
+                                'entry': wick, 'sl': wick - old_dist, 'dist': old_dist, 'ind': ind,
+                            }
 
     wins = [t for t in trades if t['r_mult'] > 0]
     total_pnl = sum(t['pnl_usd'] for t in trades)
     return {
         'trades': trades, 'final_balance': balance,
         'blocked_by_slot': blocked_by_slot, 'blocked_by_margin': blocked_by_margin,
-        'blocked_by_filter': blocked_by_filter,
+        'blocked_by_filter': blocked_by_filter, 'blocked_by_rsi_gate': blocked_by_rsi_gate,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
         'total_pnl': total_pnl,
@@ -867,7 +910,8 @@ def _run():
               f"PnL ${result['total_pnl']:+.2f} | ROI {result['roi']:+.1f}% | "
               f"Balance akhir ${result['final_balance']:.2f} | "
               f"blocked: {result['blocked_by_slot']} (slot), {result['blocked_by_margin']} (margin), "
-              f"{result['blocked_by_filter']} (filter indikator)")
+              f"{result['blocked_by_filter']} (filter indikator), "
+              f"{result['blocked_by_rsi_gate']} (RSI{RSI_GATE_FAST}/{RSI_GATE_SLOW} gate)")
 
 
 # ============================================================
@@ -938,13 +982,14 @@ def _render_html() -> bytes:
     blocked_slot   = cr.get('blocked_by_slot', 0)
     blocked_margin = cr.get('blocked_by_margin', 0)
     blocked_filter = cr.get('blocked_by_filter', 0)
+    blocked_rsi_gate = cr.get('blocked_by_rsi_gate', 0)
 
     summary_html = f'''
     <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
     <table>
       <tr><th>Total Trade</th><th>Win</th><th>Loss</th><th>WR%</th><th>Total PnL</th>
           <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
-          <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th></tr>
+          <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th><th>Blokir: RSI Gate</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
@@ -958,12 +1003,16 @@ def _render_html() -> bytes:
         <td class="y">{blocked_slot}</td>
         <td class="y">{blocked_margin}</td>
         <td class="y">{blocked_filter}</td>
+        <td class="y">{blocked_rsi_gate}</td>
       </tr>
     </table>
     <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
     <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
     terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Filter aktif: {
-        ', '.join(_active_filter_summary()) or 'tidak ada (semua nonaktif)'}</p>
+        ', '.join(_active_filter_summary()) or 'tidak ada (semua nonaktif)'}
+    <br>Gate RSI{RSI_GATE_FAST}/RSI{RSI_GATE_SLOW} saat cross: <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b>
+    (Golden cross butuh RSI{RSI_GATE_FAST} &gt; RSI{RSI_GATE_SLOW}, Death cross butuh RSI{RSI_GATE_FAST} &lt; RSI{RSI_GATE_SLOW}
+    — matikan via env var <code>RSI_GATE_ENABLED=0</code>, atau ubah periode via <code>RSI_GATE_FAST</code>/<code>RSI_GATE_SLOW</code>)</p>
     '''
 
     # ── Dampak Filter Aktif: bandingkan DENGAN filter (hasil di atas) vs simulasi
@@ -1183,7 +1232,7 @@ def _trades_csv() -> bytes:
         'symbol', 'direction', 'entry', 'sl', 'exit', 'reason', 'r_mult',
         'pnl_usd', 'entry_ts', 'exit_ts', 'balance_after',
         'vol_ratio', 'atr_ratio', 'ema_gap_pct', 'trend_pct', 'dist_pct',
-        'rsi', 'macd_hist_pct', 'sar_dist_pct'],
+        'rsi', 'macd_hist_pct', 'sar_dist_pct', f'rsi{RSI_GATE_FAST}', f'rsi{RSI_GATE_SLOW}'],
         extrasaction='ignore')
     writer.writeheader()
     for t in trades_cp:
