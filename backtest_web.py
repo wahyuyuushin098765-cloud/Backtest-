@@ -78,6 +78,20 @@ FILTER_MAX_EMA_GAP_PCT = float(os.environ.get('FILTER_MAX_EMA_GAP_PCT', '0'))   
 FILTER_MIN_DIST_PCT    = float(os.environ.get('FILTER_MIN_DIST_PCT', '0'))       # 0 = nonaktif
 FILTER_MAX_DIST_PCT    = float(os.environ.get('FILTER_MAX_DIST_PCT', '0'))       # 0 = nonaktif
 
+# RSI/MACD/SAR: sentinel nonaktif = string kosong (BUKAN 0), karena MACD histogram &
+# jarak-ke-SAR bisa bernilai negatif secara wajar (0 tetap nilai valid utk keduanya).
+def _env_float_opt(name):
+    raw = os.environ.get(name, '').strip()
+    return float(raw) if raw != '' else None
+
+FILTER_MIN_RSI          = _env_float_opt('FILTER_MIN_RSI')            # None = nonaktif
+FILTER_MAX_RSI          = _env_float_opt('FILTER_MAX_RSI')            # None = nonaktif
+FILTER_MIN_MACD_HIST    = _env_float_opt('FILTER_MIN_MACD_HIST_PCT')  # None = nonaktif
+FILTER_MAX_MACD_HIST    = _env_float_opt('FILTER_MAX_MACD_HIST_PCT')  # None = nonaktif
+FILTER_MIN_SAR_DIST_PCT = _env_float_opt('FILTER_MIN_SAR_DIST_PCT')   # None = nonaktif
+FILTER_MAX_SAR_DIST_PCT = _env_float_opt('FILTER_MAX_SAR_DIST_PCT')   # None = nonaktif
+
+
 # CACHE data candle H1 ke disk supaya tidak perlu fetch ulang dari Bybit tiap kali variable
 # strategi diubah. Arahkan CACHE_DIR ke mount point Railway Volume (mis. /data/cache) biar
 # persisten lintas redeploy. Tanpa Volume, cache tetap jalan tapi hilang tiap redeploy.
@@ -114,6 +128,39 @@ _combined_result = {         # ringkasan hasil simulasi gabungan (1 balance, 1 p
     'blocked_by_slot': 0, 'blocked_by_margin': 0, 'blocked_by_filter': 0,
 }
 _indicator_result = {}      # hasil analisis indikator saat cross (win vs loss)
+_no_filter_result = None    # ringkasan simulasi PEMBANDING tanpa filter (None jika tidak ada filter aktif)
+
+
+def _any_filter_active():
+    return (
+        FILTER_MIN_ATR_RATIO > 0 or FILTER_MAX_ATR_RATIO > 0 or
+        FILTER_MIN_VOL_RATIO > 0 or FILTER_MAX_VOL_RATIO > 0 or
+        FILTER_MIN_EMA_GAP_PCT > 0 or FILTER_MAX_EMA_GAP_PCT > 0 or
+        FILTER_MIN_DIST_PCT > 0 or FILTER_MAX_DIST_PCT > 0 or
+        FILTER_MIN_RSI is not None or FILTER_MAX_RSI is not None or
+        FILTER_MIN_MACD_HIST is not None or FILTER_MAX_MACD_HIST is not None or
+        FILTER_MIN_SAR_DIST_PCT is not None or FILTER_MAX_SAR_DIST_PCT is not None
+    )
+
+
+def _active_filter_summary():
+    """List string ringkas filter yg sedang aktif, utk ditampilkan di dashboard."""
+    parts = []
+    if FILTER_MIN_ATR_RATIO > 0: parts.append(f"ATR ratio ≥ {FILTER_MIN_ATR_RATIO:.2f}x")
+    if FILTER_MAX_ATR_RATIO > 0: parts.append(f"ATR ratio ≤ {FILTER_MAX_ATR_RATIO:.2f}x")
+    if FILTER_MIN_VOL_RATIO > 0: parts.append(f"Vol ratio ≥ {FILTER_MIN_VOL_RATIO:.2f}x")
+    if FILTER_MAX_VOL_RATIO > 0: parts.append(f"Vol ratio ≤ {FILTER_MAX_VOL_RATIO:.2f}x")
+    if FILTER_MIN_EMA_GAP_PCT > 0: parts.append(f"EMA gap ≥ {FILTER_MIN_EMA_GAP_PCT:.3f}%")
+    if FILTER_MAX_EMA_GAP_PCT > 0: parts.append(f"EMA gap ≤ {FILTER_MAX_EMA_GAP_PCT:.3f}%")
+    if FILTER_MIN_DIST_PCT > 0: parts.append(f"Jarak SL ≥ {FILTER_MIN_DIST_PCT:.3f}%")
+    if FILTER_MAX_DIST_PCT > 0: parts.append(f"Jarak SL ≤ {FILTER_MAX_DIST_PCT:.3f}%")
+    if FILTER_MIN_RSI is not None: parts.append(f"RSI ≥ {FILTER_MIN_RSI:.1f}")
+    if FILTER_MAX_RSI is not None: parts.append(f"RSI ≤ {FILTER_MAX_RSI:.1f}")
+    if FILTER_MIN_MACD_HIST is not None: parts.append(f"MACD hist ≥ {FILTER_MIN_MACD_HIST:+.3f}%")
+    if FILTER_MAX_MACD_HIST is not None: parts.append(f"MACD hist ≤ {FILTER_MAX_MACD_HIST:+.3f}%")
+    if FILTER_MIN_SAR_DIST_PCT is not None: parts.append(f"Jarak SAR ≥ {FILTER_MIN_SAR_DIST_PCT:+.2f}%")
+    if FILTER_MAX_SAR_DIST_PCT is not None: parts.append(f"Jarak SAR ≤ {FILTER_MAX_SAR_DIST_PCT:+.2f}%")
+    return parts
 
 
 def _ts():
@@ -424,8 +471,10 @@ def prepare_coin(symbol, df):
 # dipakai bersama oleh semua koin, bukan simulasi per-koin terisolasi)
 # ============================================================
 
-def run_combined_backtest(coins: dict) -> dict:
-    """coins: {symbol: prepared_dict dari prepare_coin()}"""
+def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
+    """coins: {symbol: prepared_dict dari prepare_coin()}
+    filters_enabled=False -> semua FILTER_* diabaikan (dipakai utk simulasi pembanding
+    'tanpa filter' pada bagian Dampak Filter Aktif)."""
     # ── timeline global: semua timestamp dari semua koin, urut kronologis ──
     all_ts = set()
     for c in coins.values():
@@ -453,7 +502,9 @@ def run_combined_backtest(coins: dict) -> dict:
         dibuka bersamaan, BUKAN sekadar persentase risiko."""
         return sum((p['entry'] * p['qty']) / LEVERAGE for p in active_positions.values())
 
-    def _passes_filters(ind):
+    def _passes_filters(ind, enabled=True):
+        if not enabled:
+            return True
         v = ind.get('atr_ratio')
         if FILTER_MIN_ATR_RATIO > 0 and (v is None or v < FILTER_MIN_ATR_RATIO):
             return False
@@ -473,6 +524,21 @@ def run_combined_backtest(coins: dict) -> dict:
         if FILTER_MIN_DIST_PCT > 0 and (v is None or v < FILTER_MIN_DIST_PCT):
             return False
         if FILTER_MAX_DIST_PCT > 0 and (v is None or v > FILTER_MAX_DIST_PCT):
+            return False
+        v = ind.get('rsi')
+        if FILTER_MIN_RSI is not None and (v is None or v < FILTER_MIN_RSI):
+            return False
+        if FILTER_MAX_RSI is not None and (v is None or v > FILTER_MAX_RSI):
+            return False
+        v = ind.get('macd_hist_pct')
+        if FILTER_MIN_MACD_HIST is not None and (v is None or v < FILTER_MIN_MACD_HIST):
+            return False
+        if FILTER_MAX_MACD_HIST is not None and (v is None or v > FILTER_MAX_MACD_HIST):
+            return False
+        v = ind.get('sar_dist_pct')
+        if FILTER_MIN_SAR_DIST_PCT is not None and (v is None or v < FILTER_MIN_SAR_DIST_PCT):
+            return False
+        if FILTER_MAX_SAR_DIST_PCT is not None and (v is None or v > FILTER_MAX_SAR_DIST_PCT):
             return False
         return True
 
@@ -602,7 +668,7 @@ def run_combined_backtest(coins: dict) -> dict:
                 if old_dist > 0:
                     ind = _capture_indicators(c, i)
                     ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
-                    if not _passes_filters(ind):
+                    if not _passes_filters(ind, filters_enabled):
                         blocked_by_filter += 1
                     elif key_short not in pending and _slots_used() >= MAX_CONCURRENT:
                         blocked_by_slot += 1
@@ -616,7 +682,7 @@ def run_combined_backtest(coins: dict) -> dict:
                 if old_dist > 0:
                     ind = _capture_indicators(c, i)
                     ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
-                    if not _passes_filters(ind):
+                    if not _passes_filters(ind, filters_enabled):
                         blocked_by_filter += 1
                     elif key_long not in pending and _slots_used() >= MAX_CONCURRENT:
                         blocked_by_slot += 1
@@ -753,11 +819,27 @@ def _run():
     result = run_combined_backtest(coins)
     ind_analysis = indicator_analysis(result['trades'])
 
+    no_filter_summary = None
+    if _any_filter_active():
+        _log_msg("🔁 Filter aktif terdeteksi — menjalankan simulasi PEMBANDING tanpa filter "
+                  "utk mengukur dampaknya (n trade, WR, PnL)...")
+        result_nf = run_combined_backtest(coins, filters_enabled=False)
+        no_filter_summary = {
+            'n_trades': result_nf['n_trades'], 'wr': result_nf['wr'],
+            'total_pnl': result_nf['total_pnl'], 'roi': result_nf['roi'],
+            'total_r': result_nf['total_r'], 'avg_r': result_nf['avg_r'],
+            'final_balance': result_nf['final_balance'],
+        }
+        _log_msg(f"   Tanpa filter: {result_nf['n_trades']} trade | WR {result_nf['wr']:.1f}% | "
+                  f"PnL ${result_nf['total_pnl']:+.2f} | Total R {result_nf['total_r']:+.2f}")
+
     with _lock:
         _combined_result.update(result)
         _all_trades.extend(result['trades'])
         _results.extend(per_symbol_breakdown(result['trades']))
         _indicator_result.update(ind_analysis)
+        global _no_filter_result
+        _no_filter_result = no_filter_summary
         _phase = 'done'
 
     _log_msg(f"🏁 Selesai! {result['n_trades']} trade | WR {result['wr']:.1f}% | "
@@ -811,6 +893,7 @@ def _render_html() -> bytes:
         trades_cp = list(_all_trades)
         cr = dict(_combined_result)
         ind_cp = dict(_indicator_result)
+        nf_cp = dict(_no_filter_result) if _no_filter_result else None
 
     refresh = '<meta http-equiv="refresh" content="5">' if phase == 'running' else ''
     chip_cls = {'running': 'running', 'done': 'done', 'error': 'error'}.get(phase, 'running')
@@ -859,19 +942,78 @@ def _render_html() -> bytes:
     <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
     <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
     terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Filter aktif: {
-        ', '.join(f
-        for f in [
-            f'ATR≥{FILTER_MIN_ATR_RATIO}x' if FILTER_MIN_ATR_RATIO > 0 else '',
-            f'ATR≤{FILTER_MAX_ATR_RATIO}x' if FILTER_MAX_ATR_RATIO > 0 else '',
-            f'Vol≥{FILTER_MIN_VOL_RATIO}x' if FILTER_MIN_VOL_RATIO > 0 else '',
-            f'Vol≤{FILTER_MAX_VOL_RATIO}x' if FILTER_MAX_VOL_RATIO > 0 else '',
-            f'EMAgap≥{FILTER_MIN_EMA_GAP_PCT}%' if FILTER_MIN_EMA_GAP_PCT > 0 else '',
-            f'EMAgap≤{FILTER_MAX_EMA_GAP_PCT}%' if FILTER_MAX_EMA_GAP_PCT > 0 else '',
-            f'SLdist≥{FILTER_MIN_DIST_PCT}%' if FILTER_MIN_DIST_PCT > 0 else '',
-            f'SLdist≤{FILTER_MAX_DIST_PCT}%' if FILTER_MAX_DIST_PCT > 0 else '',
-        ] if f
-    ) or 'tidak ada (semua nonaktif)'}</p>
+        ', '.join(_active_filter_summary()) or 'tidak ada (semua nonaktif)'}</p>
     '''
+
+    # ── Dampak Filter Aktif: bandingkan DENGAN filter (hasil di atas) vs simulasi
+    #    PEMBANDING tanpa filter, dijalankan sekali di awal saat filter terdeteksi aktif ──
+    filter_impact_html = ''
+    if nf_cp is not None:
+        active_filters = _active_filter_summary()
+        filt_chips = ''.join(f'<span class="chip" style="background:#1f6feb33;color:#58a6ff;margin:2px">{f}</span> '
+                              for f in active_filters)
+        n_delta = total_trades - nf_cp['n_trades']
+        n_delta_pct = (n_delta / nf_cp['n_trades'] * 100) if nf_cp['n_trades'] else 0
+        wr_delta = wr_overall - nf_cp['wr']
+        pnl_delta = total_pnl - nf_cp['total_pnl']
+        totalr_cur = cr.get('total_r', 0)
+        totalr_delta = totalr_cur - nf_cp['total_r']
+
+        def _dc(v):  # kelas warna utk delta (hijau kalau naik, merah kalau turun)
+            return 'g' if v > 0 else ('r' if v < 0 else 'y')
+
+        filter_impact_html = f'''
+        <h2>⚖️ Dampak Filter Aktif — Dengan Filter vs Tanpa Filter</h2>
+        <p class="note">Filter yang sedang aktif: {filt_chips or '(tidak ada)'}</p>
+        <div class="tbl-wrap">
+        <table>
+          <tr><th></th><th>N Trade</th><th>WR%</th><th>Total PnL</th><th>Total R</th><th>Balance Akhir</th></tr>
+          <tr>
+            <td>🔒 DENGAN filter (hasil aktif)</td>
+            <td>{total_trades}</td>
+            <td class="{'g' if wr_overall>=40 else ('y' if wr_overall>=25 else 'r')}">{wr_overall:.1f}%</td>
+            <td class="{'g' if total_pnl>=0 else 'r'}">${total_pnl:+,.2f}</td>
+            <td class="{'g' if totalr_cur>=0 else 'r'}">{totalr_cur:+.2f}</td>
+            <td>${final_bal:,.2f}</td>
+          </tr>
+          <tr>
+            <td>🔓 TANPA filter (simulasi pembanding)</td>
+            <td>{nf_cp['n_trades']}</td>
+            <td>{nf_cp['wr']:.1f}%</td>
+            <td>${nf_cp['total_pnl']:+,.2f}</td>
+            <td>{nf_cp['total_r']:+.2f}</td>
+            <td>${nf_cp['final_balance']:,.2f}</td>
+          </tr>
+          <tr style="border-top:2px solid #30363d">
+            <td><b>Selisih (Filter − Tanpa Filter)</b></td>
+            <td class="{_dc(n_delta)}">{n_delta:+d} trade ({n_delta_pct:+.1f}%)</td>
+            <td class="{_dc(wr_delta)}">{wr_delta:+.1f}pp</td>
+            <td class="{_dc(pnl_delta)}">${pnl_delta:+,.2f}</td>
+            <td class="{_dc(totalr_delta)}">{totalr_delta:+.2f}</td>
+            <td class="{_dc(final_bal - nf_cp['final_balance'])}">${final_bal - nf_cp['final_balance']:+,.2f}</td>
+          </tr>
+        </table>
+        </div>
+        <div class="note">
+          💡 Baris "Selisih" menjawab: apakah filter ini <b>sepadan</b>? Kalau N Trade berkurang drastis
+          tapi WR/Total R/PnL cuma naik tipis (atau malah turun), filter itu kemungkinan MEMBUANG
+          peluang tanpa manfaat yang cukup. Filter yang baik: N Trade berkurang wajar, tapi Total R
+          & PnL naik lebih dari proporsional (karena membuang trade-trade yang kalah lebih banyak
+          daripada yang menang).
+          <br>⚙️ Atur ambang batas via Railway Variables: <code>FILTER_MIN_ATR_RATIO</code>,
+          <code>FILTER_MAX_ATR_RATIO</code>, <code>FILTER_MIN_VOL_RATIO</code>, <code>FILTER_MAX_VOL_RATIO</code>,
+          <code>FILTER_MIN_EMA_GAP_PCT</code>, <code>FILTER_MAX_EMA_GAP_PCT</code>,
+          <code>FILTER_MIN_DIST_PCT</code>, <code>FILTER_MAX_DIST_PCT</code>,
+          <code>FILTER_MIN_RSI</code>, <code>FILTER_MAX_RSI</code>,
+          <code>FILTER_MIN_MACD_HIST_PCT</code>, <code>FILTER_MAX_MACD_HIST_PCT</code>,
+          <code>FILTER_MIN_SAR_DIST_PCT</code>, <code>FILTER_MAX_SAR_DIST_PCT</code>
+          (isi salah satu sisi saja utk filter satu-arah, isi MIN+MAX utk filter "range"/tengah,
+          kosongkan/hapus utk nonaktifkan sisi itu). Lihat nilai ambang batas tercile per-indikator
+          di tabel "Analisis Indikator" di bawah sebagai referensi angka.
+          <br>Simulasi pembanding ini dijalankan otomatis SEKALI di awal saat filter terdeteksi aktif —
+          jalankan ulang backtest (restart service) setelah mengubah env var utk lihat dampak barunya.
+        </div>
+        '''
 
     # ── tabel per coin (kontribusi PnL masing-masing dari balance BERSAMA di atas) ──
     rows = ''
@@ -957,6 +1099,8 @@ def _render_html() -> bytes:
   </p>
 
   {summary_html}
+
+  {filter_impact_html}
 
   <h2>Kontribusi Per Coin</h2>
   <div class="tbl-wrap">{coin_table}</div>
