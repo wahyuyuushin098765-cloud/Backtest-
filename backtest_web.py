@@ -280,6 +280,87 @@ def _calc_atr(H, L, C, period):
 
 
 # ============================================================
+# INDIKATOR TAMBAHAN: RSI, MACD, PARABOLIC SAR
+# (implementasi manual numpy/pandas, tanpa dependency TA-Lib)
+# ============================================================
+
+RSI_PERIOD       = int(os.environ.get('RSI_PERIOD', '14'))
+MACD_FAST        = int(os.environ.get('MACD_FAST', '12'))
+MACD_SLOW        = int(os.environ.get('MACD_SLOW', '26'))
+MACD_SIGNAL      = int(os.environ.get('MACD_SIGNAL', '9'))
+SAR_STEP         = float(os.environ.get('SAR_STEP', '0.02'))
+SAR_MAX_STEP     = float(os.environ.get('SAR_MAX_STEP', '0.2'))
+
+
+def _calc_rsi(C, period):
+    """RSI standar (Wilder smoothing via EWM alpha=1/period).
+    Rumus 100*avg_gain/(avg_gain+avg_loss) dipakai langsung (bukan 100-100/(1+RS))
+    supaya kasus tepi avg_gain=avg_loss=0 (harga flat berturut-turut) otomatis
+    jadi NaN alih-alih perlu di-patch manual -- identik dgn definisi RSI standar."""
+    close = pd.Series(C)
+    delta = close.diff(1)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+    rsi = 100 * avg_gain / (avg_gain + avg_loss)
+    return rsi.values
+
+
+def _calc_macd(C, fast, slow, signal):
+    """MACD line, signal line, histogram."""
+    ema_fast = pd.Series(C).ewm(span=fast, adjust=False).mean().values
+    ema_slow = pd.Series(C).ewm(span=slow, adjust=False).mean().values
+    macd_line = ema_fast - ema_slow
+    signal_line = pd.Series(macd_line).ewm(span=signal, adjust=False).mean().values
+    hist = macd_line - signal_line
+    return macd_line, signal_line, hist
+
+
+def _calc_psar(H, L, C, step=0.02, max_step=0.2):
+    """Parabolic SAR (Wilder), urutan langkah mengikuti implementasi standar:
+    1) proyeksi sar[i] dari sar[i-1], 2) tentukan reversal berdasarkan proyeksi itu,
+    3) update EP/AF, 4) clamp sar[i] ke high/low candle SEBELUMNYA (i-1) saja,
+    5) kalau reversal, timpa sar[i] = ep lama & reset AF/EP.
+    Return (sar, is_falling_bool_array) -- falling=True berarti SAR di ATAS harga (downtrend)."""
+    n = len(C)
+    sar = np.zeros(n)
+    falling = np.zeros(n, dtype=bool)
+    if n == 0:
+        return sar, falling
+    falling[0] = H[0] < H[0]  # placeholder, ditentukan dari 2 candle pertama di bawah
+    # tentukan arah awal dari candle 0->1 (naik/turun net) -- konsisten dgn referensi:
+    is_falling = L[0] > L[1] if n > 1 else False if n > 0 else False
+    # (fallback sederhana bila n==1 tak relevan krn warmup jauh lebih besar dari 1)
+    ep = L[0] if is_falling else H[0]
+    af = step
+    sar[0] = C[0] if len(C) else (H[0] if is_falling else L[0])
+    falling[0] = is_falling
+    for i in range(1, n):
+        proj = sar[i - 1] + af * (ep - sar[i - 1])
+        if is_falling:
+            reverse = H[i] > proj
+            if L[i] < ep:
+                ep = L[i]
+                af = min(af + step, max_step)
+            proj = max(H[i - 1], proj)
+        else:
+            reverse = L[i] < proj
+            if H[i] > ep:
+                ep = H[i]
+                af = min(af + step, max_step)
+            proj = min(L[i - 1], proj)
+        if reverse:
+            proj = ep
+            af = step
+            is_falling = not is_falling
+            ep = L[i] if is_falling else H[i]
+        sar[i] = proj
+        falling[i] = is_falling
+    return sar, ~falling  # kembalikan sbg "is_uptrend" (kebalikan dari falling) spy sesuai nama lama
+
+
+# ============================================================
 # INDIKATOR SAAT CROSS (utk analisis pola menang/kalah)
 # ============================================================
 
@@ -289,12 +370,19 @@ def _capture_indicators(c, i):
     vol_ma  = c['vol_ma'][i]
     atr_i   = c['atr'][i]
     rng     = c['H'][i] - c['L'][i]
+    rsi_i   = c['rsi'][i]
+    macd_i  = c['macd_hist'][i]
+    sar_i   = c['sar'][i]
+    sar_up  = c['sar_up'][i]
     return {
         'vol_ratio': (c['V'][i] / vol_ma) if vol_ma > 0 else None,          # volume vs rata2 20 candle
         'atr_ratio': (rng / atr_i) if atr_i > 0 else None,                  # besar candle vs volatilitas normal
         'ema_gap_pct': (abs(c['ema_fast'][i] - c['ema_slow'][i]) / close_i * 100) if close_i else None,
         'trend_pct': ((close_i - c['ema_trend'][i]) / c['ema_trend'][i] * 100) if c['ema_trend'][i] else None,
         'dist_pct': None,   # diisi setelah dist final diketahui (lihat di bawah)
+        'rsi': (float(rsi_i) if not np.isnan(rsi_i) else None),             # RSI14 saat cross
+        'macd_hist_pct': ((macd_i / close_i * 100) if close_i else None),   # histogram MACD, dinormalisasi ke % harga
+        'sar_dist_pct': ((close_i - sar_i) / close_i * 100) if close_i else None,  # jarak close ke PSAR (%), + = di atas SAR (uptrend PSAR)
     }
 
 
@@ -302,7 +390,7 @@ def prepare_coin(symbol, df):
     """Precompute semua yang dibutuhkan simulasi + indikator (utk analisis win/loss) utk 1 koin.
     None kalau data kurang."""
     n = len(df)
-    warmup = max(EMA_SLOW, EMA_TREND, VOL_MA_PERIOD, ATR_PERIOD) + 10
+    warmup = max(EMA_SLOW, EMA_TREND, VOL_MA_PERIOD, ATR_PERIOD, RSI_PERIOD, MACD_SLOW) + 10
     if n < warmup + 10:
         return None
     O = df['open'].values; H = df['high'].values; L = df['low'].values; C = df['close'].values
@@ -313,6 +401,9 @@ def prepare_coin(symbol, df):
     ema_trend = df['close'].ewm(span=EMA_TREND, adjust=False).mean().values
     vol_ma = pd.Series(V).rolling(VOL_MA_PERIOD, min_periods=1).mean().values
     atr = _calc_atr(H, L, C, ATR_PERIOD)
+    rsi = _calc_rsi(C, RSI_PERIOD)
+    _, _, macd_hist = _calc_macd(C, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+    sar, sar_up = _calc_psar(H, L, C, SAR_STEP, SAR_MAX_STEP)
     events = find_sr_events(df)
     events_by_c3 = {}
     for e in events:
@@ -320,7 +411,8 @@ def prepare_coin(symbol, df):
     return {
         'symbol': symbol, 'O': O, 'H': H, 'L': L, 'C': C, 'V': V, 'TS': TS,
         'ema_fast': ema_fast, 'ema_slow': ema_slow, 'ema_trend': ema_trend,
-        'vol_ma': vol_ma, 'atr': atr, 'events_by_c3': events_by_c3,
+        'vol_ma': vol_ma, 'atr': atr, 'rsi': rsi, 'macd_hist': macd_hist,
+        'sar': sar, 'sar_up': sar_up, 'events_by_c3': events_by_c3,
         'n': n, 'warmup': warmup,
         'ts_to_idx': {int(TS[i]): i for i in range(n)},
     }
@@ -571,11 +663,14 @@ def per_symbol_breakdown(trades):
 # ============================================================
 
 INDICATOR_INFO = {
-    'vol_ratio':   {'label': 'Volume saat cross (vs rata² 20 candle)', 'fmt': '{:.2f}x'},
-    'atr_ratio':   {'label': 'Ukuran candle cross (vs ATR14)',         'fmt': '{:.2f}x'},
-    'ema_gap_pct': {'label': 'Jarak EMA4-EMA10 saat cross',            'fmt': '{:.3f}%'},
-    'trend_pct':   {'label': 'Posisi close vs EMA50 (tren besar)',     'fmt': '{:+.2f}%'},
-    'dist_pct':    {'label': 'Jarak SL dari entry',                    'fmt': '{:.3f}%'},
+    'vol_ratio':      {'label': 'Volume saat cross (vs rata² 20 candle)', 'fmt': '{:.2f}x'},
+    'atr_ratio':      {'label': 'Ukuran candle cross (vs ATR14)',         'fmt': '{:.2f}x'},
+    'ema_gap_pct':    {'label': 'Jarak EMA4-EMA10 saat cross',            'fmt': '{:.3f}%'},
+    'trend_pct':      {'label': 'Posisi close vs EMA50 (tren besar)',     'fmt': '{:+.2f}%'},
+    'dist_pct':       {'label': 'Jarak SL dari entry',                    'fmt': '{:.3f}%'},
+    'rsi':            {'label': f'RSI{RSI_PERIOD} saat cross',            'fmt': '{:.1f}'},
+    'macd_hist_pct':  {'label': f'MACD histogram ({MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}, %harga)', 'fmt': '{:+.3f}%'},
+    'sar_dist_pct':   {'label': 'Jarak close ke Parabolic SAR (%)',       'fmt': '{:+.2f}%'},
 }
 
 def indicator_analysis(trades):
@@ -818,9 +913,9 @@ def _render_html() -> bytes:
         def _bucket_cell(name):
             info = b[name]
             if info['wr'] is None:
-                return f'<td class="y">-</td>'
+                return f'<td class="y">-</td><td style="color:#8b949e">0</td>'
             cls = 'g' if info['wr'] >= 45 else ('y' if info['wr'] >= 30 else 'r')
-            return f'<td class="{cls}">{info["wr"]:.1f}% <span style="color:#8b949e">(n={info["n"]})</span></td>'
+            return f'<td class="{cls}">{info["wr"]:.1f}%</td><td style="color:#8b949e">{info["n"]}</td>'
         ind_rows += (
             f'<tr><td>{d["label"]}</td>'
             f'<td class="g">{avg_win_s}</td>'
@@ -833,10 +928,11 @@ def _render_html() -> bytes:
         )
     ind_table = f'''
     <table>
-      <tr><th>Indikator (saat candle cross)</th><th>Avg saat WIN</th><th>Avg saat LOSS</th>
-          <th>WR% - Rendah</th><th>WR% - Sedang</th><th>WR% - Tinggi</th>
-          <th>Batas Rendah/Sedang</th></tr>
-      {ind_rows or '<tr><td colspan="7" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
+      <tr><th rowspan="2">Indikator (saat candle cross)</th><th rowspan="2">Avg saat WIN</th><th rowspan="2">Avg saat LOSS</th>
+          <th colspan="2">Rendah</th><th colspan="2">Sedang</th><th colspan="2">Tinggi</th>
+          <th rowspan="2">Batas Rendah/Sedang</th></tr>
+      <tr><th>WR%</th><th>N trade</th><th>WR%</th><th>N trade</th><th>WR%</th><th>N trade</th></tr>
+      {ind_rows or '<tr><td colspan="10" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
     </table>
     ''' if ind_cp else '<p class="note">Belum ada data indikator.</p>'
 
@@ -877,6 +973,9 @@ def _render_html() -> bytes:
     <code>FILTER_MIN_ATR_RATIO</code>, <code>FILTER_MIN_VOL_RATIO</code>, atau
     <code>FILTER_MAX_EMA_GAP_PCT</code> (nilai ambang batas Sedang/Tinggi di atas), lalu jalankan
     ulang backtest untuk lihat dampaknya ke Total R & WR keseluruhan (bukan cuma tercile).
+    <br>⚠️ Kolom <b>N trade</b> di tiap bucket penting dicek sebelum aktifkan filter — WR tinggi di
+    bucket "Tinggi" tidak ada gunanya kalau isinya cuma 5 trade dari total 300 (bisa kebetulan/noise),
+    dan mengunci filter di bucket itu bisa memblokir mayoritas sinyal.
   </div>
 
   <div class="note">
@@ -905,7 +1004,8 @@ def _trades_csv() -> bytes:
     writer = csv.DictWriter(buf, fieldnames=[
         'symbol', 'direction', 'entry', 'sl', 'exit', 'reason', 'r_mult',
         'pnl_usd', 'entry_ts', 'exit_ts', 'balance_after',
-        'vol_ratio', 'atr_ratio', 'ema_gap_pct', 'trend_pct', 'dist_pct'],
+        'vol_ratio', 'atr_ratio', 'ema_gap_pct', 'trend_pct', 'dist_pct',
+        'rsi', 'macd_hist_pct', 'sar_dist_pct'],
         extrasaction='ignore')
     writer.writeheader()
     for t in trades_cp:
