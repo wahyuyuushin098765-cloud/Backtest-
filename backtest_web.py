@@ -740,7 +740,8 @@ INDICATOR_INFO = {
 }
 
 def indicator_analysis(trades):
-    """Utk tiap indikator: avg saat WIN vs LOSS, + win rate per bucket (Rendah/Sedang/Tinggi)."""
+    """Utk tiap indikator: avg saat WIN vs LOSS, WR & win/loss count utk SEMUA trade (agregat,
+    tidak dipecah), + win rate & win/loss count per bucket (Rendah/Sedang/Tinggi) sbg pola tambahan."""
     out = {}
     for key, info in INDICATOR_INFO.items():
         pairs = [(t[key], t['r_mult'] > 0) for t in trades if t.get(key) is not None]
@@ -760,15 +761,21 @@ def indicator_analysis(trades):
                 buckets['Sedang'].append(w)
             else:
                 buckets['Tinggi'].append(w)
+        n_win_all = len(win_vals)
+        n_loss_all = len(loss_vals)
         out[key] = {
             'label': info['label'], 'fmt': info['fmt'],
             'avg_win': (sum(win_vals) / len(win_vals)) if win_vals else None,
             'avg_loss': (sum(loss_vals) / len(loss_vals)) if loss_vals else None,
             'n': len(pairs), 't1': t1, 't2': t2,
+            'n_win_all': n_win_all, 'n_loss_all': n_loss_all,
+            'wr_all': (n_win_all / len(pairs) * 100) if pairs else None,
             'buckets': {
                 name: {
                     'wr': (sum(ws) / len(ws) * 100) if ws else None,
                     'n': len(ws),
+                    'n_win': sum(1 for w in ws if w),
+                    'n_loss': sum(1 for w in ws if not w),
                 } for name, ws in buckets.items()
             },
         }
@@ -1052,16 +1059,26 @@ def _render_html() -> bytes:
         t1_s = fmt.format(d['t1'])
         t2_s = fmt.format(d['t2'])
         b = d['buckets']
+
         def _bucket_cell(name):
             info = b[name]
             if info['wr'] is None:
-                return f'<td class="y">-</td><td style="color:#8b949e">0</td>'
+                return f'<td class="y">-</td><td style="color:#8b949e">0 (0M/0K)</td>'
             cls = 'g' if info['wr'] >= 45 else ('y' if info['wr'] >= 30 else 'r')
-            return f'<td class="{cls}">{info["wr"]:.1f}%</td><td style="color:#8b949e">{info["n"]}</td>'
+            return (f'<td class="{cls}">{info["wr"]:.1f}%</td>'
+                    f'<td style="color:#8b949e">{info["n"]} '
+                    f'(<span class="g">{info["n_win"]}M</span>/<span class="r">{info["n_loss"]}K</span>)</td>')
+
+        wr_all_cls = 'g' if (d['wr_all'] or 0) >= 45 else ('y' if (d['wr_all'] or 0) >= 30 else 'r')
+        all_cell = (f'<td class="{wr_all_cls}">{d["wr_all"]:.1f}%</td>'
+                    f'<td style="color:#8b949e">{d["n"]} '
+                    f'(<span class="g">{d["n_win_all"]}M</span>/<span class="r">{d["n_loss_all"]}K</span>)</td>')
+
         ind_rows += (
             f'<tr><td>{d["label"]}</td>'
             f'<td class="g">{avg_win_s}</td>'
             f'<td class="r">{avg_loss_s}</td>'
+            f'{all_cell}'
             f'{_bucket_cell("Rendah")}'
             f'{_bucket_cell("Sedang")}'
             f'{_bucket_cell("Tinggi")}'
@@ -1071,10 +1088,12 @@ def _render_html() -> bytes:
     ind_table = f'''
     <table>
       <tr><th rowspan="2">Indikator (saat candle cross)</th><th rowspan="2">Avg saat WIN</th><th rowspan="2">Avg saat LOSS</th>
+          <th colspan="2">Semua Trade</th>
           <th colspan="2">Rendah</th><th colspan="2">Sedang</th><th colspan="2">Tinggi</th>
           <th rowspan="2">Batas Rendah/Sedang</th></tr>
-      <tr><th>WR%</th><th>N trade</th><th>WR%</th><th>N trade</th><th>WR%</th><th>N trade</th></tr>
-      {ind_rows or '<tr><td colspan="10" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
+      <tr><th>WR%</th><th>N (Menang/Kalah)</th>
+          <th>WR%</th><th>N (Menang/Kalah)</th><th>WR%</th><th>N (Menang/Kalah)</th><th>WR%</th><th>N (Menang/Kalah)</th></tr>
+      {ind_rows or '<tr><td colspan="12" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
     </table>
     ''' if ind_cp else '<p class="note">Belum ada data indikator.</p>'
 
@@ -1108,10 +1127,13 @@ def _render_html() -> bytes:
   <h2>Analisis Indikator saat Cross — Pola Menang vs Kalah</h2>
   <div class="tbl-wrap">{ind_table}</div>
   <div class="note">
-    💡 Cara baca: bandingkan kolom "Avg saat WIN" vs "Avg saat LOSS" — kalau beda jauh, indikator itu
-    berpotensi jadi FILTER. Kolom WR%-Rendah/Sedang/Tinggi membagi SEMUA trade jadi 3 kelompok
-    (tercile) berdasarkan nilai indikator itu saat cross, lalu tunjukkan win rate tiap kelompok.
-    Kolom "Batas Rendah/Sedang" adalah nilai ambang aktual pembagi tercile (mis. "≤1.05x / ≤1.40x"
+    💡 Cara baca: kolom <b>"Semua Trade"</b> = total trade yang punya nilai indikator ini, TIDAK dipecah
+    (jumlah win/loss & WR% dari seluruh trade sekaligus). Kolom Rendah/Sedang/Tinggi membagi trade yang
+    sama itu jadi 3 kelompok (tercile) berdasarkan nilai indikator saat cross, supaya kelihatan POLA-nya —
+    misal apakah WR makin naik seiring nilai indikator makin tinggi. "N (Menang/Kalah)" di tiap kelompok
+    menunjukkan jumlah trade menang (M) dan kalah (K) secara eksplisit, bukan cuma persentase.
+    Bandingkan juga kolom "Avg saat WIN" vs "Avg saat LOSS" — kalau beda jauh, indikator itu berpotensi
+    jadi FILTER. Kolom "Batas Rendah/Sedang" adalah nilai ambang aktual pembagi tercile (mis. "≤1.05x / ≤1.40x"
     artinya Rendah = sampai 1.05x, Sedang = 1.05x-1.40x, Tinggi = di atas 1.40x).
     <br>Kalau mau menerapkan filter berdasarkan hasil ini, isi env var di Railway:
     <code>FILTER_MIN_ATR_RATIO</code>, <code>FILTER_MIN_VOL_RATIO</code>, atau
