@@ -354,6 +354,16 @@ RSI_GATE_MAX_LONG   = float(os.environ.get('RSI_GATE_MAX_LONG', '70'))
 RSI_GATE_MIN_SHORT  = float(os.environ.get('RSI_GATE_MIN_SHORT', '40'))
 RSI_GATE_MAX_SHORT  = float(os.environ.get('RSI_GATE_MAX_SHORT', '100'))
 
+# ── Rentang FOKUS utk tabel Analisis Khusus RSI Gate (TERPISAH dari gate aktual di atas --
+# ini cuma menyempitkan rentang yg dianalisis & dibagi 3 bucket, tidak mempengaruhi entry
+# sama sekali walau RSI_GATE_ENABLED=1). Nilai diluar rentang fokus tetap dihitung ke
+# n_total & per_value (spy total tetap akurat), tapi TIDAK masuk ke salah satu bucket.
+# Bucket dibagi RATA OTOMATIS jadi 3 dari rentang fokus ini (span/3, integer boundary).
+RSI_ANALYSIS_MIN_LONG  = float(os.environ.get('RSI_ANALYSIS_MIN_LONG', '41'))
+RSI_ANALYSIS_MAX_LONG  = float(os.environ.get('RSI_ANALYSIS_MAX_LONG', '100'))
+RSI_ANALYSIS_MIN_SHORT = float(os.environ.get('RSI_ANALYSIS_MIN_SHORT', '0'))
+RSI_ANALYSIS_MAX_SHORT = float(os.environ.get('RSI_ANALYSIS_MAX_SHORT', '69'))
+
 
 def _calc_rsi(C, period):
     """RSI standar (Wilder smoothing via EWM alpha=1/period).
@@ -848,21 +858,36 @@ def rsi_gate_analysis(trades):
     """Analisis KHUSUS utk RSI gate (RSI{RSI_GATE_PERIOD}), TERPISAH Long vs Short:
     - per_value: utk tiap nilai RSI BULAT (0-100), jumlah win/loss/WR -- supaya kelihatan
       angka RSI spesifik mana yang paling sering menang, bukan cuma rentang besar.
-    - buckets: 3 kelompok tetap Rendah(0-40) / Sedang(41-69) / Tinggi(70-100), total trade
-      & win/loss per kelompok, tiap arah.
+    - buckets: 3 kelompok dibagi RATA OTOMATIS dari rentang FOKUS
+      (RSI_ANALYSIS_MIN_LONG..MAX_LONG utk Long, RSI_ANALYSIS_MIN_SHORT..MAX_SHORT utk
+      Short) -- span/3, batas bulat. Trade DILUAR rentang fokus tetap dihitung ke n_total
+      & per_value, tapi tidak masuk bucket manapun (supaya bucket cuma merepresentasikan
+      rentang yg sedang difokuskan, bukan ikut numpuk di tepi).
     - best_value: nilai RSI bulat dgn jumlah MENANG absolut terbanyak per arah (bukan cuma
       WR% tertinggi -- supaya tidak kejebak angka dgn n kecil tapi WR 100%)."""
     rsi_key = f'rsi{RSI_GATE_PERIOD}'
+    focus_range = {
+        'Long':  (RSI_ANALYSIS_MIN_LONG, RSI_ANALYSIS_MAX_LONG),
+        'Short': (RSI_ANALYSIS_MIN_SHORT, RSI_ANALYSIS_MAX_SHORT),
+    }
     out = {}
     for direction in ('Long', 'Short'):
         pairs = [(t[rsi_key], t['r_mult'] > 0) for t in trades
                  if t.get(rsi_key) is not None and t.get('direction') == direction]
-        per_value = {}   # nilai RSI bulat (0-100) -> {n, n_win, n_loss, wr}
-        buckets = {
-            'Rendah (0-40)':  {'n': 0, 'n_win': 0, 'n_loss': 0},
-            'Sedang (41-69)': {'n': 0, 'n_win': 0, 'n_loss': 0},
-            'Tinggi (70-100)': {'n': 0, 'n_win': 0, 'n_loss': 0},
+
+        fmin, fmax = focus_range[direction]
+        fmin_i, fmax_i = int(round(fmin)), int(round(fmax))
+        span = max(fmax_i - fmin_i, 1)
+        b1 = fmin_i + span // 3               # batas Rendah/Sedang
+        b2 = fmin_i + (2 * span) // 3          # batas Sedang/Tinggi
+        bucket_names = {
+            'Rendah': f'Rendah ({fmin_i}-{b1})',
+            'Sedang': f'Sedang ({b1+1}-{b2})',
+            'Tinggi': f'Tinggi ({b2+1}-{fmax_i})',
         }
+        buckets = {name: {'n': 0, 'n_win': 0, 'n_loss': 0} for name in bucket_names.values()}
+
+        per_value = {}   # nilai RSI bulat (0-100) -> {n, n_win, n_loss, wr}
         for v, w in pairs:
             iv = int(round(v))
             iv = max(0, min(100, iv))   # clamp jaga2 kalau RSI numerik meleset dikit dari [0,100]
@@ -870,10 +895,11 @@ def rsi_gate_analysis(trades):
             slot['n'] += 1
             slot['n_win'] += 1 if w else 0
             slot['n_loss'] += 0 if w else 1
-            bname = 'Rendah (0-40)' if iv <= 40 else ('Sedang (41-69)' if iv <= 69 else 'Tinggi (70-100)')
-            buckets[bname]['n'] += 1
-            buckets[bname]['n_win'] += 1 if w else 0
-            buckets[bname]['n_loss'] += 0 if w else 1
+            if fmin_i <= iv <= fmax_i:   # hanya masuk bucket kalau di dalam rentang fokus
+                bname = bucket_names['Rendah'] if iv <= b1 else (bucket_names['Sedang'] if iv <= b2 else bucket_names['Tinggi'])
+                buckets[bname]['n'] += 1
+                buckets[bname]['n_win'] += 1 if w else 0
+                buckets[bname]['n_loss'] += 0 if w else 1
         for slot in per_value.values():
             slot['wr'] = (slot['n_win'] / slot['n'] * 100) if slot['n'] else None
         for b in buckets.values():
@@ -881,8 +907,11 @@ def rsi_gate_analysis(trades):
         best_value = None
         if per_value:
             best_value = max(per_value.items(), key=lambda kv: kv[1]['n_win'])[0]
+        n_in_focus = sum(b['n'] for b in buckets.values())
         out[direction] = {
             'n_total': len(pairs),
+            'n_in_focus': n_in_focus,     # jumlah trade yg masuk rentang fokus (<= n_total)
+            'focus_range': (fmin_i, fmax_i),
             'per_value': per_value,      # {0: {...}, 1: {...}, ..., 100: {...}}
             'buckets': buckets,
             'best_value': best_value,    # nilai RSI bulat dgn n_win TERBANYAK (bukan cuma WR tertinggi)
@@ -1221,13 +1250,15 @@ def _render_html() -> bytes:
             wr = info['wr']
             cls = 'g' if (wr or 0) >= 50 else ('y' if (wr or 0) >= 30 else 'r')
             star = ' ⭐' if rsi_val == d['best_value'] else ''
-            per_val_rows += (f'<tr><td>{rsi_val}{star}</td><td>{info["n"]}</td>'
+            in_focus = d['focus_range'][0] <= rsi_val <= d['focus_range'][1]
+            dim = '' if in_focus else ' style="color:#6e7681"'   # nilai diluar fokus ditampilkan redup
+            per_val_rows += (f'<tr{dim}><td>{rsi_val}{star}</td><td>{info["n"]}</td>'
                               f'<td class="g">{info["n_win"]}</td><td class="r">{info["n_loss"]}</td>'
                               f'<td class="{cls}">{wr:.1f}%</td></tr>\n')
-        b = d['buckets']
+        # bucket names sekarang DINAMIS (mengikuti rentang fokus) -- iterasi dict.items()
+        # langsung supaya urutan insert (Rendah, Sedang, Tinggi) terjaga
         bucket_rows = ''
-        for bname in ('Rendah (0-40)', 'Sedang (41-69)', 'Tinggi (70-100)'):
-            bi = b[bname]
+        for bname, bi in d['buckets'].items():
             wr = bi['wr']
             cls = 'y' if wr is None else ('g' if wr >= 50 else ('y' if wr >= 30 else 'r'))
             wr_s = f'{wr:.1f}%' if wr is not None else '-'
@@ -1235,17 +1266,19 @@ def _render_html() -> bytes:
                              f'<td class="g">{bi["n_win"]}</td><td class="r">{bi["n_loss"]}</td>'
                              f'<td class="{cls}">{wr_s}</td></tr>\n')
         best_s = f"RSI{RSI_GATE_PERIOD} = {d['best_value']}" if d['best_value'] is not None else '-'
+        fmin, fmax = d['focus_range']
         return f'''
         <p style="font-size:13px;color:#8b949e">Total {direction}: <b>{d["n_total"]}</b> trade |
+        Rentang fokus: <b>{fmin}-{fmax}</b> ({d["n_in_focus"]} trade masuk fokus) |
         Nilai RSI{RSI_GATE_PERIOD} dgn MENANG absolut terbanyak: <b class="g">{best_s}</b> (⭐ di tabel bawah)</p>
         <table>
           <tr><th>RSI{RSI_GATE_PERIOD}</th><th>N</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
           {per_val_rows or '<tr><td colspan="5" class="y">-</td></tr>'}
         </table>
         <p style="font-size:12px;color:#8b949e;margin-top:8px">Top 15 nilai RSI{RSI_GATE_PERIOD} diurutkan by jumlah MENANG
-        terbanyak (bukan cuma WR% tertinggi, spy tidak kejebak n kecil).</p>
+        terbanyak (bukan cuma WR% tertinggi, spy tidak kejebak n kecil). Nilai redup = diluar rentang fokus saat ini.</p>
         <table style="margin-top:6px">
-          <tr><th>Kategori</th><th>N</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
+          <tr><th>Kategori (rentang fokus {fmin}-{fmax}, dibagi rata otomatis)</th><th>N</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
           {bucket_rows}
         </table>
         '''
@@ -1268,8 +1301,13 @@ def _render_html() -> bytes:
       </div>
     </div>
     <div class="note" style="margin-top:10px">
-      ⚙️ Setelah tahu rentang yang bagus dari tabel di atas, aktifkan gate via Railway Variables:
-      <code>RSI_GATE_ENABLED=1</code>, lalu atur rentang valid:
+      ⚙️ Rentang FOKUS tabel di atas (bukan gate aktual) diatur via:
+      <code>RSI_ANALYSIS_MIN_LONG</code>/<code>RSI_ANALYSIS_MAX_LONG</code> (skrg {RSI_ANALYSIS_MIN_LONG:.0f}-{RSI_ANALYSIS_MAX_LONG:.0f}),
+      <code>RSI_ANALYSIS_MIN_SHORT</code>/<code>RSI_ANALYSIS_MAX_SHORT</code> (skrg {RSI_ANALYSIS_MIN_SHORT:.0f}-{RSI_ANALYSIS_MAX_SHORT:.0f}).
+      Bucket Rendah/Sedang/Tinggi otomatis dibagi rata 3 dari rentang ini — ubah env var lalu jalankan
+      ulang backtest utk lihat pembagian bucket yang baru.
+      <br>Setelah tahu rentang yang bagus, aktifkan GATE ENTRY aktual (beda dari rentang fokus di atas)
+      via Railway Variables: <code>RSI_GATE_ENABLED=1</code>, lalu atur rentang valid:
       <code>RSI_GATE_MIN_LONG</code>/<code>RSI_GATE_MAX_LONG</code> (utk Long/Golden cross),
       <code>RSI_GATE_MIN_SHORT</code>/<code>RSI_GATE_MAX_SHORT</code> (utk Short/Death cross).
       Nilai RSI{RSI_GATE_PERIOD} DILUAR rentang yg kamu set akan diblokir (sinyal dilewati, tidak entry).
