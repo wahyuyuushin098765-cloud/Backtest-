@@ -360,8 +360,8 @@ RSI_GATE_MAX_SHORT  = float(os.environ.get('RSI_GATE_MAX_SHORT', '100'))
 # n_total & per_value (spy total tetap akurat), tapi TIDAK masuk ke salah satu bucket.
 # Bucket dibagi RATA OTOMATIS jadi 3 dari rentang fokus ini (span/3, integer boundary).
 RSI_ANALYSIS_MIN_LONG  = float(os.environ.get('RSI_ANALYSIS_MIN_LONG', '41'))
-RSI_ANALYSIS_MAX_LONG  = float(os.environ.get('RSI_ANALYSIS_MAX_LONG', '100'))
-RSI_ANALYSIS_MIN_SHORT = float(os.environ.get('RSI_ANALYSIS_MIN_SHORT', '0'))
+RSI_ANALYSIS_MAX_LONG  = float(os.environ.get('RSI_ANALYSIS_MAX_LONG', '89'))
+RSI_ANALYSIS_MIN_SHORT = float(os.environ.get('RSI_ANALYSIS_MIN_SHORT', '12'))
 RSI_ANALYSIS_MAX_SHORT = float(os.environ.get('RSI_ANALYSIS_MAX_SHORT', '69'))
 
 
