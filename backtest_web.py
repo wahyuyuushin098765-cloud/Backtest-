@@ -10,10 +10,13 @@ Strategi (hasil riset & backtest terbaik, lihat Readme.md):
      Bias tetap hidup untuk re-entry berulang sampai ada S/R valid baru.
   3. Entry: LIMIT order di WICK candle yang menyebabkan EMA cross (EMA4/EMA10).
      SL = wick diperpanjang sejauh jarak (wick, close candle cross) ke arah berlawanan.
-  4. FLIP PROTECTION: EMA cross berlawanan muncul saat limit masih PENDING (belum
-     fill) -> limit dibatalkan SEKARANG. Posisi yang SUDAH aktif/filled TIDAK
-     ditutup paksa oleh cross berlawanan -- tetap berjalan sampai kena SL/trailing
-     sendiri. Bias tetap hidup, tunggu cross searah lagi utk re-entry.
+  4. FLIP PROTECTION dgn SYARAT RSI: EMA cross berlawanan HANYA membatalkan limit
+     pending / menutup posisi filled kalau cross berlawanan itu SENDIRI juga lolos
+     gate RSI4 (persis spt syarat entry biasa) -- death cross butuh RSI4>=40 baru
+     valid utk membatalkan bias Long, golden cross butuh RSI4<=70 baru valid utk
+     membatalkan bias Short. Cross berlawanan yg gagal gate (sinyal lemah) TIDAK
+     membatalkan apapun -- posisi/pending lama tetap jalan. Kalau valid, dibatalkan
+     SEKARANG, apapun P&L-nya. Bias tetap hidup, tunggu cross searah lagi.
   5. Trailing stop aktif di rasio 1:TRAIL_ACT_R (default 6) dari jarak entry-SL.
 
 Deploy ke Railway:
@@ -623,13 +626,20 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
             key_long  = _akey(symbol, 'Long')
             key_short = _akey(symbol, 'Short')
 
-            # ── 1) FLIP PROTECTION — HANYA utk limit PENDING yg belum fill. Posisi yang SUDAH
-            #    aktif/filled TIDAK ditutup paksa oleh cross berlawanan; tetap dikelola normal
-            #    oleh SL/trailing di bagian (2) di bawah sampai kena SL/trailing/TP sendiri. ──
-            if death_cross:
+            # ── 1) FLIP PROTECTION dgn SYARAT RSI GATE — cross berlawanan HANYA membatalkan
+            #    limit pending / menutup posisi filled kalau cross berlawanan itu SENDIRI juga
+            #    lolos gate RSI (persis spt syarat entry): death cross butuh RSI4 >= 40 baru
+            #    valid utk membatalkan bias Long; golden cross butuh RSI4 <= 70 baru valid utk
+            #    membatalkan bias Short. Kalau cross berlawanan TIDAK lolos gate (sinyal lemah),
+            #    posisi/pending lama DIBIARKAN, tidak dibatalkan. ──
+            if death_cross and _passes_rsi_gate(c, i, 'Short'):
                 pending.pop(key_long, None)
-            if golden_cross:
+                if key_long in active_positions:
+                    close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
+            if golden_cross and _passes_rsi_gate(c, i, 'Long'):
                 pending.pop(key_short, None)
+                if key_short in active_positions:
+                    close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
 
             # ── 2) SL / trailing normal ──
             for direction, key in (('Short', key_short), ('Long', key_long)):
@@ -1212,9 +1222,10 @@ def _render_html() -> bytes:
   <div class="note">
     💡 Entry = LIMIT di wick candle penyebab EMA cross. SL = wick diperpanjang sejauh
     jarak yang sama. Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
-    Flip protection: cross berlawanan → HANYA membatalkan limit yang masih pending
-    (belum fill); posisi yang sudah aktif tetap jalan sampai kena SL/trailing sendiri.
-    Tunggu cross searah lagi utk re-entry.
+    Flip protection: cross berlawanan → HANYA membatalkan limit pending/menutup posisi
+    filled kalau cross berlawanan itu SENDIRI lolos gate RSI{RSI_GATE_PERIOD} (death cross
+    butuh ≥{RSI_GATE_MIN_SHORT:.0f}, golden cross butuh ≤{RSI_GATE_MAX_LONG:.0f}) — kalau
+    cross berlawanan gagal gate (sinyal lemah), posisi/pending lama dibiarkan jalan.
     Trailing aktif di rasio 1:{TRAIL_ACT_R:.0f}, lebar {TRAIL_STOP:.1f}x dist.
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dihitung dari balance TERKINI (compounding, 1 akun bersama —
     bukan modal terpisah per coin). Kalau slot ({MAX_CONCURRENT}) penuh saat sinyal valid baru
