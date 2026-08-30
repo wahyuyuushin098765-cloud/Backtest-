@@ -34,7 +34,8 @@ from pybit.unified_trading import HTTP
 PORT             = int(os.environ.get('PORT', 8080))
 INITIAL_BALANCE  = float(os.environ.get('INITIAL_BALANCE', '30.0'))   # modal awal, 1 AKUN BERSAMA (bukan per coin)
 RISK_PCT         = float(os.environ.get('RISK_PCT', '0.01'))          # risk 1% balance/trade (compound)
-FEE_PCT          = float(os.environ.get('FEE_PCT', '0.00055'))        # taker fee per sisi (Bybit USDT perp)
+FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))   # fee saat BUKA posisi (taker, Bybit USDT perp)
+FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))  # fee saat TUTUP posisi = 3x fee entry
 EMA_FAST         = int(os.environ.get('EMA_FAST', '4'))
 EMA_SLOW         = int(os.environ.get('EMA_SLOW', '10'))
 TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '4.0'))        # trailing aktif di rasio 1:4
@@ -600,7 +601,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
         pos = active_positions[key]
         entry, dist, qty = pos['entry'], pos['dist'], pos['qty']
         pnl_gross = (exit_price - entry) * qty if direction == 'Long' else (entry - exit_price) * qty
-        fee = (entry * qty + exit_price * qty) * FEE_PCT
+        fee = entry * qty * FEE_ENTRY_PCT + exit_price * qty * FEE_EXIT_PCT
         pnl_net = pnl_gross - fee
         balance += pnl_net
         r_mult = pnl_gross / (dist * qty) if dist * qty else 0
@@ -1093,7 +1094,9 @@ def _render_html() -> bytes:
     </table>
     <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
     <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
-    terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Filter aktif: {
+    terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Fee: entry
+    <b>{FEE_ENTRY_PCT*100:.3f}%</b>, exit <b>{FEE_EXIT_PCT*100:.3f}%</b> ({FEE_EXIT_PCT/FEE_ENTRY_PCT:.0f}x fee entry) —
+    atur via env var <code>FEE_ENTRY_PCT</code>/<code>FEE_EXIT_PCT</code>. Filter aktif: {
         ', '.join(_active_filter_summary()) or 'tidak ada (semua nonaktif)'}
     <br>Gate RSI{RSI_GATE_PERIOD} saat cross: <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b>
     (Golden cross/Long butuh RSI{RSI_GATE_PERIOD} di rentang [{RSI_GATE_MIN_LONG:.0f}, {RSI_GATE_MAX_LONG:.0f}],
