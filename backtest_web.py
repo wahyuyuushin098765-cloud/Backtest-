@@ -34,8 +34,8 @@ from pybit.unified_trading import HTTP
 PORT             = int(os.environ.get('PORT', 8080))
 INITIAL_BALANCE  = float(os.environ.get('INITIAL_BALANCE', '30.0'))   # modal awal, 1 AKUN BERSAMA (bukan per coin)
 RISK_PCT         = float(os.environ.get('RISK_PCT', '0.01'))          # risk 1% balance/trade (compound)
-FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.055'))   # fee saat BUKA posisi (taker, Bybit USDT perp)
-FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.055 * 3)))  # fee saat TUTUP posisi = 3x fee entry
+FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.0055'))   # fee saat BUKA posisi (taker, Bybit USDT perp)
+FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.0055 * 3)))  # fee saat TUTUP posisi = 3x fee entry
 EMA_FAST         = int(os.environ.get('EMA_FAST', '4'))
 EMA_SLOW         = int(os.environ.get('EMA_SLOW', '10'))
 TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '4.0'))        # trailing aktif di rasio 1:4
