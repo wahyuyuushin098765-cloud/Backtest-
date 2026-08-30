@@ -128,6 +128,7 @@ _combined_result = {         # ringkasan hasil simulasi gabungan (1 balance, 1 p
     'blocked_by_slot': 0, 'blocked_by_margin': 0, 'blocked_by_filter': 0,
 }
 _indicator_result = {}      # hasil analisis indikator saat cross (win vs loss)
+_rsi_gate_result = {}       # hasil analisis khusus RSI gate (per-nilai + bucket, terpisah Long/Short)
 _no_filter_result = None    # ringkasan simulasi PEMBANDING tanpa filter (None jika tidak ada filter aktif)
 
 
@@ -340,17 +341,18 @@ SAR_MAX_STEP     = float(os.environ.get('SAR_MAX_STEP', '0.2'))
 
 # ── GATE RSI TUNGGAL saat EMA cross (BUKAN filter statistik ambang batas -- ini kondisi
 # STRUKTURAL yg dicek TEPAT di candle penyebab cross, sama level dgn syarat cross itu sendiri) ──
-# RSI4 (periode pendek, reaktif thd harga). Logika DIBALIK dari RSI konvensional (yg biasanya
-# overbought=jangan-beli/mulai-jual, oversold=jangan-jual/mulai-beli): di sini overbought
-# JUSTRU dipakai sbg batas atas utk Long (tolak kalau RSI sudah kelewat tinggi drpd histori
-# jangka pendek), dan oversold dipakai sbg batas bawah utk Short (tolak kalau RSI sudah
-# kelewat rendah). Cocok utk strategi momentum/breakout spt ini -- bukan mean-reversion.
-# Golden cross (bias Long)  valid HANYA jika RSI4 <= RSI_GATE_MAX_LONG  (tolak kalau RSI > 70)
-# Death cross  (bias Short) valid HANYA jika RSI4 >= RSI_GATE_MIN_SHORT (tolak kalau RSI < 40)
-RSI_GATE_ENABLED   = os.environ.get('RSI_GATE_ENABLED', '1').strip() not in ('0', 'false', 'False', '')
-RSI_GATE_PERIOD    = int(os.environ.get('RSI_GATE_PERIOD', '4'))
-RSI_GATE_MAX_LONG  = float(os.environ.get('RSI_GATE_MAX_LONG', '70'))
-RSI_GATE_MIN_SHORT = float(os.environ.get('RSI_GATE_MIN_SHORT', '40'))
+# RSI4 (periode pendek, reaktif thd harga). NONAKTIF secara default -- dipakai dulu utk
+# eksplorasi via tabel Analisis Indikator (RSI per-nilai + bucket Rendah/Sedang/Tinggi),
+# baru diaktifkan setelah tahu rentang RSI4 yg benar2 menguntungkan dari hasil analisis itu.
+# Golden cross (bias Long)  valid HANYA jika RSI_GATE_MIN_LONG  <= RSI4 <= RSI_GATE_MAX_LONG
+# Death cross  (bias Short) valid HANYA jika RSI_GATE_MIN_SHORT <= RSI4 <= RSI_GATE_MAX_SHORT
+# Di luar rentang = diblokir (sinyal dilewati, tidak entry).
+RSI_GATE_ENABLED    = os.environ.get('RSI_GATE_ENABLED', '0').strip() not in ('0', 'false', 'False', '')
+RSI_GATE_PERIOD     = int(os.environ.get('RSI_GATE_PERIOD', '4'))
+RSI_GATE_MIN_LONG   = float(os.environ.get('RSI_GATE_MIN_LONG', '0'))
+RSI_GATE_MAX_LONG   = float(os.environ.get('RSI_GATE_MAX_LONG', '70'))
+RSI_GATE_MIN_SHORT  = float(os.environ.get('RSI_GATE_MIN_SHORT', '40'))
+RSI_GATE_MAX_SHORT  = float(os.environ.get('RSI_GATE_MAX_SHORT', '100'))
 
 
 def _calc_rsi(C, period):
@@ -451,22 +453,20 @@ def _capture_indicators(c, i):
 
 def _passes_rsi_gate(c, i, direction):
     """Gate RSI TUNGGAL saat EMA cross (bukan filter statistik -- kondisi STRUKTURAL).
-    Logika DIBALIK dari RSI konvensional: dipakai sbg batas ATAS utk Long (tolak kalau RSI
-    sudah kelewat tinggi/jenuh-beli) dan batas BAWAH utk Short (tolak kalau RSI sudah kelewat
-    rendah/jenuh-jual) -- kebalikan dari overbought=jual/oversold=beli yg biasa dipakai
-    strategi mean-reversion. direction: 'Long' butuh RSI <= RSI_GATE_MAX_LONG; 'Short' butuh
-    RSI >= RSI_GATE_MIN_SHORT, persis di candle cross yg sama. True kalau gate nonaktif ATAU
-    nilai RSI belum tersedia (masih warmup) -- fail-open spy tidak diam-diam menolak semua
-    trade di awal data krn NaN."""
+    Rentang penuh [MIN, MAX] terpisah utk Long & Short -- diluar rentang = diblokir.
+    direction: 'Long' butuh RSI_GATE_MIN_LONG <= RSI <= RSI_GATE_MAX_LONG; 'Short' butuh
+    RSI_GATE_MIN_SHORT <= RSI <= RSI_GATE_MAX_SHORT, persis di candle cross yg sama.
+    True kalau gate nonaktif ATAU nilai RSI belum tersedia (masih warmup) -- fail-open
+    spy tidak diam-diam menolak semua trade di awal data krn NaN."""
     if not RSI_GATE_ENABLED:
         return True
     v = c['rsi_gate'][i]
     if np.isnan(v):
         return True
     if direction == 'Long':
-        return v <= RSI_GATE_MAX_LONG
+        return RSI_GATE_MIN_LONG <= v <= RSI_GATE_MAX_LONG
     else:
-        return v >= RSI_GATE_MIN_SHORT
+        return RSI_GATE_MIN_SHORT <= v <= RSI_GATE_MAX_SHORT
 
 
 def prepare_coin(symbol, df):
@@ -844,6 +844,52 @@ def indicator_analysis(trades):
     return out
 
 
+def rsi_gate_analysis(trades):
+    """Analisis KHUSUS utk RSI gate (RSI{RSI_GATE_PERIOD}), TERPISAH Long vs Short:
+    - per_value: utk tiap nilai RSI BULAT (0-100), jumlah win/loss/WR -- supaya kelihatan
+      angka RSI spesifik mana yang paling sering menang, bukan cuma rentang besar.
+    - buckets: 3 kelompok tetap Rendah(0-40) / Sedang(41-69) / Tinggi(70-100), total trade
+      & win/loss per kelompok, tiap arah.
+    - best_value: nilai RSI bulat dgn jumlah MENANG absolut terbanyak per arah (bukan cuma
+      WR% tertinggi -- supaya tidak kejebak angka dgn n kecil tapi WR 100%)."""
+    rsi_key = f'rsi{RSI_GATE_PERIOD}'
+    out = {}
+    for direction in ('Long', 'Short'):
+        pairs = [(t[rsi_key], t['r_mult'] > 0) for t in trades
+                 if t.get(rsi_key) is not None and t.get('direction') == direction]
+        per_value = {}   # nilai RSI bulat (0-100) -> {n, n_win, n_loss, wr}
+        buckets = {
+            'Rendah (0-40)':  {'n': 0, 'n_win': 0, 'n_loss': 0},
+            'Sedang (41-69)': {'n': 0, 'n_win': 0, 'n_loss': 0},
+            'Tinggi (70-100)': {'n': 0, 'n_win': 0, 'n_loss': 0},
+        }
+        for v, w in pairs:
+            iv = int(round(v))
+            iv = max(0, min(100, iv))   # clamp jaga2 kalau RSI numerik meleset dikit dari [0,100]
+            slot = per_value.setdefault(iv, {'n': 0, 'n_win': 0, 'n_loss': 0})
+            slot['n'] += 1
+            slot['n_win'] += 1 if w else 0
+            slot['n_loss'] += 0 if w else 1
+            bname = 'Rendah (0-40)' if iv <= 40 else ('Sedang (41-69)' if iv <= 69 else 'Tinggi (70-100)')
+            buckets[bname]['n'] += 1
+            buckets[bname]['n_win'] += 1 if w else 0
+            buckets[bname]['n_loss'] += 0 if w else 1
+        for slot in per_value.values():
+            slot['wr'] = (slot['n_win'] / slot['n'] * 100) if slot['n'] else None
+        for b in buckets.values():
+            b['wr'] = (b['n_win'] / b['n'] * 100) if b['n'] else None
+        best_value = None
+        if per_value:
+            best_value = max(per_value.items(), key=lambda kv: kv[1]['n_win'])[0]
+        out[direction] = {
+            'n_total': len(pairs),
+            'per_value': per_value,      # {0: {...}, 1: {...}, ..., 100: {...}}
+            'buckets': buckets,
+            'best_value': best_value,    # nilai RSI bulat dgn n_win TERBANYAK (bukan cuma WR tertinggi)
+        }
+    return out
+
+
 # ============================================================
 # BACKGROUND RUNNER
 # ============================================================
@@ -887,6 +933,7 @@ def _run():
 
     result = run_combined_backtest(coins)
     ind_analysis = indicator_analysis(result['trades'])
+    rsi_gate_res = rsi_gate_analysis(result['trades'])
 
     no_filter_summary = None
     if _any_filter_active():
@@ -907,6 +954,7 @@ def _run():
         _all_trades.extend(result['trades'])
         _results.extend(per_symbol_breakdown(result['trades']))
         _indicator_result.update(ind_analysis)
+        _rsi_gate_result.update(rsi_gate_res)
         global _no_filter_result
         _no_filter_result = no_filter_summary
         _phase = 'done'
@@ -963,6 +1011,7 @@ def _render_html() -> bytes:
         trades_cp = list(_all_trades)
         cr = dict(_combined_result)
         ind_cp = dict(_indicator_result)
+        rsi_gate_cp = dict(_rsi_gate_result)
         nf_cp = dict(_no_filter_result) if _no_filter_result else None
 
     refresh = '<meta http-equiv="refresh" content="5">' if phase == 'running' else ''
@@ -1015,10 +1064,11 @@ def _render_html() -> bytes:
     <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
     terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Filter aktif: {
         ', '.join(_active_filter_summary()) or 'tidak ada (semua nonaktif)'}
-    <br>Gate RSI{RSI_GATE_PERIOD} saat cross (LOGIKA DIBALIK dari RSI konvensional): <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b>
-    (Golden cross/Long butuh RSI{RSI_GATE_PERIOD} &le; {RSI_GATE_MAX_LONG:.0f} — tolak kalau sudah overbought,
-    Death cross/Short butuh RSI{RSI_GATE_PERIOD} &ge; {RSI_GATE_MIN_SHORT:.0f} — tolak kalau sudah oversold
-    — matikan via env var <code>RSI_GATE_ENABLED=0</code>, atau ubah lewat <code>RSI_GATE_PERIOD</code>/<code>RSI_GATE_MAX_LONG</code>/<code>RSI_GATE_MIN_SHORT</code>)</p>
+    <br>Gate RSI{RSI_GATE_PERIOD} saat cross: <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b>
+    (Golden cross/Long butuh RSI{RSI_GATE_PERIOD} di rentang [{RSI_GATE_MIN_LONG:.0f}, {RSI_GATE_MAX_LONG:.0f}],
+    Death cross/Short butuh RSI{RSI_GATE_PERIOD} di rentang [{RSI_GATE_MIN_SHORT:.0f}, {RSI_GATE_MAX_SHORT:.0f}]
+    — diluar rentang diblokir. Atur via env var <code>RSI_GATE_ENABLED</code>, <code>RSI_GATE_PERIOD</code>,
+    <code>RSI_GATE_MIN_LONG</code>/<code>RSI_GATE_MAX_LONG</code>, <code>RSI_GATE_MIN_SHORT</code>/<code>RSI_GATE_MAX_SHORT</code>)</p>
     '''
 
     # ── Dampak Filter Aktif: bandingkan DENGAN filter (hasil di atas) vs simulasi
@@ -1159,6 +1209,74 @@ def _render_html() -> bytes:
     </table>
     ''' if ind_cp else '<p class="note">Belum ada data indikator.</p>'
 
+    # ── tabel khusus RSI GATE: per-nilai RSI bulat (diurutkan by n_win terbanyak) + bucket tetap ──
+    def _rsi_gate_side_html(direction):
+        d = rsi_gate_cp.get(direction)
+        if not d or d['n_total'] == 0:
+            return f'<p class="note">Belum ada trade {direction} dgn data RSI{RSI_GATE_PERIOD}.</p>'
+        # per-nilai: urutkan by jumlah MENANG absolut terbanyak dulu, lalu tampilkan top 15
+        rows_sorted = sorted(d['per_value'].items(), key=lambda kv: kv[1]['n_win'], reverse=True)
+        per_val_rows = ''
+        for rsi_val, info in rows_sorted[:15]:
+            wr = info['wr']
+            cls = 'g' if (wr or 0) >= 50 else ('y' if (wr or 0) >= 30 else 'r')
+            star = ' ⭐' if rsi_val == d['best_value'] else ''
+            per_val_rows += (f'<tr><td>{rsi_val}{star}</td><td>{info["n"]}</td>'
+                              f'<td class="g">{info["n_win"]}</td><td class="r">{info["n_loss"]}</td>'
+                              f'<td class="{cls}">{wr:.1f}%</td></tr>\n')
+        b = d['buckets']
+        bucket_rows = ''
+        for bname in ('Rendah (0-40)', 'Sedang (41-69)', 'Tinggi (70-100)'):
+            bi = b[bname]
+            wr = bi['wr']
+            cls = 'y' if wr is None else ('g' if wr >= 50 else ('y' if wr >= 30 else 'r'))
+            wr_s = f'{wr:.1f}%' if wr is not None else '-'
+            bucket_rows += (f'<tr><td>{bname}</td><td>{bi["n"]}</td>'
+                             f'<td class="g">{bi["n_win"]}</td><td class="r">{bi["n_loss"]}</td>'
+                             f'<td class="{cls}">{wr_s}</td></tr>\n')
+        best_s = f"RSI{RSI_GATE_PERIOD} = {d['best_value']}" if d['best_value'] is not None else '-'
+        return f'''
+        <p style="font-size:13px;color:#8b949e">Total {direction}: <b>{d["n_total"]}</b> trade |
+        Nilai RSI{RSI_GATE_PERIOD} dgn MENANG absolut terbanyak: <b class="g">{best_s}</b> (⭐ di tabel bawah)</p>
+        <table>
+          <tr><th>RSI{RSI_GATE_PERIOD}</th><th>N</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
+          {per_val_rows or '<tr><td colspan="5" class="y">-</td></tr>'}
+        </table>
+        <p style="font-size:12px;color:#8b949e;margin-top:8px">Top 15 nilai RSI{RSI_GATE_PERIOD} diurutkan by jumlah MENANG
+        terbanyak (bukan cuma WR% tertinggi, spy tidak kejebak n kecil).</p>
+        <table style="margin-top:6px">
+          <tr><th>Kategori</th><th>N</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
+          {bucket_rows}
+        </table>
+        '''
+
+    rsi_gate_html = f'''
+    <h2>Analisis Khusus RSI{RSI_GATE_PERIOD} Gate — Long vs Short (Nonaktif = mode eksplorasi)</h2>
+    <p class="note">💡 RSI{RSI_GATE_PERIOD} saat ini <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b> sbg gate entry —
+    tabel ini menganalisis SEMUA trade yg terjadi (termasuk yg akan diblokir kalau gate diaktifkan), supaya kamu
+    bisa cari rentang RSI{RSI_GATE_PERIOD} yang benar2 menguntungkan SEBELUM mengaktifkan gate-nya.
+    Kolom "Kebanyakan Menang" pakai jumlah MENANG absolut (n_win), bukan WR% semata, spy tidak kejebak nilai RSI
+    yang cuma muncul 1-2 kali dgn WR 100%.</p>
+    <div style="display:flex; flex-wrap:wrap; gap:20px;">
+      <div style="flex:1; min-width:340px;">
+        <h3>🟢 LONG (Golden Cross)</h3>
+        {_rsi_gate_side_html('Long')}
+      </div>
+      <div style="flex:1; min-width:340px;">
+        <h3>🔴 SHORT (Death Cross)</h3>
+        {_rsi_gate_side_html('Short')}
+      </div>
+    </div>
+    <div class="note" style="margin-top:10px">
+      ⚙️ Setelah tahu rentang yang bagus dari tabel di atas, aktifkan gate via Railway Variables:
+      <code>RSI_GATE_ENABLED=1</code>, lalu atur rentang valid:
+      <code>RSI_GATE_MIN_LONG</code>/<code>RSI_GATE_MAX_LONG</code> (utk Long/Golden cross),
+      <code>RSI_GATE_MIN_SHORT</code>/<code>RSI_GATE_MAX_SHORT</code> (utk Short/Death cross).
+      Nilai RSI{RSI_GATE_PERIOD} DILUAR rentang yg kamu set akan diblokir (sinyal dilewati, tidak entry).
+      Jalankan ulang backtest setelah mengubah env var utk lihat dampaknya ke Total R & WR keseluruhan.
+    </div>
+    '''
+
     return f'''<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -1188,6 +1306,7 @@ def _render_html() -> bytes:
 
   <h2>Analisis Indikator saat Cross — Pola Menang vs Kalah</h2>
   <div class="tbl-wrap">{ind_table}</div>
+
   <div class="note">
     💡 Cara baca: ketiga kolom ini KUMULATIF, bukan pembagian rentang terpisah — ketiganya dievaluasi
     terhadap SEMUA trade yang sama (persis seperti menguji sebuah filter beneran):
@@ -1211,6 +1330,7 @@ def _render_html() -> bytes:
     dan menerapkan filter seketat itu bisa membuang mayoritas sinyal & trade menang yang sebenarnya ada.
   </div>
 
+  {rsi_gate_html}
   <div class="note">
     💡 Entry = LIMIT di wick candle penyebab EMA cross. SL = wick diperpanjang sejauh
     jarak yang sama. Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
