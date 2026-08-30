@@ -9,7 +9,7 @@ Strategi (hasil riset & backtest terbaik, lihat Readme.md):
   2. Arah DIBALIK: support valid -> bias SHORT, resistance valid -> bias LONG.
      Bias tetap hidup untuk re-entry berulang sampai ada S/R valid baru.
   3. Entry: LIMIT order di WICK candle yang menyebabkan EMA cross (EMA4/EMA10).
-     SL = wick diperpanjang sejauh jarak (wick, close candle cross) ke arah berlawanan.
+     SL = SL_PCT (default 0.3%) dari entry (wick), arah berlawanan dari entry.
   4. FLIP PROTECTION: EMA cross berlawanan muncul saat pending/aktif -> batal/tutup
      SEKARANG, apapun P&L-nya. Bias tetap hidup, tunggu cross searah lagi.
   5. Trailing stop aktif di rasio 1:TRAIL_ACT_R (default 4) dari jarak entry-SL.
@@ -40,6 +40,8 @@ EMA_SLOW         = int(os.environ.get('EMA_SLOW', '10'))
 TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '4.0'))        # trailing aktif di rasio 1:4
 TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar trailing = 1x dist
 MIN_DIST_PCT     = float(os.environ.get('MIN_DIST_PCT', '0.002'))     # floor SL minimum 0.2%
+SL_PCT           = float(os.environ.get('SL_PCT', '0.003'))           # jarak SL = 0.3% dari entry (wick),
+                                                                        # MENGGANTIKAN jarak struktural candle
 
 # Rentang backtest: FIX (bukan "N hari terakhir") supaya data bisa di-cache & tidak
 # perlu fetch ulang dari Bybit tiap kali variable diubah. Format: YYYY-MM-DD.
@@ -716,7 +718,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
             # ── 5) cross SEARAH -> pasang/ganti limit di wick, TUNDUK ke RSI GATE, MAX_CONCURRENT & FILTER ──
             # Tangkap indikator PERSIS di candle cross ini -> dipakai jg utk filter & analisis win/loss.
             if death_cross and key_short in armed and key_short not in active_positions:
-                wick = H[i]; old_dist = wick - C_[i]
+                wick = H[i]; old_dist = wick * SL_PCT   # SL = SL_PCT dari entry (wick), bukan jarak struktural candle
                 if old_dist > 0:
                     if not _passes_rsi_gate(c, i, 'Short'):
                         blocked_by_rsi_gate += 1
@@ -733,7 +735,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                             }
 
             if golden_cross and key_long in armed and key_long not in active_positions:
-                wick = L[i]; old_dist = C_[i] - wick
+                wick = L[i]; old_dist = wick * SL_PCT   # SL = SL_PCT dari entry (wick), bukan jarak struktural candle
                 if old_dist > 0:
                     if not _passes_rsi_gate(c, i, 'Long'):
                         blocked_by_rsi_gate += 1
@@ -1370,8 +1372,9 @@ def _render_html() -> bytes:
 
   {rsi_gate_html}
   <div class="note">
-    💡 Entry = LIMIT di wick candle penyebab EMA cross. SL = wick diperpanjang sejauh
-    jarak yang sama. Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
+    💡 Entry = LIMIT di wick candle penyebab EMA cross. SL = <b>{SL_PCT*100:.2f}%</b> dari entry
+    (bukan lagi jarak struktural candle) — atur via env var <code>SL_PCT</code>.
+    Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
     Flip protection: cross berlawanan → keluar/batal seketika, tunggu cross searah lagi.
     Trailing aktif di rasio 1:{TRAIL_ACT_R:.0f}, lebar {TRAIL_STOP:.1f}x dist.
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dihitung dari balance TERKINI (compounding, 1 akun bersama —
