@@ -10,8 +10,10 @@ Strategi (hasil riset & backtest terbaik, lihat Readme.md):
      Bias tetap hidup untuk re-entry berulang sampai ada S/R valid baru.
   3. Entry: LIMIT order di WICK candle yang menyebabkan EMA cross (EMA4/EMA10).
      SL = wick diperpanjang sejauh jarak (wick, close candle cross) ke arah berlawanan.
-  4. FLIP PROTECTION: EMA cross berlawanan muncul saat pending/aktif -> batal/tutup
-     SEKARANG, apapun P&L-nya. Bias tetap hidup, tunggu cross searah lagi.
+  4. FLIP PROTECTION: EMA cross berlawanan muncul saat limit masih PENDING (belum
+     fill) -> limit dibatalkan SEKARANG. Posisi yang SUDAH aktif/filled TIDAK
+     ditutup paksa oleh cross berlawanan -- tetap berjalan sampai kena SL/trailing
+     sendiri. Bias tetap hidup, tunggu cross searah lagi utk re-entry.
   5. Trailing stop aktif di rasio 1:TRAIL_ACT_R (default 6) dari jarak entry-SL.
 
 Deploy ke Railway:
@@ -621,13 +623,11 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
             key_long  = _akey(symbol, 'Long')
             key_short = _akey(symbol, 'Short')
 
-            # ── 1) FLIP PROTECTION ──
-            if death_cross and key_long in active_positions:
-                close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
+            # ── 1) FLIP PROTECTION — HANYA utk limit PENDING yg belum fill. Posisi yang SUDAH
+            #    aktif/filled TIDAK ditutup paksa oleh cross berlawanan; tetap dikelola normal
+            #    oleh SL/trailing di bagian (2) di bawah sampai kena SL/trailing/TP sendiri. ──
             if death_cross:
                 pending.pop(key_long, None)
-            if golden_cross and key_short in active_positions:
-                close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
             if golden_cross:
                 pending.pop(key_short, None)
 
@@ -1212,7 +1212,9 @@ def _render_html() -> bytes:
   <div class="note">
     💡 Entry = LIMIT di wick candle penyebab EMA cross. SL = wick diperpanjang sejauh
     jarak yang sama. Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
-    Flip protection: cross berlawanan → keluar/batal seketika, tunggu cross searah lagi.
+    Flip protection: cross berlawanan → HANYA membatalkan limit yang masih pending
+    (belum fill); posisi yang sudah aktif tetap jalan sampai kena SL/trailing sendiri.
+    Tunggu cross searah lagi utk re-entry.
     Trailing aktif di rasio 1:{TRAIL_ACT_R:.0f}, lebar {TRAIL_STOP:.1f}x dist.
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dihitung dari balance TERKINI (compounding, 1 akun bersama —
     bukan modal terpisah per coin). Kalau slot ({MAX_CONCURRENT}) penuh saat sinyal valid baru
