@@ -34,8 +34,8 @@ from pybit.unified_trading import HTTP
 PORT             = int(os.environ.get('PORT', 8080))
 INITIAL_BALANCE  = float(os.environ.get('INITIAL_BALANCE', '30.0'))   # modal awal, 1 AKUN BERSAMA (bukan per coin)
 RISK_PCT         = float(os.environ.get('RISK_PCT', '0.01'))          # risk 1% balance/trade (compound)
-FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.001'))   # fee saat BUKA posisi (taker, Bybit USDT perp)
-FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.001 * 3)))  # fee saat TUTUP posisi = 3x fee entry
+FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))   # fee saat BUKA posisi (taker, Bybit USDT perp)
+FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))  # fee saat TUTUP posisi = 3x fee entry
 EMA_FAST         = int(os.environ.get('EMA_FAST', '4'))
 EMA_SLOW         = int(os.environ.get('EMA_SLOW', '10'))
 TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '4.0'))        # trailing aktif di rasio 1:4
@@ -132,6 +132,7 @@ _combined_result = {         # ringkasan hasil simulasi gabungan (1 balance, 1 p
 }
 _indicator_result = {}      # hasil analisis indikator saat cross (win vs loss)
 _rsi_gate_result = {}       # hasil analisis khusus RSI gate (per-nilai + bucket, terpisah Long/Short)
+_session_day_result = {}    # hasil analisis sesi trading (WIB) & hari (Senin-Minggu)
 _no_filter_result = None    # ringkasan simulasi PEMBANDING tanpa filter (None jika tidak ada filter aktif)
 
 
@@ -922,6 +923,58 @@ def rsi_gate_analysis(trades):
     return out
 
 
+# Definisi sesi trading (WIB / UTC+7). Batas jam INKLUSIF di kedua ujung sesuai spesifikasi:
+# Asia 07:00-13:59, London 14:00-18:59, New York 19:00-23:59, Tengah Malam 00:00-04:59,
+# Sydney 05:00-06:59. Urutan list menentukan urutan tampil di dashboard.
+_SESSION_DEFS = [
+    ('Sydney',       5,  6),
+    ('Asia',         7,  13),
+    ('London',       14, 18),
+    ('New York',     19, 23),
+    ('Tengah Malam', 0,  4),
+]
+_WIB = timezone(timedelta(hours=7))
+_DAY_NAMES_ID = ['Senin', 'Selasa', 'Rabu', 'Kamis', "Jumat", 'Sabtu', 'Minggu']
+
+
+def _session_for_hour(hour_wib):
+    for name, start_h, end_h in _SESSION_DEFS:
+        if start_h <= hour_wib <= end_h:
+            return name
+    return None   # tidak akan pernah kejadian krn 5 sesi di atas menutupi 24 jam penuh
+
+
+def session_day_analysis(trades):
+    """Analisis SESI TRADING (WIB, berdasar jam candle SAAT FILLED / entry_ts -- bukan saat
+    sinyal cross muncul, sesuai definisi: cross jam 13:00 tapi filled jam 14:00 -> masuk
+    sesi London) dan HARI (Senin-Minggu, dari entry_ts yg sama). Tiap kelompok: total trade,
+    menang, kalah, WR%."""
+    sessions = {name: {'n': 0, 'n_win': 0, 'n_loss': 0} for name, _, _ in _SESSION_DEFS}
+    days = {name: {'n': 0, 'n_win': 0, 'n_loss': 0} for name in _DAY_NAMES_ID}
+    for t in trades:
+        ts = t.get('entry_ts')
+        if ts is None:
+            continue
+        dt_wib = datetime.fromtimestamp(ts / 1000, tz=_WIB)
+        win = t['r_mult'] > 0
+        sname = _session_for_hour(dt_wib.hour)
+        if sname is not None:
+            s = sessions[sname]
+            s['n'] += 1
+            s['n_win'] += 1 if win else 0
+            s['n_loss'] += 0 if win else 1
+        dname = _DAY_NAMES_ID[dt_wib.weekday()]   # Monday=0 -> 'Senin'
+        d = days[dname]
+        d['n'] += 1
+        d['n_win'] += 1 if win else 0
+        d['n_loss'] += 0 if win else 1
+    for s in sessions.values():
+        s['wr'] = (s['n_win'] / s['n'] * 100) if s['n'] else None
+    for d in days.values():
+        d['wr'] = (d['n_win'] / d['n'] * 100) if d['n'] else None
+    return {'sessions': sessions, 'days': days}
+
+
 # ============================================================
 # BACKGROUND RUNNER
 # ============================================================
@@ -966,6 +1019,7 @@ def _run():
     result = run_combined_backtest(coins)
     ind_analysis = indicator_analysis(result['trades'])
     rsi_gate_res = rsi_gate_analysis(result['trades'])
+    session_day_res = session_day_analysis(result['trades'])
 
     no_filter_summary = None
     if _any_filter_active():
@@ -987,6 +1041,7 @@ def _run():
         _results.extend(per_symbol_breakdown(result['trades']))
         _indicator_result.update(ind_analysis)
         _rsi_gate_result.update(rsi_gate_res)
+        _session_day_result.update(session_day_res)
         global _no_filter_result
         _no_filter_result = no_filter_summary
         _phase = 'done'
@@ -1044,6 +1099,7 @@ def _render_html() -> bytes:
         cr = dict(_combined_result)
         ind_cp = dict(_indicator_result)
         rsi_gate_cp = dict(_rsi_gate_result)
+        session_day_cp = dict(_session_day_result)
         nf_cp = dict(_no_filter_result) if _no_filter_result else None
 
     refresh = '<meta http-equiv="refresh" content="5">' if phase == 'running' else ''
@@ -1320,6 +1376,51 @@ def _render_html() -> bytes:
     </div>
     '''
 
+    # ── Analisis Sesi Trading (WIB) & Hari — berdasarkan entry_ts (candle SAAT FILLED) ──
+    sd = session_day_cp
+    session_rows = ''
+    session_hours = {name: (s, e) for name, s, e in _SESSION_DEFS}
+    if sd.get('sessions'):
+        for name, info in sd['sessions'].items():
+            s_h, e_h = session_hours[name]
+            wr = info['wr']
+            cls = 'y' if wr is None else ('g' if wr >= 45 else ('y' if wr >= 30 else 'r'))
+            wr_s = f'{wr:.1f}%' if wr is not None else '-'
+            session_rows += (f'<tr><td>{name} ({s_h:02d}:00-{e_h:02d}:59 WIB)</td>'
+                              f'<td>{info["n"]}</td><td class="g">{info["n_win"]}</td>'
+                              f'<td class="r">{info["n_loss"]}</td><td class="{cls}">{wr_s}</td></tr>\n')
+    day_rows = ''
+    if sd.get('days'):
+        for name in _DAY_NAMES_ID:   # urutan tetap Senin->Minggu, bukan urutan dict insert
+            info = sd['days'][name]
+            wr = info['wr']
+            cls = 'y' if wr is None else ('g' if wr >= 45 else ('y' if wr >= 30 else 'r'))
+            wr_s = f'{wr:.1f}%' if wr is not None else '-'
+            day_rows += (f'<tr><td>{name}</td><td>{info["n"]}</td><td class="g">{info["n_win"]}</td>'
+                          f'<td class="r">{info["n_loss"]}</td><td class="{cls}">{wr_s}</td></tr>\n')
+    session_day_html = f'''
+    <h2>📅 Analisis Sesi Trading (WIB) & Hari</h2>
+    <p class="note">💡 Dikelompokkan berdasarkan waktu candle SAAT FILLED (entry_ts), BUKAN saat sinyal
+    EMA cross muncul — mis. cross jam 13:00 WIB tapi baru filled jam 14:00 WIB akan masuk sesi London,
+    bukan Asia. Semua jam dalam WIB (UTC+7).</p>
+    <div style="display:flex; flex-wrap:wrap; gap:20px;">
+      <div style="flex:1; min-width:320px;">
+        <h3>Per Sesi Trading</h3>
+        <table>
+          <tr><th>Sesi</th><th>Total Trade</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
+          {session_rows or '<tr><td colspan="5" class="y">Belum ada data.</td></tr>'}
+        </table>
+      </div>
+      <div style="flex:1; min-width:320px;">
+        <h3>Per Hari</h3>
+        <table>
+          <tr><th>Hari</th><th>Total Trade</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
+          {day_rows or '<tr><td colspan="5" class="y">Belum ada data.</td></tr>'}
+        </table>
+      </div>
+    </div>
+    '''
+
     return f'''<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -1374,6 +1475,7 @@ def _render_html() -> bytes:
   </div>
 
   {rsi_gate_html}
+  {session_day_html}
   <div class="note">
     💡 Entry = LIMIT di wick candle penyebab EMA cross. SL = <b>{SL_PCT*100:.2f}%</b> dari entry
     (bukan lagi jarak struktural candle) — atur via env var <code>SL_PCT</code>.
