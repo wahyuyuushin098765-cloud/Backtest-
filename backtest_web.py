@@ -368,6 +368,45 @@ RSI_ANALYSIS_MAX_LONG  = float(os.environ.get('RSI_ANALYSIS_MAX_LONG', '80'))
 RSI_ANALYSIS_MIN_SHORT = float(os.environ.get('RSI_ANALYSIS_MIN_SHORT', '12'))
 RSI_ANALYSIS_MAX_SHORT = float(os.environ.get('RSI_ANALYSIS_MAX_SHORT', '50'))
 
+# Definisi sesi trading (WIB / UTC+7). Batas jam INKLUSIF di kedua ujung sesuai spesifikasi:
+# Asia 07:00-13:59, London 14:00-18:59, New York 19:00-23:59, Tengah Malam 00:00-04:59,
+# Sydney 05:00-06:59. Urutan list menentukan urutan tampil di dashboard.
+_SESSION_DEFS = [
+    ('Sydney',       5,  6),
+    ('Asia',         7,  13),
+    ('London',       14, 18),
+    ('New York',     19, 23),
+    ('Tengah Malam', 0,  4),
+]
+_WIB = timezone(timedelta(hours=7))
+_DAY_NAMES_ID = ['Senin', 'Selasa', 'Rabu', 'Kamis', "Jumat", 'Sabtu', 'Minggu']
+
+
+def _session_for_hour(hour_wib):
+    for name, start_h, end_h in _SESSION_DEFS:
+        if start_h <= hour_wib <= end_h:
+            return name
+    return None   # tidak akan pernah kejadian krn 5 sesi di atas menutupi 24 jam penuh
+
+
+# ── BLOKIR SESI: sesi yg trading-nya DIHENTIKAN sama sekali -- entry yg SEHARUSNYA fill di
+# sesi ini justru DIBATALKAN (bukan cuma dianalisis pasca-hoc), sama seperti "berhenti trading"
+# di jam tsb. Evaluasi persis di titik FILL (candle yg sama dgn entry_ts), bukan di titik
+# limit dipasang -- konsisten dgn definisi sesi "berdasar waktu filled" yg sudah dipakai di
+# tabel Analisis Sesi. Isi comma-separated (nama sesi persis spt di _SESSION_DEFS), kosongkan
+# utk nonaktifkan semua blokir sesi. Hasil riset dashboard: Sydney & London WR-nya termasuk
+# yang lebih rendah dibanding sesi lain.
+SESSION_BLOCK_LIST = [s.strip() for s in os.environ.get('SESSION_BLOCK_LIST', 'Sydney,London').split(',') if s.strip()]
+
+
+def _session_blocked(entry_ts_ms):
+    """True kalau candle di entry_ts_ms (ms epoch UTC) jatuh di salah satu sesi yg diblokir."""
+    if not SESSION_BLOCK_LIST:
+        return False
+    dt_wib = datetime.fromtimestamp(entry_ts_ms / 1000, tz=_WIB)
+    sname = _session_for_hour(dt_wib.hour)
+    return sname in SESSION_BLOCK_LIST
+
 
 def _calc_rsi(C, period):
     """RSI standar (Wilder smoothing via EWM alpha=1/period).
@@ -543,6 +582,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
     blocked_by_margin = 0    # counter: dilewati krn margin (leverage) sudah habis -- constraint ASLI Bybit
     blocked_by_filter = 0    # counter: dilewati krn tidak lolos filter indikator
     blocked_by_rsi_gate = 0  # counter: dilewati krn gate RSI12 vs RSI24 tidak searah dgn cross
+    blocked_by_session = 0   # counter: fill dibatalkan krn waktu fill jatuh di sesi yg diblokir
 
     def _akey(symbol, direction):
         return f"{symbol}|{direction}" if ALLOW_HEDGE else symbol
@@ -679,6 +719,14 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                 p = pending.get(key)
                 if p is not None and key not in active_positions:
                     filled = (H[i] >= p['entry']) if direction == 'Short' else (L[i] <= p['entry'])
+                    if filled and _session_blocked(int(TS[i])):
+                        # Waktu FILL jatuh di sesi yg diblokir (SESSION_BLOCK_LIST) -> batalkan
+                        # limit, jangan buka posisi. Bukan cuma "skip candle ini": limit yg
+                        # sama tidak akan dicoba fill lagi di candle berikutnya krn sudah
+                        # dihapus dari pending (persis kayak "berhenti trading" di sesi ini).
+                        blocked_by_session += 1
+                        del pending[key]
+                        continue
                     if filled:
                         dist = p['dist']
                         min_dist = p['entry'] * MIN_DIST_PCT
@@ -759,6 +807,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
         'trades': trades, 'final_balance': balance,
         'blocked_by_slot': blocked_by_slot, 'blocked_by_margin': blocked_by_margin,
         'blocked_by_filter': blocked_by_filter, 'blocked_by_rsi_gate': blocked_by_rsi_gate,
+        'blocked_by_session': blocked_by_session,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
         'total_pnl': total_pnl,
@@ -921,27 +970,6 @@ def rsi_gate_analysis(trades):
             'best_value': best_value,    # nilai RSI bulat dgn n_win TERBANYAK (bukan cuma WR tertinggi)
         }
     return out
-
-
-# Definisi sesi trading (WIB / UTC+7). Batas jam INKLUSIF di kedua ujung sesuai spesifikasi:
-# Asia 07:00-13:59, London 14:00-18:59, New York 19:00-23:59, Tengah Malam 00:00-04:59,
-# Sydney 05:00-06:59. Urutan list menentukan urutan tampil di dashboard.
-_SESSION_DEFS = [
-    ('Sydney',       5,  6),
-    ('Asia',         7,  13),
-    ('London',       14, 18),
-    ('New York',     19, 23),
-    ('Tengah Malam', 0,  4),
-]
-_WIB = timezone(timedelta(hours=7))
-_DAY_NAMES_ID = ['Senin', 'Selasa', 'Rabu', 'Kamis', "Jumat", 'Sabtu', 'Minggu']
-
-
-def _session_for_hour(hour_wib):
-    for name, start_h, end_h in _SESSION_DEFS:
-        if start_h <= hour_wib <= end_h:
-            return name
-    return None   # tidak akan pernah kejadian krn 5 sesi di atas menutupi 24 jam penuh
 
 
 def session_day_analysis(trades):
@@ -1125,13 +1153,15 @@ def _render_html() -> bytes:
     blocked_margin = cr.get('blocked_by_margin', 0)
     blocked_filter = cr.get('blocked_by_filter', 0)
     blocked_rsi_gate = cr.get('blocked_by_rsi_gate', 0)
+    blocked_session = cr.get('blocked_by_session', 0)
 
     summary_html = f'''
     <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
     <table>
       <tr><th>Total Trade</th><th>Win</th><th>Loss</th><th>WR%</th><th>Total PnL</th>
           <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
-          <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th><th>Blokir: RSI Gate</th></tr>
+          <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th><th>Blokir: RSI Gate</th>
+          <th>Blokir: Sesi</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
@@ -1146,6 +1176,7 @@ def _render_html() -> bytes:
         <td class="y">{blocked_margin}</td>
         <td class="y">{blocked_filter}</td>
         <td class="y">{blocked_rsi_gate}</td>
+        <td class="y">{blocked_session}</td>
       </tr>
     </table>
     <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
@@ -1158,7 +1189,11 @@ def _render_html() -> bytes:
     (Golden cross/Long butuh RSI{RSI_GATE_PERIOD} di rentang [{RSI_GATE_MIN_LONG:.0f}, {RSI_GATE_MAX_LONG:.0f}],
     Death cross/Short butuh RSI{RSI_GATE_PERIOD} di rentang [{RSI_GATE_MIN_SHORT:.0f}, {RSI_GATE_MAX_SHORT:.0f}]
     — diluar rentang diblokir. Atur via env var <code>RSI_GATE_ENABLED</code>, <code>RSI_GATE_PERIOD</code>,
-    <code>RSI_GATE_MIN_LONG</code>/<code>RSI_GATE_MAX_LONG</code>, <code>RSI_GATE_MIN_SHORT</code>/<code>RSI_GATE_MAX_SHORT</code>)</p>
+    <code>RSI_GATE_MIN_LONG</code>/<code>RSI_GATE_MAX_LONG</code>, <code>RSI_GATE_MIN_SHORT</code>/<code>RSI_GATE_MAX_SHORT</code>)
+    <br>Sesi trading yang DIBLOKIR (fill dibatalkan jika jatuh di jam ini, WIB): <b>{
+        ', '.join(SESSION_BLOCK_LIST) or 'tidak ada (semua sesi aktif)'}</b> —
+    atur via env var <code>SESSION_BLOCK_LIST</code> (comma-separated, mis. <code>Sydney,London</code>;
+    kosongkan utk nonaktifkan semua blokir sesi).</p>
     '''
 
     # ── Dampak Filter Aktif: bandingkan DENGAN filter (hasil di atas) vs simulasi
