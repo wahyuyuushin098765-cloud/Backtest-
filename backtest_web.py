@@ -1,5 +1,5 @@
 """
-backtest_web.py — Backtest strategi EMA-Cross Reversal + Flip Protection (H1)
+backtest_web.py — Backtest strategi EMA-Cross Entry, murni TRAIL/SL exit (H1)
 ==============================================================================
 Semua coin, data H1 live dari Bybit API.
 
@@ -10,9 +10,15 @@ Strategi (hasil riset & backtest terbaik, lihat Readme.md):
      Bias tetap hidup untuk re-entry berulang sampai ada S/R valid baru.
   3. Entry: LIMIT order di WICK candle yang menyebabkan EMA cross (EMA4/EMA10).
      SL = SL_PCT (default 0.3%) dari entry (wick), arah berlawanan dari entry.
-  4. FLIP PROTECTION: EMA cross berlawanan muncul saat pending/aktif -> batal/tutup
-     SEKARANG, apapun P&L-nya. Bias tetap hidup, tunggu cross searah lagi.
+  4. TIDAK ADA flip protection: cross berlawanan TIDAK membatalkan limit pending
+     ataupun menutup posisi yang sudah filled. Limit pending HANYA diganti kalau
+     ada cross SEARAH baru (wick terbaru menggantikan yg lama). Posisi filled
+     HANYA keluar lewat TRAIL atau SL -- murni "menang lewat trailing, kalah
+     lewat stop loss", tidak ada exit paksa krn arah tren berubah.
   5. Trailing stop aktif di rasio 1:TRAIL_ACT_R (default 4) dari jarak entry-SL.
+  6. Long & Short BISA aktif bersamaan (ALLOW_HEDGE=true, default) -- baik utk
+     coin yang sama maupun lintas coin, krn tidak ada mekanisme apapun yg
+     memaksa satu sisi tertutup ketika sisi lain terbentuk (flip sdh dihapus).
 
 Deploy ke Railway:
   Start command -> python backtest_web.py
@@ -396,7 +402,7 @@ def _session_for_hour(hour_wib):
 # tabel Analisis Sesi. Isi comma-separated (nama sesi persis spt di _SESSION_DEFS), kosongkan
 # utk nonaktifkan semua blokir sesi. Hasil riset dashboard: Sydney & London WR-nya termasuk
 # yang lebih rendah dibanding sesi lain.
-SESSION_BLOCK_LIST = [s.strip() for s in os.environ.get('SESSION_BLOCK_LIST', 'Sydney,London').split(',') if s.strip()]
+SESSION_BLOCK_LIST = [s.strip() for s in os.environ.get('SESSION_BLOCK_LIST', '').split(',') if s.strip()]
 
 
 def _session_blocked(entry_ts_ms):
@@ -675,17 +681,11 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
             key_long  = _akey(symbol, 'Long')
             key_short = _akey(symbol, 'Short')
 
-            # ── 1) FLIP PROTECTION murni EMA cross (TANPA syarat RSI) — cross berlawanan
-            #    langsung membatalkan limit pending / menutup posisi filled, apapun P&L-nya.
-            #    Bias tetap hidup, tunggu cross searah lagi utk re-entry. ──
-            if death_cross:
-                pending.pop(key_long, None)
-                if key_long in active_positions:
-                    close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
-            if golden_cross:
-                pending.pop(key_short, None)
-                if key_short in active_positions:
-                    close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
+            # ── (Flip protection dihapus total: cross berlawanan TIDAK membatalkan limit
+            #    pending maupun menutup posisi filled. Limit pending hanya diganti kalau
+            #    ada cross SEARAH baru (lihat bagian 5 di bawah -- overwrite pending[key]
+            #    otomatis terjadi krn key sama). Posisi filled HANYA keluar lewat TRAIL
+            #    atau SL di bagian (2) di bawah -- murni "menang lewat trail, kalah lewat SL"). ──
 
             # ── 2) SL / trailing normal ──
             for direction, key in (('Short', key_short), ('Long', key_long)):
@@ -1515,7 +1515,8 @@ def _render_html() -> bytes:
     💡 Entry = LIMIT di wick candle penyebab EMA cross. SL = <b>{SL_PCT*100:.2f}%</b> dari entry
     (bukan lagi jarak struktural candle) — atur via env var <code>SL_PCT</code>.
     Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
-    Flip protection: cross berlawanan → keluar/batal seketika, tunggu cross searah lagi.
+    Tidak ada flip protection: posisi filled HANYA keluar lewat TRAIL atau SL, cross
+    berlawanan tidak membatalkan apapun. Limit pending diganti hanya oleh cross SEARAH baru.
     Trailing aktif di rasio 1:{TRAIL_ACT_R:.0f}, lebar {TRAIL_STOP:.1f}x dist.
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dihitung dari balance TERKINI (compounding, 1 akun bersama —
     bukan modal terpisah per coin). Kalau slot ({MAX_CONCURRENT}) penuh saat sinyal valid baru
