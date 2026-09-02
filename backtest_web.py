@@ -11,15 +11,11 @@ Strategi (hasil riset & backtest terbaik, lihat Readme.md):
   3. Entry: LIMIT order di ENTRY_LEVEL_PCT (default 0.5 = titik tengah) dari range
      candle yang menyebabkan EMA cross (EMA4/EMA10) -- 0.0 = wick asli, 1.0 = sisi
      berlawanan. SL = SL_PCT (default 0.3%) dari entry, arah berlawanan dari entry.
-  4. TIDAK ADA flip protection: cross berlawanan TIDAK membatalkan limit pending
-     ataupun menutup posisi yang sudah filled. Limit pending HANYA diganti kalau
-     ada cross SEARAH baru (level terbaru menggantikan yg lama). Posisi filled
-     HANYA keluar lewat TRAIL atau SL -- murni "menang lewat trailing, kalah
-     lewat stop loss", tidak ada exit paksa krn arah tren berubah.
+  4. FLIP PROTECTION: EMA cross berlawanan muncul saat pending/aktif -> batal/tutup
+     SEKARANG, apapun P&L-nya. Bias tetap hidup, tunggu cross searah lagi.
   5. Trailing stop aktif di rasio 1:TRAIL_ACT_R (default 4) dari jarak entry-SL.
   6. Long & Short BISA aktif bersamaan (ALLOW_HEDGE=true, default) -- baik utk
-     coin yang sama maupun lintas coin, krn tidak ada mekanisme apapun yg
-     memaksa satu sisi tertutup ketika sisi lain terbentuk (flip sdh dihapus).
+     coin yang sama maupun lintas coin (masing2 arah punya bias & flip sendiri).
 
 Deploy ke Railway:
   Start command -> python backtest_web.py
@@ -685,11 +681,17 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
             key_long  = _akey(symbol, 'Long')
             key_short = _akey(symbol, 'Short')
 
-            # ── (Flip protection dihapus total: cross berlawanan TIDAK membatalkan limit
-            #    pending maupun menutup posisi filled. Limit pending hanya diganti kalau
-            #    ada cross SEARAH baru (lihat bagian 5 di bawah -- overwrite pending[key]
-            #    otomatis terjadi krn key sama). Posisi filled HANYA keluar lewat TRAIL
-            #    atau SL di bagian (2) di bawah -- murni "menang lewat trail, kalah lewat SL"). ──
+            # ── 1) FLIP PROTECTION murni EMA cross (TANPA syarat RSI) — cross berlawanan
+            #    langsung membatalkan limit pending / menutup posisi filled, apapun P&L-nya.
+            #    Bias tetap hidup, tunggu cross searah lagi utk re-entry. ──
+            if death_cross:
+                pending.pop(key_long, None)
+                if key_long in active_positions:
+                    close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
+            if golden_cross:
+                pending.pop(key_short, None)
+                if key_short in active_positions:
+                    close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
 
             # ── 2) SL / trailing normal ──
             for direction, key in (('Short', key_short), ('Long', key_long)):
@@ -1522,8 +1524,7 @@ def _render_html() -> bytes:
     (0%=wick, 50%=titik tengah, 100%=sisi berlawanan) — atur via env var <code>ENTRY_LEVEL_PCT</code>.
     SL = <b>{SL_PCT*100:.2f}%</b> dari entry (bukan lagi jarak struktural candle) — atur via env var <code>SL_PCT</code>.
     Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
-    Tidak ada flip protection: posisi filled HANYA keluar lewat TRAIL atau SL, cross
-    berlawanan tidak membatalkan apapun. Limit pending diganti hanya oleh cross SEARAH baru.
+    Flip protection: cross berlawanan → keluar/batal seketika, tunggu cross searah lagi.
     Trailing aktif di rasio 1:{TRAIL_ACT_R:.0f}, lebar {TRAIL_STOP:.1f}x dist.
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dihitung dari balance TERKINI (compounding, 1 akun bersama —
     bukan modal terpisah per coin). Kalau slot ({MAX_CONCURRENT}) penuh saat sinyal valid baru
