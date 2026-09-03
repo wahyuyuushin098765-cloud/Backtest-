@@ -416,6 +416,13 @@ SWING_GATE_ENABLED = os.environ.get('SWING_GATE_ENABLED', '0').strip() not in ('
 # TIDAK terpengaruh -- tetap dibatalkan seperti biasa oleh cross berlawanan, apapun nilainya.
 FLIP_MIN_R = float(os.environ.get('FLIP_MIN_R', '1.0'))
 
+# ── PENDING EXPIRY: limit yang dipasang saat candle cross (candle ke-0) HARUS fill dalam
+# PENDING_EXPIRY_CANDLES candle H1 BERIKUTNYA (default 3 -> candle+1, +2, +3 = 3 jam). Kalau
+# sampai candle ke-3 CLOSE dan masih belum fill, limit DIBATALKAN otomatis (tidak menunggu
+# cross berlawanan atau cross searah baru). 0 = nonaktif (limit menggantung selamanya spt
+# sebelumnya, sampai fill / dibatalkan flip / diganti cross searah baru).
+PENDING_EXPIRY_CANDLES = int(os.environ.get('PENDING_EXPIRY_CANDLES', '3'))
+
 # ── Rentang FOKUS utk tabel Analisis Khusus RSI Gate (TERPISAH dari gate aktual di atas --
 # ini cuma menyempitkan rentang yg dianalisis & dibagi 3 bucket, tidak mempengaruhi entry
 # sama sekali walau RSI_GATE_ENABLED=1). Nilai diluar rentang fokus tetap dihitung ke
@@ -663,6 +670,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
     bumped_by_min_order = 0    # counter: qty DIPAKSA NAIK krn order_value < MIN_ORDER_USD -- risk aktual > target
     blocked_by_swing = 0       # counter: dilewati krn candle sblm cross bukan swing point asli
     flip_held_below_1r = 0     # counter: cross berlawanan MUNCUL tp posisi TIDAK ditutup krn msh <1R
+    blocked_by_expiry = 0      # counter: limit dibatalkan krn tidak fill dlm PENDING_EXPIRY_CANDLES candle
 
     def _akey(symbol, direction):
         return f"{symbol}|{direction}" if ALLOW_HEDGE else symbol
@@ -814,11 +822,18 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                     if pos['trail_active']:
                         pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
 
-            # ── 3) cek fill pending (limit di wick), TUNDUK ke MARGIN (leverage) ──
+            # ── 3) cek fill pending (limit di wick), TUNDUK ke MARGIN (leverage) & EXPIRY ──
             for direction, key in (('Short', key_short), ('Long', key_long)):
                 p = pending.get(key)
                 if p is not None and key not in active_positions:
                     filled = (H[i] >= p['entry']) if direction == 'Short' else (L[i] <= p['entry'])
+                    if not filled and PENDING_EXPIRY_CANDLES > 0 and i >= p['placed_at_i'] + PENDING_EXPIRY_CANDLES:
+                        # Limit dipasang di candle placed_at_i (candle ke-0), sudah PENDING_EXPIRY_CANDLES
+                        # candle H1 berlalu (candle ke-3 ini CLOSE) dan masih belum fill -> batalkan
+                        # otomatis, tidak menunggu cross berlawanan/searah baru.
+                        blocked_by_expiry += 1
+                        del pending[key]
+                        continue
                     if filled and _session_blocked(int(TS[i])):
                         # Waktu FILL jatuh di sesi yg diblokir (SESSION_BLOCK_LIST) -> batalkan
                         # limit, jangan buka posisi. Bukan cuma "skip candle ini": limit yg
@@ -892,6 +907,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                         else:
                             pending[key_short] = {
                                 'entry': wick, 'sl': wick + old_dist, 'dist': old_dist, 'ind': ind,
+                                'placed_at_i': i,
                             }
 
             if golden_cross and key_long in armed and key_long not in active_positions:
@@ -912,6 +928,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                         else:
                             pending[key_long] = {
                                 'entry': wick, 'sl': wick - old_dist, 'dist': old_dist, 'ind': ind,
+                                'placed_at_i': i,
                             }
 
     wins = [t for t in trades if t['r_mult'] > 0]
@@ -924,6 +941,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
         'blocked_by_min_order': blocked_by_min_order, 'bumped_by_min_order': bumped_by_min_order,
         'blocked_by_swing': blocked_by_swing,
         'flip_held_below_1r': flip_held_below_1r,
+        'blocked_by_expiry': blocked_by_expiry,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
         'total_pnl': total_pnl,
@@ -1276,6 +1294,7 @@ def _render_html() -> bytes:
     bumped_min_order = cr.get('bumped_by_min_order', 0)
     blocked_swing = cr.get('blocked_by_swing', 0)
     flip_held = cr.get('flip_held_below_1r', 0)
+    blocked_expiry = cr.get('blocked_by_expiry', 0)
 
     summary_html = f'''
     <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
@@ -1284,7 +1303,7 @@ def _render_html() -> bytes:
           <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
           <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th><th>Blokir: RSI Gate</th>
           <th>Blokir: Sesi</th><th>Blokir: Min Order</th><th>Qty Dipaksa Naik</th><th>Blokir: Swing</th>
-          <th>Flip Ditahan (&lt;1R)</th></tr>
+          <th>Flip Ditahan (&lt;1R)</th><th>Limit Expired</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
@@ -1304,8 +1323,14 @@ def _render_html() -> bytes:
         <td class="y">{bumped_min_order}</td>
         <td class="y">{blocked_swing}</td>
         <td class="y">{flip_held}</td>
+        <td class="y">{blocked_expiry}</td>
       </tr>
     </table>
+    <p style="font-size:12px;color:#8b949e">Pending Expiry: limit yang tidak fill dalam
+    <b>{PENDING_EXPIRY_CANDLES}</b> candle H1 setelah dipasang (candle cross = candle ke-0, limit
+    boleh coba fill sampai candle ke-{PENDING_EXPIRY_CANDLES}) akan DIBATALKAN otomatis (kolom
+    "Limit Expired") — tidak menunggu cross berlawanan/searah baru. Atur via env var
+    <code>PENDING_EXPIRY_CANDLES</code> (0 = nonaktif, limit menggantung sampai fill/flip/diganti).</p>
     <p style="font-size:12px;color:#8b949e">Flip protection: posisi filled HANYA ditutup oleh cross
     berlawanan kalau <b>CLOSE candle yang menyebabkan cross</b> itu sudah <b>≥ {FLIP_MIN_R:.1f}R</b> dari
     entry (dihitung dari entry & jarak SL posisi itu — misal entry $1.6, SL $1.3, dist=$0.3, maka
