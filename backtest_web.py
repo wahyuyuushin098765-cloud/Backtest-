@@ -408,8 +408,10 @@ RSI_GATE_MAX_SHORT  = float(os.environ.get('RSI_GATE_MAX_SHORT', '100'))
 SWING_GATE_ENABLED = os.environ.get('SWING_GATE_ENABLED', '0').strip() not in ('0', 'false', 'False', '')
 
 # ── FLIP MIN R: posisi yang SUDAH FILLED hanya ditutup oleh cross berlawanan (flip) kalau
-# floating profit-nya (dihitung dlm R, dari entry & jarak SL posisi itu) SUDAH >= FLIP_MIN_R
-# di harga eksekusi flip. Kalau msh dibawah ambang ini (termasuk floating loss), posisi
+# CLOSE candle yang menyebabkan cross berlawanan itu (bukan candle setelahnya) sudah
+# >= FLIP_MIN_R dari entry (dihitung dari entry & jarak SL posisi itu). Contoh: entry $1.6,
+# SL $1.3 (dist=$0.3, FLIP_MIN_R=1.0) -> close candle cross harus > $1.9 baru boleh
+# membatalkan posisi Long itu. Kalau msh dibawah ambang ini (termasuk floating loss), posisi
 # DIBIARKAN jalan terus, cuma keluar lewat TRAIL/SL normal. Limit PENDING (belum filled)
 # TIDAK terpengaruh -- tetap dibatalkan seperti biasa oleh cross berlawanan, apapun nilainya.
 FLIP_MIN_R = float(os.environ.get('FLIP_MIN_R', '1.0'))
@@ -759,16 +761,19 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
 
             # ── 1) FLIP PROTECTION murni EMA cross (TANPA syarat RSI) — cross berlawanan
             #    LANGSUNG membatalkan limit pending (tidak ada urusan profit, blm ada entry).
-            #    Untuk posisi FILLED: HANYA ditutup kalau cross berlawanan terjadi di harga yg
-            #    SUDAH >= 1R profit (dihitung dari entry & dist posisi itu, di harga O[i+1] yg
-            #    dipakai utk eksekusi flip). Kalau msh < 1R (termasuk floating loss), posisi
-            #    DIBIARKAN jalan terus -- cuma keluar lewat TRAIL/SL normal di bagian (2). ──
+            #    Untuk posisi FILLED: HANYA ditutup kalau CLOSE candle yang menyebabkan cross
+            #    berlawanan (C_[i], candle cross itu sendiri -- BUKAN candle setelahnya) SUDAH
+            #    >= FLIP_MIN_R dari entry (dihitung dari entry & dist posisi itu). Kalau msh
+            #    < FLIP_MIN_R (termasuk floating loss), posisi DIBIARKAN jalan terus -- cuma
+            #    keluar lewat TRAIL/SL normal di bagian (2). Eksekusi close tetap di O[i+1]
+            #    (konsisten dgn model eksekusi entry/exit lain di backtest ini), tapi
+            #    KEPUTUSANnya berdasarkan close candle cross. ──
             if death_cross:
                 pending.pop(key_long, None)
                 pos_long = active_positions.get(key_long)
                 if pos_long is not None and pos_long['dist'] > 0:
-                    current_r = (O[i+1] - pos_long['entry']) / pos_long['dist']
-                    if current_r >= FLIP_MIN_R:
+                    current_r = (C_[i] - pos_long['entry']) / pos_long['dist']
+                    if current_r >= FLIP_MIN_R - 1e-9:
                         close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
                     else:
                         flip_held_below_1r += 1
@@ -776,8 +781,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                 pending.pop(key_short, None)
                 pos_short = active_positions.get(key_short)
                 if pos_short is not None and pos_short['dist'] > 0:
-                    current_r = (pos_short['entry'] - O[i+1]) / pos_short['dist']
-                    if current_r >= FLIP_MIN_R:
+                    current_r = (pos_short['entry'] - C_[i]) / pos_short['dist']
+                    if current_r >= FLIP_MIN_R - 1e-9:
                         close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
                     else:
                         flip_held_below_1r += 1
@@ -1302,10 +1307,11 @@ def _render_html() -> bytes:
       </tr>
     </table>
     <p style="font-size:12px;color:#8b949e">Flip protection: posisi filled HANYA ditutup oleh cross
-    berlawanan kalau floating profit-nya sudah <b>≥ {FLIP_MIN_R:.1f}R</b> (dihitung dari entry & jarak
-    SL posisi itu). Dibawah ambang ini (kolom "Flip Ditahan") posisi dibiarkan jalan, cuma keluar
-    lewat TRAIL/SL normal. Limit pending TETAP dibatalkan seperti biasa, tidak terpengaruh ambang ini.
-    Atur via env var <code>FLIP_MIN_R</code>.</p>
+    berlawanan kalau <b>CLOSE candle yang menyebabkan cross</b> itu sudah <b>≥ {FLIP_MIN_R:.1f}R</b> dari
+    entry (dihitung dari entry & jarak SL posisi itu — misal entry $1.6, SL $1.3, dist=$0.3, maka
+    close candle cross harus di atas $1.9 baru boleh membatalkan Long). Dibawah ambang ini (kolom
+    "Flip Ditahan") posisi dibiarkan jalan, cuma keluar lewat TRAIL/SL normal. Limit pending TETAP
+    dibatalkan seperti biasa, tidak terpengaruh ambang ini. Atur via env var <code>FLIP_MIN_R</code>.</p>
     <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
     <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
     terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Fee: entry
