@@ -63,6 +63,40 @@ BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', '2026-07-31')
 LEVERAGE           = float(os.environ.get('LEVERAGE', '25'))
 MARGIN_USAGE_CAP    = float(os.environ.get('MARGIN_USAGE_CAP', '0.90'))   # max 90% balance dipakai jd margin
 
+# ── SIMULASI MIN ORDER SIZE & QTY ROUNDING (approksimasi Bybit real, PERSIS logika
+# place_limit_order() di bot_ema_flip.py). Tanpa ini, backtest MENGASUMSIKAN qty selalu
+# presisi penuh & risk selalu tepat RISK_PCT -- padahal di Bybit real, order kecil (modal
+# kecil) sering DIPAKSA NAIK ke MIN_ORDER_USD (risk aktual > target) atau malah DI-SKIP
+# total kalau order_value < ORDER_BUMP_FLOOR. Ini approksimasi (qty_step generik, BUKAN
+# per-coin asli dari API) -- cukup utk melihat efek MIN_ORDER_USD thd risk aktual, bukan
+# presisi tick-level per-coin.
+SIMULATE_MIN_ORDER  = os.environ.get('SIMULATE_MIN_ORDER', '1').strip() not in ('0', 'false', 'False', '')
+MIN_ORDER_USD       = float(os.environ.get('MIN_ORDER_USD', '5.0'))
+ORDER_BUMP_FLOOR     = float(os.environ.get('ORDER_BUMP_FLOOR', '4.0'))
+QTY_STEP_APPROX      = float(os.environ.get('QTY_STEP_APPROX', '0.000001'))   # generik, halus
+
+
+def _apply_min_order_size(raw_qty, entry_p):
+    """Replikasi persis alur place_limit_order(): round qty ke step generik, cek min_qty
+    (didekati dgn 1 step), lalu cek MIN_ORDER_USD/ORDER_BUMP_FLOOR (bump atau skip).
+    Return (qty_final, skipped_bool, bumped_bool). qty_final=0 kalau skipped."""
+    if not SIMULATE_MIN_ORDER:
+        return raw_qty, False, False
+    step = QTY_STEP_APPROX
+    qty = round(raw_qty / step) * step
+    if qty < step:   # analog "qty < min_qty" -- pakai 1 step sbg proxy min_qty generik
+        return 0, True, False
+    order_value = qty * entry_p
+    if order_value < MIN_ORDER_USD:
+        if order_value >= ORDER_BUMP_FLOOR:
+            qty = round((MIN_ORDER_USD / entry_p) / step) * step
+            if qty * entry_p < MIN_ORDER_USD:
+                qty += step
+            return qty, False, True
+        else:
+            return 0, True, False
+    return qty, False, False
+
 # MAX_CONCURRENT: default TANPA BATAS (seperti sebelumnya). Isi angka di Railway
 # Variables (mis. MAX_CONCURRENT=10) kalau mau membatasi slot global lagi.
 # 0 / kosong / 'unlimited' = tanpa batas. Dengan constraint MARGIN di atas, batas alami
@@ -364,6 +398,15 @@ RSI_GATE_MAX_LONG   = float(os.environ.get('RSI_GATE_MAX_LONG', '70'))
 RSI_GATE_MIN_SHORT  = float(os.environ.get('RSI_GATE_MIN_SHORT', '40'))
 RSI_GATE_MAX_SHORT  = float(os.environ.get('RSI_GATE_MAX_SHORT', '100'))
 
+# ── GATE SWING 3-CANDLE (BUKAN filter statistik -- kondisi STRUKTURAL, dicek di candle
+# TEPAT SEBELUM candle penyebab cross). Tujuannya: pastikan candle sebelum cross itu betulan
+# swing point (titik balik lokal), bukan cuma pergerakan lanjutan tren sebelumnya.
+# Death cross (candle cross biasanya bearish) -> candle 1-sebelum-cross harus SWING HIGH:
+#   high[i-1] > high[i-2] (kiri) DAN high[i-1] > high[i] (kanan, candle cross itu sendiri).
+# Golden cross -> candle 1-sebelum-cross harus SWING LOW:
+#   low[i-1] < low[i-2] (kiri) DAN low[i-1] < low[i] (kanan).
+SWING_GATE_ENABLED = os.environ.get('SWING_GATE_ENABLED', '0').strip() not in ('0', 'false', 'False', '')
+
 # ── Rentang FOKUS utk tabel Analisis Khusus RSI Gate (TERPISAH dari gate aktual di atas --
 # ini cuma menyempitkan rentang yg dianalisis & dibagi 3 bucket, tidak mempengaruhi entry
 # sama sekali walau RSI_GATE_ENABLED=1). Nilai diluar rentang fokus tetap dihitung ke
@@ -528,6 +571,24 @@ def _passes_rsi_gate(c, i, direction):
         return RSI_GATE_MIN_SHORT <= v <= RSI_GATE_MAX_SHORT
 
 
+def _passes_swing_filter(H, L, O, C, i, direction):
+    """Gate SWING 3-CANDLE (bukan filter statistik -- kondisi STRUKTURAL). Dicek di candle
+    i-1 (1 candle SEBELUM candle cross i) -- harus swing point asli, bukan cuma pergerakan
+    lanjutan: kiri (i-2) tidak boleh lebih ekstrem, kanan (i, candle cross) tidak boleh lebih
+    ekstrem juga. direction='Short' (death cross) -> swing HIGH: high[i-1] harus PALING TINGGI
+    di antara [i-2,i-1,i]. direction='Long' (golden cross) -> swing LOW: low[i-1] harus PALING
+    RENDAH di antara [i-2,i-1,i]. True kalau gate nonaktif ATAU candle i-2 belum ada (index<2,
+    fail-open spy tidak diam2 menolak semua trade di awal data)."""
+    if not SWING_GATE_ENABLED:
+        return True
+    if i < 2:
+        return True
+    if direction == 'Short':
+        return H[i-1] > H[i-2] and H[i-1] > H[i]
+    else:
+        return L[i-1] < L[i-2] and L[i-1] < L[i]
+
+
 def prepare_coin(symbol, df):
     """Precompute semua yang dibutuhkan simulasi + indikator (utk analisis win/loss) utk 1 koin.
     None kalau data kurang."""
@@ -589,6 +650,9 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
     blocked_by_filter = 0    # counter: dilewati krn tidak lolos filter indikator
     blocked_by_rsi_gate = 0  # counter: dilewati krn gate RSI12 vs RSI24 tidak searah dgn cross
     blocked_by_session = 0   # counter: fill dibatalkan krn waktu fill jatuh di sesi yg diblokir
+    blocked_by_min_order = 0   # counter: fill dibatalkan krn order_value < ORDER_BUMP_FLOOR (Bybit min order)
+    bumped_by_min_order = 0    # counter: qty DIPAKSA NAIK krn order_value < MIN_ORDER_USD -- risk aktual > target
+    blocked_by_swing = 0       # counter: dilewati krn candle sblm cross bukan swing point asli
 
     def _akey(symbol, direction):
         return f"{symbol}|{direction}" if ALLOW_HEDGE else symbol
@@ -743,7 +807,14 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                         if dist < min_dist:
                             dist = min_dist
                         risk_usd = balance * RISK_PCT   # <-- COMPOUNDING: 1% dari balance TERKINI (shared)
-                        qty = risk_usd / dist if dist > 0 else 0
+                        raw_qty = risk_usd / dist if dist > 0 else 0
+                        qty, skipped_min_order, bumped_min_order = _apply_min_order_size(raw_qty, p['entry'])
+                        if skipped_min_order:
+                            blocked_by_min_order += 1
+                            del pending[key]
+                            continue
+                        if bumped_min_order:
+                            bumped_by_min_order += 1
 
                         # MARGIN CHECK (persis Bybit asli): notional = qty*entry, margin = notional/leverage.
                         # Kalau margin yg sudah dipakai + margin posisi baru ini > batas (mis. 90% balance),
@@ -783,6 +854,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                 if old_dist > 0:
                     if not _passes_rsi_gate(c, i, 'Short'):
                         blocked_by_rsi_gate += 1
+                    elif not _passes_swing_filter(H, L, O, C_, i, 'Short'):
+                        blocked_by_swing += 1
                     else:
                         ind = _capture_indicators(c, i)
                         ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
@@ -801,6 +874,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                 if old_dist > 0:
                     if not _passes_rsi_gate(c, i, 'Long'):
                         blocked_by_rsi_gate += 1
+                    elif not _passes_swing_filter(H, L, O, C_, i, 'Long'):
+                        blocked_by_swing += 1
                     else:
                         ind = _capture_indicators(c, i)
                         ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
@@ -820,6 +895,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
         'blocked_by_slot': blocked_by_slot, 'blocked_by_margin': blocked_by_margin,
         'blocked_by_filter': blocked_by_filter, 'blocked_by_rsi_gate': blocked_by_rsi_gate,
         'blocked_by_session': blocked_by_session,
+        'blocked_by_min_order': blocked_by_min_order, 'bumped_by_min_order': bumped_by_min_order,
+        'blocked_by_swing': blocked_by_swing,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
         'total_pnl': total_pnl,
@@ -1166,6 +1243,9 @@ def _render_html() -> bytes:
     blocked_filter = cr.get('blocked_by_filter', 0)
     blocked_rsi_gate = cr.get('blocked_by_rsi_gate', 0)
     blocked_session = cr.get('blocked_by_session', 0)
+    blocked_min_order = cr.get('blocked_by_min_order', 0)
+    bumped_min_order = cr.get('bumped_by_min_order', 0)
+    blocked_swing = cr.get('blocked_by_swing', 0)
 
     summary_html = f'''
     <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
@@ -1173,7 +1253,7 @@ def _render_html() -> bytes:
       <tr><th>Total Trade</th><th>Win</th><th>Loss</th><th>WR%</th><th>Total PnL</th>
           <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
           <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th><th>Blokir: RSI Gate</th>
-          <th>Blokir: Sesi</th></tr>
+          <th>Blokir: Sesi</th><th>Blokir: Min Order</th><th>Qty Dipaksa Naik</th><th>Blokir: Swing</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
@@ -1189,6 +1269,9 @@ def _render_html() -> bytes:
         <td class="y">{blocked_filter}</td>
         <td class="y">{blocked_rsi_gate}</td>
         <td class="y">{blocked_session}</td>
+        <td class="y">{blocked_min_order}</td>
+        <td class="y">{bumped_min_order}</td>
+        <td class="y">{blocked_swing}</td>
       </tr>
     </table>
     <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
@@ -1198,7 +1281,13 @@ def _render_html() -> bytes:
     atur via env var <code>FEE_ENTRY_PCT</code>/<code>FEE_EXIT_PCT</code>.
     ⚠️ <b>WR% & status Menang/Kalah di SELURUH dashboard ini dihitung SETELAH fee</b> (net) — trade
     yang harganya untung tipis tapi habis kena fee entry+exit jadi rugi akan tercatat sbg <b>Kalah</b>,
-    bukan Menang. Filter aktif: {
+    bukan Menang.
+    <br>💰 Simulasi Min Order Size (approksimasi Bybit, {'AKTIF' if SIMULATE_MIN_ORDER else 'NONAKTIF'}):
+    order &lt; <b>${ORDER_BUMP_FLOOR:.0f}</b> di-SKIP (kolom "Blokir: Min Order"), order &lt; <b>${MIN_ORDER_USD:.0f}</b>
+    (tapi &ge;${ORDER_BUMP_FLOOR:.0f}) DIPAKSA NAIK ke ${MIN_ORDER_USD:.0f} (kolom "Qty Dipaksa Naik" — risk
+    trade itu jadi LEBIH BESAR dari target {RISK_PCT*100:.0f}%). Makin kecil modal awal, makin sering ini
+    terjadi — atur via env var <code>SIMULATE_MIN_ORDER</code>, <code>MIN_ORDER_USD</code>, <code>ORDER_BUMP_FLOOR</code>.
+    Filter aktif: {
         ', '.join(_active_filter_summary()) or 'tidak ada (semua nonaktif)'}
     <br>Gate RSI{RSI_GATE_PERIOD} saat cross: <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b>
     (Golden cross/Long butuh RSI{RSI_GATE_PERIOD} di rentang [{RSI_GATE_MIN_LONG:.0f}, {RSI_GATE_MAX_LONG:.0f}],
@@ -1208,7 +1297,11 @@ def _render_html() -> bytes:
     <br>Sesi trading yang DIBLOKIR (fill dibatalkan jika jatuh di jam ini, WIB): <b>{
         ', '.join(SESSION_BLOCK_LIST) or 'tidak ada (semua sesi aktif)'}</b> —
     atur via env var <code>SESSION_BLOCK_LIST</code> (comma-separated, mis. <code>Sydney,London</code>;
-    kosongkan utk nonaktifkan semua blokir sesi).</p>
+    kosongkan utk nonaktifkan semua blokir sesi).
+    <br>🔍 Gate Swing 3-Candle: <b>{'AKTIF' if SWING_GATE_ENABLED else 'NONAKTIF'}</b> — candle 1-sebelum-cross
+    harus jadi swing point asli (Death cross: high[i-1] paling tinggi drpd kiri & kanannya; Golden cross:
+    low[i-1] paling rendah drpd kiri & kanannya), bukan cuma pergerakan lanjutan tren. Atur via env var
+    <code>SWING_GATE_ENABLED</code>.</p>
     '''
 
     # ── Dampak Filter Aktif: bandingkan DENGAN filter (hasil di atas) vs simulasi
