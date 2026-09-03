@@ -651,7 +651,11 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
         fee = entry * qty * FEE_ENTRY_PCT + exit_price * qty * FEE_EXIT_PCT
         pnl_net = pnl_gross - fee
         balance += pnl_net
-        r_mult = pnl_gross / (dist * qty) if dist * qty else 0
+        # r_mult (dan karenanya status Win/Loss di WR% seluruh dashboard) dihitung dari PNL_NET
+        # (SETELAH fee), bukan pnl_gross. Kalau tidak, trade yg harganya untung tipis tapi abis
+        # fee jadi rugi (persis keluhan "kadang rugi kecil gara2 fee") akan SALAH tercatat sbg
+        # "Win" -- WR% jadi menyesatkan drpd P&L aktual yg masuk ke balance.
+        r_mult = pnl_net / (dist * qty) if dist * qty else 0
         trade = {
             'symbol': symbol, 'direction': direction, 'entry': entry, 'sl': pos['sl'],
             'exit': exit_price, 'reason': reason, 'r_mult': r_mult, 'pnl_usd': pnl_net,
@@ -1191,7 +1195,10 @@ def _render_html() -> bytes:
     <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
     terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Fee: entry
     <b>{FEE_ENTRY_PCT*100:.3f}%</b>, exit <b>{FEE_EXIT_PCT*100:.3f}%</b> ({FEE_EXIT_PCT/FEE_ENTRY_PCT:.0f}x fee entry) —
-    atur via env var <code>FEE_ENTRY_PCT</code>/<code>FEE_EXIT_PCT</code>. Filter aktif: {
+    atur via env var <code>FEE_ENTRY_PCT</code>/<code>FEE_EXIT_PCT</code>.
+    ⚠️ <b>WR% & status Menang/Kalah di SELURUH dashboard ini dihitung SETELAH fee</b> (net) — trade
+    yang harganya untung tipis tapi habis kena fee entry+exit jadi rugi akan tercatat sbg <b>Kalah</b>,
+    bukan Menang. Filter aktif: {
         ', '.join(_active_filter_summary()) or 'tidak ada (semua nonaktif)'}
     <br>Gate RSI{RSI_GATE_PERIOD} saat cross: <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b>
     (Golden cross/Long butuh RSI{RSI_GATE_PERIOD} di rentang [{RSI_GATE_MIN_LONG:.0f}, {RSI_GATE_MAX_LONG:.0f}],
