@@ -407,6 +407,13 @@ RSI_GATE_MAX_SHORT  = float(os.environ.get('RSI_GATE_MAX_SHORT', '100'))
 #   low[i-1] < low[i-2] (kiri) DAN low[i-1] < low[i] (kanan).
 SWING_GATE_ENABLED = os.environ.get('SWING_GATE_ENABLED', '0').strip() not in ('0', 'false', 'False', '')
 
+# ── FLIP MIN R: posisi yang SUDAH FILLED hanya ditutup oleh cross berlawanan (flip) kalau
+# floating profit-nya (dihitung dlm R, dari entry & jarak SL posisi itu) SUDAH >= FLIP_MIN_R
+# di harga eksekusi flip. Kalau msh dibawah ambang ini (termasuk floating loss), posisi
+# DIBIARKAN jalan terus, cuma keluar lewat TRAIL/SL normal. Limit PENDING (belum filled)
+# TIDAK terpengaruh -- tetap dibatalkan seperti biasa oleh cross berlawanan, apapun nilainya.
+FLIP_MIN_R = float(os.environ.get('FLIP_MIN_R', '1.0'))
+
 # ── Rentang FOKUS utk tabel Analisis Khusus RSI Gate (TERPISAH dari gate aktual di atas --
 # ini cuma menyempitkan rentang yg dianalisis & dibagi 3 bucket, tidak mempengaruhi entry
 # sama sekali walau RSI_GATE_ENABLED=1). Nilai diluar rentang fokus tetap dihitung ke
@@ -653,6 +660,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
     blocked_by_min_order = 0   # counter: fill dibatalkan krn order_value < ORDER_BUMP_FLOOR (Bybit min order)
     bumped_by_min_order = 0    # counter: qty DIPAKSA NAIK krn order_value < MIN_ORDER_USD -- risk aktual > target
     blocked_by_swing = 0       # counter: dilewati krn candle sblm cross bukan swing point asli
+    flip_held_below_1r = 0     # counter: cross berlawanan MUNCUL tp posisi TIDAK ditutup krn msh <1R
 
     def _akey(symbol, direction):
         return f"{symbol}|{direction}" if ALLOW_HEDGE else symbol
@@ -750,16 +758,29 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
             key_short = _akey(symbol, 'Short')
 
             # ── 1) FLIP PROTECTION murni EMA cross (TANPA syarat RSI) — cross berlawanan
-            #    langsung membatalkan limit pending / menutup posisi filled, apapun P&L-nya.
-            #    Bias tetap hidup, tunggu cross searah lagi utk re-entry. ──
+            #    LANGSUNG membatalkan limit pending (tidak ada urusan profit, blm ada entry).
+            #    Untuk posisi FILLED: HANYA ditutup kalau cross berlawanan terjadi di harga yg
+            #    SUDAH >= 1R profit (dihitung dari entry & dist posisi itu, di harga O[i+1] yg
+            #    dipakai utk eksekusi flip). Kalau msh < 1R (termasuk floating loss), posisi
+            #    DIBIARKAN jalan terus -- cuma keluar lewat TRAIL/SL normal di bagian (2). ──
             if death_cross:
                 pending.pop(key_long, None)
-                if key_long in active_positions:
-                    close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
+                pos_long = active_positions.get(key_long)
+                if pos_long is not None and pos_long['dist'] > 0:
+                    current_r = (O[i+1] - pos_long['entry']) / pos_long['dist']
+                    if current_r >= FLIP_MIN_R:
+                        close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
+                    else:
+                        flip_held_below_1r += 1
             if golden_cross:
                 pending.pop(key_short, None)
-                if key_short in active_positions:
-                    close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
+                pos_short = active_positions.get(key_short)
+                if pos_short is not None and pos_short['dist'] > 0:
+                    current_r = (pos_short['entry'] - O[i+1]) / pos_short['dist']
+                    if current_r >= FLIP_MIN_R:
+                        close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
+                    else:
+                        flip_held_below_1r += 1
 
             # ── 2) SL / trailing normal ──
             for direction, key in (('Short', key_short), ('Long', key_long)):
@@ -897,6 +918,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
         'blocked_by_session': blocked_by_session,
         'blocked_by_min_order': blocked_by_min_order, 'bumped_by_min_order': bumped_by_min_order,
         'blocked_by_swing': blocked_by_swing,
+        'flip_held_below_1r': flip_held_below_1r,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
         'total_pnl': total_pnl,
@@ -941,17 +963,15 @@ INDICATOR_INFO = {
 
 def indicator_analysis(trades):
     """Utk tiap indikator: avg saat WIN vs LOSS, WR & win/loss count utk SEMUA trade (agregat),
-    + win rate & win/loss count per bucket KUMULATIF Rendah/Sedang/Tinggi.
+    + win rate & win/loss count per bucket PARTISI Rendah/Sedang/Tinggi.
 
-    PENTING - definisi bucket (KUMULATIF, bukan partisi/rentang terpisah):
-      Rendah  = SEMUA trade dgn nilai indikator <= t1  (spt filter "maks t1")
-      Sedang  = SEMUA trade dgn nilai indikator <= t2  (spt filter "maks t2", t2 > t1
-                jadi Sedang selalu superset dari Rendah, BUKAN cuma yg di antara t1-t2)
-      Tinggi  = SEMUA trade, tanpa batas atas (= sama dgn "Semua Trade")
-    Ketiganya dievaluasi terhadap TOTAL trade yang sama (n identik = jumlah trade
-    keseluruhan yg punya nilai indikator ini), bukan dipecah jadi 3 kelompok terpisah.
-    Tujuannya: lihat langsung "kalau saya pasang threshold di t1 (atau t2), berapa
-    trade yang lolos dan berapa yang MENANG secara absolut" -- bukan proporsi bucket."""
+    PENTING - definisi bucket (PARTISI berbasis RENTANG NILAI, bukan kumulatif):
+      Semua nilai indikator (tersimpan tiap trade PERSIS saat candle cross terjadi) diambil,
+      lalu rentang [MIN, MAX] dibagi 3 bagian SAMA BESAR secara nilai (bukan sama jumlah
+      trade). Tiap trade masuk TEPAT SATU kelompok sesuai nilainya -- Rendah, Sedang, Tinggi
+      TIDAK overlap (beda dgn versi kumulatif sebelumnya di mana Sedang mencakup Rendah).
+      Tujuannya: lihat 3 populasi trade yg benar2 terpisah -- apa WR di rentang nilai rendah,
+      berapa yg di rentang sedang, berapa yg di rentang tinggi."""
     out = {}
     for key, info in INDICATOR_INFO.items():
         pairs = [(t[key], t['r_mult'] > 0) for t in trades if t.get(key) is not None]
@@ -968,8 +988,16 @@ def indicator_analysis(trades):
             t1 = vmin + span / 3
             t2 = vmin + 2 * span / 3
 
-        def _cum_bucket(threshold, no_limit=False):
-            ws = [w for v, w in pairs if no_limit or v <= threshold]
+        buckets = {'Rendah': [], 'Sedang': [], 'Tinggi': []}
+        for v, w in pairs:
+            if v <= t1:
+                buckets['Rendah'].append(w)
+            elif v <= t2:
+                buckets['Sedang'].append(w)
+            else:
+                buckets['Tinggi'].append(w)
+
+        def _bucket_stats(ws):
             return {
                 'wr': (sum(ws) / len(ws) * 100) if ws else None,
                 'n': len(ws),
@@ -977,11 +1005,7 @@ def indicator_analysis(trades):
                 'n_loss': sum(1 for w in ws if not w),
             }
 
-        buckets = {
-            'Rendah': _cum_bucket(t1),
-            'Sedang': _cum_bucket(t2),
-            'Tinggi': _cum_bucket(None, no_limit=True),
-        }
+        buckets_stats = {name: _bucket_stats(ws) for name, ws in buckets.items()}
         n_win_all = len(win_vals)
         n_loss_all = len(loss_vals)
         out[key] = {
@@ -991,7 +1015,7 @@ def indicator_analysis(trades):
             'n': len(pairs), 't1': t1, 't2': t2,
             'n_win_all': n_win_all, 'n_loss_all': n_loss_all,
             'wr_all': (n_win_all / len(pairs) * 100) if pairs else None,
-            'buckets': buckets,
+            'buckets': buckets_stats,
         }
     return out
 
@@ -1246,6 +1270,7 @@ def _render_html() -> bytes:
     blocked_min_order = cr.get('blocked_by_min_order', 0)
     bumped_min_order = cr.get('bumped_by_min_order', 0)
     blocked_swing = cr.get('blocked_by_swing', 0)
+    flip_held = cr.get('flip_held_below_1r', 0)
 
     summary_html = f'''
     <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
@@ -1253,7 +1278,8 @@ def _render_html() -> bytes:
       <tr><th>Total Trade</th><th>Win</th><th>Loss</th><th>WR%</th><th>Total PnL</th>
           <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
           <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th><th>Blokir: RSI Gate</th>
-          <th>Blokir: Sesi</th><th>Blokir: Min Order</th><th>Qty Dipaksa Naik</th><th>Blokir: Swing</th></tr>
+          <th>Blokir: Sesi</th><th>Blokir: Min Order</th><th>Qty Dipaksa Naik</th><th>Blokir: Swing</th>
+          <th>Flip Ditahan (&lt;1R)</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
@@ -1272,8 +1298,14 @@ def _render_html() -> bytes:
         <td class="y">{blocked_min_order}</td>
         <td class="y">{bumped_min_order}</td>
         <td class="y">{blocked_swing}</td>
+        <td class="y">{flip_held}</td>
       </tr>
     </table>
+    <p style="font-size:12px;color:#8b949e">Flip protection: posisi filled HANYA ditutup oleh cross
+    berlawanan kalau floating profit-nya sudah <b>≥ {FLIP_MIN_R:.1f}R</b> (dihitung dari entry & jarak
+    SL posisi itu). Dibawah ambang ini (kolom "Flip Ditahan") posisi dibiarkan jalan, cuma keluar
+    lewat TRAIL/SL normal. Limit pending TETAP dibatalkan seperti biasa, tidak terpengaruh ambang ini.
+    Atur via env var <code>FLIP_MIN_R</code>.</p>
     <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
     <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
     terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Fee: entry
@@ -1434,8 +1466,8 @@ def _render_html() -> bytes:
     ind_table = f'''
     <table>
       <tr><th rowspan="2">Indikator (saat candle cross)</th><th rowspan="2">Avg saat WIN</th><th rowspan="2">Avg saat LOSS</th>
-          <th colspan="2">Rendah (≤ t1)</th><th colspan="2">Sedang (≤ t2)</th><th colspan="2">Tinggi (semua, tanpa batas)</th>
-          <th rowspan="2">t1 / t2</th></tr>
+          <th colspan="2">Rendah</th><th colspan="2">Sedang</th><th colspan="2">Tinggi</th>
+          <th rowspan="2">Batas Rendah/Sedang/Tinggi</th></tr>
       <tr><th>WR%</th><th>N (Menang/Kalah)</th>
           <th>WR%</th><th>N (Menang/Kalah)</th><th>WR%</th><th>N (Menang/Kalah)</th></tr>
       {ind_rows or '<tr><td colspan="10" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
@@ -1595,25 +1627,29 @@ def _render_html() -> bytes:
   <div class="tbl-wrap">{ind_table}</div>
 
   <div class="note">
-    💡 Cara baca: ketiga kolom ini KUMULATIF, bukan pembagian rentang terpisah — ketiganya dievaluasi
-    terhadap SEMUA trade yang sama (persis seperti menguji sebuah filter beneran):
-    <br>• <b>Rendah</b> = kalau kamu HANYA ambil trade dengan nilai indikator ini ≤ t1 (kolom paling kanan),
-    berapa yang menang & kalah?
-    <br>• <b>Sedang</b> = kalau kamu HANYA ambil trade dengan nilai ≤ t2 (batas lebih longgar dari t1),
-    berapa yang menang & kalah? (Sedang selalu MENCAKUP Rendah, karena t2 > t1 — bukan kelompok terpisah)
-    <br>• <b>Tinggi</b> = SEMUA trade tanpa batas apapun — ini baseline "tanpa filter" utk pembanding.
-    <br>Karena itu N di kolom Tinggi selalu = total trade keseluruhan, dan N di Rendah/Sedang biasanya
-    lebih kecil (subset). Yang perlu dicari: apakah WR% naik dan jumlah <b>Menang absolut</b> tetap besar
-    saat kamu perketat ke Rendah/Sedang dibanding Tinggi — kalau WR naik tapi n Menang-nya turun drastis,
-    filter itu membuang lebih banyak peluang menang daripada yang disisakan.
-    Bandingkan juga kolom "Avg saat WIN" vs "Avg saat LOSS" — kalau beda jauh, indikator itu berpotensi
-    jadi FILTER. Kolom "t1 / t2" adalah nilai ambang aktualnya (mis. "≤1.05x / ≤1.40x").
+    💡 Cara baca: setiap trade PUNYA nilai indikator ini yang tersimpan PERSIS saat candle cross
+    terjadi. Semua nilai itu diambil, rentang [nilai MINIMUM, nilai MAKSIMUM] dibagi 3 bagian
+    SAMA BESAR secara nilai (bukan sama jumlah trade), lalu tiap trade masuk TEPAT SATU kelompok
+    sesuai nilainya — <b>Rendah/Sedang/Tinggi TIDAK overlap</b> (beda dari versi sebelumnya yang
+    kumulatif):
+    <br>• <b>Rendah</b> = trade dengan nilai indikator di sepertiga rentang paling bawah
+    <br>• <b>Sedang</b> = trade dengan nilai di sepertiga rentang tengah
+    <br>• <b>Tinggi</b> = trade dengan nilai di sepertiga rentang paling atas
+    <br>Karena itu N di ketiga kolom TIDAK selalu sama — kalau kebanyakan trade nilainya
+    mengumpul di satu rentang (mis. mayoritas ATR ratio antara 1.0-1.5x), bucket itu akan
+    punya N jauh lebih besar dari bucket lain, meski secara NILAI ketiganya sama lebar.
+    Yang perlu dicari: apakah WR% dan jumlah <b>Menang absolut</b> berbeda jauh antar ketiga
+    kelompok — itu tanda indikator ini punya pola yang bisa dimanfaatkan sbg filter.
+    Bandingkan juga kolom "Avg saat WIN" vs "Avg saat LOSS" — kalau beda jauh, indikator itu
+    berpotensi jadi FILTER. Kolom "Batas Rendah/Sedang/Tinggi" adalah nilai t1/t2 pembagi
+    rentang (mis. "≤1.05x / ≤1.40x" artinya Rendah = sampai 1.05x, Sedang = 1.05x-1.40x,
+    Tinggi = di atas 1.40x).
     <br>Kalau mau menerapkan filter berdasarkan hasil ini, isi env var di Railway:
     <code>FILTER_MIN_ATR_RATIO</code>, <code>FILTER_MIN_VOL_RATIO</code>, atau
     <code>FILTER_MAX_EMA_GAP_PCT</code> (nilai ambang batas Sedang/Tinggi di atas), lalu jalankan
     ulang backtest untuk lihat dampaknya ke Total R & WR keseluruhan (bukan cuma per-bucket).
-    <br>⚠️ Kolom <b>N trade</b> di Rendah/Sedang penting dicek sebelum aktifkan filter — WR tinggi di
-    bucket "Rendah" tidak ada gunanya kalau isinya cuma 5 trade dari total 300 (bisa kebetulan/noise),
+    <br>⚠️ Kolom <b>N trade</b> di tiap bucket penting dicek sebelum aktifkan filter — WR tinggi di
+    bucket manapun tidak ada gunanya kalau isinya cuma 5 trade dari total 300 (bisa kebetulan/noise),
     dan menerapkan filter seketat itu bisa membuang mayoritas sinyal & trade menang yang sebenarnya ada.
   </div>
 
