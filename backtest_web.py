@@ -46,7 +46,7 @@ TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar tr
 MIN_DIST_PCT     = float(os.environ.get('MIN_DIST_PCT', '0.002'))     # floor SL minimum 0.2%
 SL_PCT           = float(os.environ.get('SL_PCT', '0.003'))           # jarak SL = 0.3% dari entry,
                                                                         # MENGGANTIKAN jarak struktural candle
-ENTRY_LEVEL_PCT  = float(os.environ.get('ENTRY_LEVEL_PCT', '0.5'))     # posisi limit entry dalam range
+ENTRY_LEVEL_PCT  = float(os.environ.get('ENTRY_LEVEL_PCT', '0.0'))     # posisi limit entry dalam range
                                                                         # candle cross: 0.0=wick low, 1.0=wick
                                                                         # high, 0.5=titik tengah (default)
 
