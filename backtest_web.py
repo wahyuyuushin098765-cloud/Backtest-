@@ -466,6 +466,26 @@ def _session_blocked(entry_ts_ms):
     return sname in SESSION_BLOCK_LIST
 
 
+# ── NO-TRADE SESSION (full halt): BEDA dari SESSION_BLOCK_LIST di atas (yg cuma mencegah FILL
+# baru, posisi yg sudah filled sebelum sesi itu tetap jalan). Ini jauh lebih ketat -- begitu
+# candle jatuh di salah satu sesi dalam daftar ini: 1) SEMUA limit pending utk symbol itu
+# DIBATALKAN, 2) SEMUA posisi filled utk symbol itu DITUTUX PAKSA (harga close candle saat
+# itu), 3) TIDAK ADA entry/setup baru yg dieksekusi -- sampai sesi tsb selesai. Dievaluasi
+# ULANG tiap candle, jadi begitu sesi berakhir, trading otomatis normal lagi candle berikutnya
+# tanpa perlu logika resume khusus. Default: London (sesuai temuan WR London di tabel Analisis
+# Sesi). Kosongkan utk nonaktifkan.
+NO_TRADE_SESSIONS = [s.strip() for s in os.environ.get('NO_TRADE_SESSIONS', 'London').split(',') if s.strip()]
+
+
+def _in_no_trade_session(ts_ms):
+    """True kalau candle di ts_ms (ms epoch UTC) jatuh di salah satu sesi no-trade (full halt)."""
+    if not NO_TRADE_SESSIONS:
+        return False
+    dt_wib = datetime.fromtimestamp(ts_ms / 1000, tz=_WIB)
+    sname = _session_for_hour(dt_wib.hour)
+    return sname in NO_TRADE_SESSIONS
+
+
 def _calc_rsi(C, period):
     """RSI standar (Wilder smoothing via EWM alpha=1/period).
     Rumus 100*avg_gain/(avg_gain+avg_loss) dipakai langsung (bukan 100-100/(1+RS))
@@ -663,6 +683,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
     bumped_by_min_order = 0    # counter: qty DIPAKSA NAIK krn order_value < MIN_ORDER_USD -- risk aktual > target
     blocked_by_swing = 0       # counter: dilewati krn candle sblm cross bukan swing point asli
     flip_held_below_1r = 0     # counter: cross berlawanan MUNCUL tp posisi TIDAK ditutup krn msh <1R
+    blocked_by_no_trade_session = 0   # counter: pending dibatalkan krn masuk sesi no-trade (full halt)
+    closed_by_no_trade_session = 0    # counter: posisi filled ditutup paksa krn masuk sesi no-trade
 
     def _akey(symbol, direction):
         return f"{symbol}|{direction}" if ALLOW_HEDGE else symbol
@@ -758,6 +780,29 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
 
             key_long  = _akey(symbol, 'Long')
             key_short = _akey(symbol, 'Short')
+
+            # ── 0) NO-TRADE SESSION (full halt) — cek PALING AWAL, sebelum flip/entry apapun.
+            #    Kalau candle SAAT INI jatuh di sesi no-trade: batalkan semua pending, tutup
+            #    semua posisi filled (harga close candle ini), lalu SKIP total sisa logika utk
+            #    symbol ini di candle ini (flip, SL/trailing normal, entry baru) -- persis
+            #    "berhenti trading total" sampai sesi berakhir. ──
+            if _in_no_trade_session(int(TS[i])):
+                if key_long in pending:
+                    del pending[key_long]
+                    blocked_by_no_trade_session += 1
+                if key_short in pending:
+                    del pending[key_short]
+                    blocked_by_no_trade_session += 1
+                if key_long in active_positions:
+                    close_trade(symbol, 'Long', C_[i], 'NO_TRADE_SESSION', int(TS[i]))
+                    closed_by_no_trade_session += 1
+                if key_short in active_positions:
+                    close_trade(symbol, 'Short', C_[i], 'NO_TRADE_SESSION', int(TS[i]))
+                    closed_by_no_trade_session += 1
+                continue
+
+            death_cross  = ema_fast[i-1] >= ema_slow[i-1] and ema_fast[i] < ema_slow[i]
+            golden_cross = ema_fast[i-1] <= ema_slow[i-1] and ema_fast[i] > ema_slow[i]
 
             # ── 1) FLIP PROTECTION murni EMA cross (TANPA syarat RSI) — cross berlawanan
             #    LANGSUNG membatalkan limit pending (tidak ada urusan profit, blm ada entry).
@@ -924,6 +969,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
         'blocked_by_min_order': blocked_by_min_order, 'bumped_by_min_order': bumped_by_min_order,
         'blocked_by_swing': blocked_by_swing,
         'flip_held_below_1r': flip_held_below_1r,
+        'blocked_by_no_trade_session': blocked_by_no_trade_session,
+        'closed_by_no_trade_session': closed_by_no_trade_session,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
         'total_pnl': total_pnl,
@@ -1276,6 +1323,8 @@ def _render_html() -> bytes:
     bumped_min_order = cr.get('bumped_by_min_order', 0)
     blocked_swing = cr.get('blocked_by_swing', 0)
     flip_held = cr.get('flip_held_below_1r', 0)
+    blocked_nts = cr.get('blocked_by_no_trade_session', 0)
+    closed_nts = cr.get('closed_by_no_trade_session', 0)
 
     summary_html = f'''
     <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
@@ -1284,7 +1333,7 @@ def _render_html() -> bytes:
           <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
           <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th><th>Blokir: RSI Gate</th>
           <th>Blokir: Sesi</th><th>Blokir: Min Order</th><th>Qty Dipaksa Naik</th><th>Blokir: Swing</th>
-          <th>Flip Ditahan (&lt;1R)</th></tr>
+          <th>Flip Ditahan (&lt;1R)</th><th>No-Trade: Pending Batal</th><th>No-Trade: Posisi Ditutup</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
@@ -1304,8 +1353,16 @@ def _render_html() -> bytes:
         <td class="y">{bumped_min_order}</td>
         <td class="y">{blocked_swing}</td>
         <td class="y">{flip_held}</td>
+        <td class="y">{blocked_nts}</td>
+        <td class="y">{closed_nts}</td>
       </tr>
     </table>
+    <p style="font-size:12px;color:#8b949e">🚫 No-Trade Session (full halt): <b>{
+        ', '.join(NO_TRADE_SESSIONS) or 'tidak ada (nonaktif)'}</b> — begitu candle masuk sesi ini,
+    SEMUA limit pending dibatalkan, SEMUA posisi filled ditutup paksa (reason "NO_TRADE_SESSION"),
+    dan TIDAK ADA entry/setup baru sampai sesi berakhir. Beda dari <code>SESSION_BLOCK_LIST</code>
+    (yang cuma mencegah fill baru, posisi lama tetap jalan) — ini menghentikan trading total.
+    Atur via env var <code>NO_TRADE_SESSIONS</code> (comma-separated, kosongkan utk nonaktifkan).</p>
     <p style="font-size:12px;color:#8b949e">Flip protection: posisi filled HANYA ditutup oleh cross
     berlawanan kalau <b>CLOSE candle yang menyebabkan cross</b> itu sudah <b>≥ {FLIP_MIN_R:.1f}R</b> dari
     entry (dihitung dari entry & jarak SL posisi itu — misal entry $1.6, SL $1.3, dist=$0.3, maka
