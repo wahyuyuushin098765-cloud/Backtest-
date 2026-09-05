@@ -173,6 +173,7 @@ _combined_result = {         # ringkasan hasil simulasi gabungan (1 balance, 1 p
 _indicator_result = {}      # hasil analisis indikator saat cross (win vs loss)
 _rsi_gate_result = {}       # hasil analisis khusus RSI gate (per-nilai + bucket, terpisah Long/Short)
 _session_day_result = {}    # hasil analisis sesi trading (WIB) & hari (Senin-Minggu)
+_monthly_result = {}        # hasil analisis profit % & $ per bulan kalender (WIB)
 _no_filter_result = None    # ringkasan simulasi PEMBANDING tanpa filter (None jika tidak ada filter aktif)
 
 
@@ -1194,6 +1195,53 @@ def session_day_analysis(trades):
     return {'sessions': sessions, 'days': days}
 
 
+def monthly_analysis(trades):
+    """Analisis PROFIT PER BULAN KALENDER (WIB, berdasar waktu EXIT/exit_ts -- profit baru
+    terealisasi saat trade close). Persen tiap bulan dihitung terhadap balance di AWAL bulan
+    itu (bukan terhadap modal awal keseluruhan), supaya efek compounding per bulan kelihatan
+    benar -- persis cara laporan bulanan trading pada umumnya menghitung return bulanan.
+    Trade diurutkan dulu berdasar exit_ts (sequential) supaya balance berjalan akurat."""
+    if not trades:
+        return {'months': [], 'avg_pct': None, 'avg_usd': None}
+    trades_sorted = sorted(trades, key=lambda t: t['exit_ts'])
+
+    # kelompokkan index trade per (tahun, bulan) WIB berdasar exit_ts, jaga urutan bulan
+    # kemunculan pertama (bukan diurutkan ulang -- data sudah sequential by exit_ts)
+    month_keys = []          # urutan (year, month) sesuai kemunculan pertama
+    month_trades = {}        # (year, month) -> list of trade dict
+    for t in trades_sorted:
+        dt = datetime.fromtimestamp(t['exit_ts'] / 1000, tz=_WIB)
+        key = (dt.year, dt.month)
+        if key not in month_trades:
+            month_trades[key] = []
+            month_keys.append(key)
+        month_trades[key].append(t)
+
+    months = []
+    balance_start_of_month = INITIAL_BALANCE
+    for key in month_keys:
+        ts_list = month_trades[key]
+        profit_usd = sum(t['pnl_usd'] for t in ts_list)
+        n_trade = len(ts_list)
+        n_win = sum(1 for t in ts_list if t['r_mult'] > 0)
+        bal_start = balance_start_of_month
+        bal_end = bal_start + profit_usd
+        pct = (profit_usd / bal_start * 100) if bal_start != 0 else None
+        year, month = key
+        months.append({
+            'year': year, 'month': month,
+            'n_trade': n_trade, 'n_win': n_win, 'n_loss': n_trade - n_win,
+            'profit_usd': profit_usd, 'pct': pct,
+            'balance_start': bal_start, 'balance_end': bal_end,
+        })
+        balance_start_of_month = bal_end   # bulan berikutnya mulai dari balance akhir bulan ini
+
+    pct_values = [m['pct'] for m in months if m['pct'] is not None]
+    avg_pct = (sum(pct_values) / len(pct_values)) if pct_values else None
+    avg_usd = (sum(m['profit_usd'] for m in months) / len(months)) if months else None
+    return {'months': months, 'avg_pct': avg_pct, 'avg_usd': avg_usd}
+
+
 # ============================================================
 # BACKGROUND RUNNER
 # ============================================================
@@ -1239,6 +1287,7 @@ def _run():
     ind_analysis = indicator_analysis(result['trades'])
     rsi_gate_res = rsi_gate_analysis(result['trades'])
     session_day_res = session_day_analysis(result['trades'])
+    monthly_res = monthly_analysis(result['trades'])
 
     no_filter_summary = None
     if _any_filter_active():
@@ -1261,6 +1310,7 @@ def _run():
         _indicator_result.update(ind_analysis)
         _rsi_gate_result.update(rsi_gate_res)
         _session_day_result.update(session_day_res)
+        _monthly_result.update(monthly_res)
         global _no_filter_result
         _no_filter_result = no_filter_summary
         _phase = 'done'
@@ -1319,6 +1369,7 @@ def _render_html() -> bytes:
         ind_cp = dict(_indicator_result)
         rsi_gate_cp = dict(_rsi_gate_result)
         session_day_cp = dict(_session_day_result)
+        monthly_cp = dict(_monthly_result)
         nf_cp = dict(_no_filter_result) if _no_filter_result else None
 
     refresh = '<meta http-equiv="refresh" content="5">' if phase == 'running' else ''
@@ -1693,6 +1744,45 @@ def _render_html() -> bytes:
     </div>
     '''
 
+    # ── Analisis Profit per Bulan Kalender (WIB) ──
+    mo = monthly_cp
+    monthly_rows = ''
+    if mo.get('months'):
+        _MONTH_NAMES_ID = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des']
+        for m in mo['months']:
+            pct = m['pct']
+            pct_s = f'{pct:+.1f}%' if pct is not None else '-'
+            cls = 'y' if pct is None else ('g' if pct >= 0 else 'r')
+            usd_cls = 'g' if m['profit_usd'] >= 0 else 'r'
+            monthly_rows += (
+                f'<tr><td>{_MONTH_NAMES_ID[m["month"]]} {m["year"]}</td>'
+                f'<td>{m["n_trade"]}</td><td class="g">{m["n_win"]}</td><td class="r">{m["n_loss"]}</td>'
+                f'<td>${m["balance_start"]:,.2f}</td>'
+                f'<td class="{usd_cls}">${m["profit_usd"]:+,.2f}</td>'
+                f'<td class="{cls}">{pct_s}</td>'
+                f'<td>${m["balance_end"]:,.2f}</td></tr>\n'
+            )
+    avg_pct_s = f"{mo['avg_pct']:+.1f}%" if mo.get('avg_pct') is not None else '-'
+    avg_usd_s = f"${mo['avg_usd']:+,.2f}" if mo.get('avg_usd') is not None else '-'
+    monthly_html = f'''
+    <h2>📆 Analisis Profit per Bulan</h2>
+    <p class="note">💡 Dikelompokkan berdasarkan waktu EXIT (bulan kalender WIB) — profit baru terealisasi
+    saat trade close. Persen tiap bulan dihitung terhadap balance di AWAL bulan itu (bukan modal awal
+    keseluruhan), supaya efek compounding antar bulan kelihatan benar — persis cara laporan bulanan
+    trading pada umumnya.</p>
+    <table>
+      <tr><th>Bulan</th><th>Total Trade</th><th>Menang</th><th>Kalah</th>
+          <th>Balance Awal</th><th>Profit $</th><th>Profit %</th><th>Balance Akhir</th></tr>
+      {monthly_rows or '<tr><td colspan="8" class="y">Belum ada data.</td></tr>'}
+    </table>
+    <p style="font-size:13px;color:#8b949e;margin-top:8px">
+    Rata-rata per bulan: <b class="{'g' if (mo.get('avg_pct') or 0) >= 0 else 'r'}">{avg_pct_s}</b> |
+    <b class="{'g' if (mo.get('avg_usd') or 0) >= 0 else 'r'}">{avg_usd_s}</b>
+    (rata-rata aritmatika sederhana dari semua bulan yang ada trade, BUKAN CAGR/rata-rata geometris —
+    kalau bulan-bulan awal untung besar lalu belakangan menyusut, rata-rata ini bisa lebih tinggi dari
+    "kesan" pertumbuhan keseluruhan).</p>
+    '''
+
     return f'''<!DOCTYPE html>
 <html lang="id">
 <head>
@@ -1752,6 +1842,7 @@ def _render_html() -> bytes:
 
   {rsi_gate_html}
   {session_day_html}
+  {monthly_html}
   <div class="note">
     💡 Entry = LIMIT di <b>{ENTRY_LEVEL_PCT*100:.0f}%</b> range candle penyebab EMA cross
     (0%=wick, 50%=titik tengah, 100%=sisi berlawanan) — atur via env var <code>ENTRY_LEVEL_PCT</code>.
