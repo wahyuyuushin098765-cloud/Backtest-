@@ -407,6 +407,26 @@ RSI_GATE_MAX_SHORT  = float(os.environ.get('RSI_GATE_MAX_SHORT', '100'))
 #   low[i-1] < low[i-2] (kiri) DAN low[i-1] < low[i] (kanan).
 SWING_GATE_ENABLED = os.environ.get('SWING_GATE_ENABLED', '0').strip() not in ('0', 'false', 'False', '')
 
+# ── GATE ARAH CANDLE CROSS (BUKAN filter statistik -- kondisi STRUKTURAL). Candle yang
+# menyebabkan EMA cross harus SEARAH dengan arah cross itu sendiri, bukan cuma kebetulan
+# EMA-nya cross sementara harga candle itu sendiri malah berlawanan arah.
+# Golden cross (bias Long) -> candle cross HARUS bullish: open < close.
+# Death cross (bias Short)  -> candle cross HARUS bearish: open > close.
+CANDLE_DIRECTION_GATE_ENABLED = os.environ.get('CANDLE_DIRECTION_GATE_ENABLED', '0').strip() not in ('0', 'false', 'False', '')
+
+
+def _passes_candle_direction_filter(O, C, i, direction):
+    """Gate ARAH CANDLE CROSS (bukan filter statistik -- kondisi STRUKTURAL). Candle cross (i)
+    harus searah dgn arah cross: direction='Long' (golden cross) butuh candle BULLISH
+    (open[i] < close[i]); direction='Short' (death cross) butuh candle BEARISH
+    (open[i] > close[i]). True kalau gate nonaktif."""
+    if not CANDLE_DIRECTION_GATE_ENABLED:
+        return True
+    if direction == 'Long':
+        return O[i] < C[i]
+    else:
+        return O[i] > C[i]
+
 # ── FLIP MIN R: posisi yang SUDAH FILLED hanya ditutup oleh cross berlawanan (flip) kalau
 # CLOSE candle yang menyebabkan cross berlawanan itu (bukan candle setelahnya) sudah
 # >= FLIP_MIN_R dari entry (dihitung dari entry & jarak SL posisi itu). Contoh: entry $1.6,
@@ -474,7 +494,7 @@ def _session_blocked(entry_ts_ms):
 # ULANG tiap candle, jadi begitu sesi berakhir, trading otomatis normal lagi candle berikutnya
 # tanpa perlu logika resume khusus. Default: London (sesuai temuan WR London di tabel Analisis
 # Sesi). Kosongkan utk nonaktifkan.
-NO_TRADE_SESSIONS = [s.strip() for s in os.environ.get('NO_TRADE_SESSIONS', 'London').split(',') if s.strip()]
+NO_TRADE_SESSIONS = [s.strip() for s in os.environ.get('NO_TRADE_SESSIONS', '').split(',') if s.strip()]
 
 
 def _in_no_trade_session(ts_ms):
@@ -682,6 +702,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
     blocked_by_min_order = 0   # counter: fill dibatalkan krn order_value < ORDER_BUMP_FLOOR (Bybit min order)
     bumped_by_min_order = 0    # counter: qty DIPAKSA NAIK krn order_value < MIN_ORDER_USD -- risk aktual > target
     blocked_by_swing = 0       # counter: dilewati krn candle sblm cross bukan swing point asli
+    blocked_by_candle_direction = 0  # counter: dilewati krn candle cross tidak searah dgn cross-nya
     flip_held_below_1r = 0     # counter: cross berlawanan MUNCUL tp posisi TIDAK ditutup krn msh <1R
     blocked_by_no_trade_session = 0   # counter: pending dibatalkan krn masuk sesi no-trade (full halt)
     closed_by_no_trade_session = 0    # counter: posisi filled ditutup paksa krn masuk sesi no-trade
@@ -927,6 +948,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                         blocked_by_rsi_gate += 1
                     elif not _passes_swing_filter(H, L, O, C_, i, 'Short'):
                         blocked_by_swing += 1
+                    elif not _passes_candle_direction_filter(O, C_, i, 'Short'):
+                        blocked_by_candle_direction += 1
                     else:
                         ind = _capture_indicators(c, i)
                         ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
@@ -947,6 +970,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                         blocked_by_rsi_gate += 1
                     elif not _passes_swing_filter(H, L, O, C_, i, 'Long'):
                         blocked_by_swing += 1
+                    elif not _passes_candle_direction_filter(O, C_, i, 'Long'):
+                        blocked_by_candle_direction += 1
                     else:
                         ind = _capture_indicators(c, i)
                         ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
@@ -968,6 +993,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
         'blocked_by_session': blocked_by_session,
         'blocked_by_min_order': blocked_by_min_order, 'bumped_by_min_order': bumped_by_min_order,
         'blocked_by_swing': blocked_by_swing,
+        'blocked_by_candle_direction': blocked_by_candle_direction,
         'flip_held_below_1r': flip_held_below_1r,
         'blocked_by_no_trade_session': blocked_by_no_trade_session,
         'closed_by_no_trade_session': closed_by_no_trade_session,
@@ -1322,6 +1348,7 @@ def _render_html() -> bytes:
     blocked_min_order = cr.get('blocked_by_min_order', 0)
     bumped_min_order = cr.get('bumped_by_min_order', 0)
     blocked_swing = cr.get('blocked_by_swing', 0)
+    blocked_candle_dir = cr.get('blocked_by_candle_direction', 0)
     flip_held = cr.get('flip_held_below_1r', 0)
     blocked_nts = cr.get('blocked_by_no_trade_session', 0)
     closed_nts = cr.get('closed_by_no_trade_session', 0)
@@ -1333,6 +1360,7 @@ def _render_html() -> bytes:
           <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
           <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th><th>Blokir: RSI Gate</th>
           <th>Blokir: Sesi</th><th>Blokir: Min Order</th><th>Qty Dipaksa Naik</th><th>Blokir: Swing</th>
+          <th>Blokir: Arah Candle</th>
           <th>Flip Ditahan (&lt;1R)</th><th>No-Trade: Pending Batal</th><th>No-Trade: Posisi Ditutup</th></tr>
       <tr>
         <td>{total_trades}</td>
@@ -1352,11 +1380,17 @@ def _render_html() -> bytes:
         <td class="y">{blocked_min_order}</td>
         <td class="y">{bumped_min_order}</td>
         <td class="y">{blocked_swing}</td>
+        <td class="y">{blocked_candle_dir}</td>
         <td class="y">{flip_held}</td>
         <td class="y">{blocked_nts}</td>
         <td class="y">{closed_nts}</td>
       </tr>
     </table>
+    <p style="font-size:12px;color:#8b949e">🕯️ Gate Arah Candle Cross: <b>{'AKTIF' if CANDLE_DIRECTION_GATE_ENABLED else 'NONAKTIF'}</b>
+    — candle yang menyebabkan EMA cross harus SEARAH dengan arah cross-nya: Golden cross butuh candle
+    <b>bullish</b> (open &lt; close), Death cross butuh candle <b>bearish</b> (open &gt; close). Sinyal
+    yang candle cross-nya berlawanan arah diblokir (kolom "Blokir: Arah Candle"). Atur via env var
+    <code>CANDLE_DIRECTION_GATE_ENABLED</code>.</p>
     <p style="font-size:12px;color:#8b949e">🚫 No-Trade Session (full halt): <b>{
         ', '.join(NO_TRADE_SESSIONS) or 'tidak ada (nonaktif)'}</b> — begitu candle masuk sesi ini,
     SEMUA limit pending dibatalkan, SEMUA posisi filled ditutup paksa (reason "NO_TRADE_SESSION"),
