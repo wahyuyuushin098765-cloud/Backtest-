@@ -534,22 +534,24 @@ def _passes_candle_direction_filter(O, C, i, direction):
 # TIDAK terpengaruh -- tetap dibatalkan seperti biasa oleh cross berlawanan, apapun nilainya.
 FLIP_MIN_R = float(os.environ.get('FLIP_MIN_R', '1.0'))
 
-# ── KONFIRMASI EMA4 H1 + TRIGGER M5 (menggantikan limit-di-wick lama sepenuhnya) ──
+# ── KONFIRMASI EMA4 H1 (SEKALI CEK) + TRIGGER M5 SWING (menggantikan limit-di-wick lama) ──
 # Setelah cross H1 lolos RSI gate/swing/candle-direction/filter (persis alur lama), TIDAK
-# langsung pasang limit. Tunggu candle H1 BERIKUTNYA (j > i, candle cross):
-#   - BATAL TOTAL kalau BODY candle j "menembus" EMA4 -- utk golden cross: open[j] > EMA4[j]
-#     > close[j] (open di atas EMA, close di bawah EMA, EMA ada di tengah body). Utk death
+# langsung pasang limit. Konfirmasi EMA4 HANYA DICEK SEKALI, di candle H1 TEPAT SETELAH cross
+# (j = i+1, bukan berkali-kali):
+#   - BATAL kalau BODY candle j "menembus" EMA4 -- utk golden cross: open[j] > EMA4[j] >
+#     close[j] (open di atas EMA, close di bawah EMA, EMA ada di tengah body). Utk death
 #     cross: open[j] < EMA4[j] < close[j]. Ini beda dari "wick nyentuh" -- body break berarti
-#     EMA4 dilibas penuh, sinyal awal dianggap gagal.
+#     EMA4 dilibas penuh, sinyal awal dianggap gagal (counter: blocked_by_ema4_break).
 #   - LOLOS (konfirmasi OK) kalau WICK candle j menyentuh EMA4 TAPI close masih searah bias:
 #     golden cross -> low[j] <= EMA4[j] dan close[j] > EMA4[j]. Death cross -> high[j] >=
 #     EMA4[j] dan close[j] < EMA4[j].
-#   - Kalau belum body-break dan belum lolos -> tetap tunggu, cek lagi di candle H1
-#     berikutnya (bisa berkali-kali), sampai salah satu dari 2 kondisi di atas terjadi atau
-#     muncul FLIP cross H1 berlawanan (batalkan monitoring, sama seperti flip protection biasa).
-# Begitu lolos konfirmasi di candle j, MULAI monitoring M5 dari candle H1 BERIKUTNYA (j+1) --
-# cari cross EMA_FAST/EMA_SLOW M5 (searah bias awal) dan begitu ketemu, MARKET ORDER langsung
-# di close candle M5 itu. SL = SL_PCT% dari harga entry market (bukan lagi dari wick H1 lama).
+#   - NETRAL (bukan body-break maupun wick-confirm, mis. wick sama sekali tidak menyentuh
+#     EMA4) -> setup JUGA GAGAL (counter: blocked_by_ema4_neutral). TIDAK ditunggu lagi di
+#     candle-candle berikutnya -- cukup 1x kesempatan cek di candle j ini saja.
+# Begitu lolos konfirmasi di candle j, MULAI monitoring M5 dari candle H1 BERIKUTNYA (j+1),
+# dimulai 5 menit setelah candle itu buka -- cari SWING POINT M5 pertama valid (searah bias),
+# tunggu wick M5 menyentuh level itu -> MARKET ORDER di close candle M5 itu. SL = SL_PCT% dari
+# harga entry market (bukan lagi dari wick H1 lama).
 EMA_CONFIRM_MODE = os.environ.get('EMA_CONFIRM_MODE', '1').strip() not in ('0', 'false', 'False', '')
 
 # ── TRIGGER M5 BERBASIS SWING (menggantikan cross EMA4/EMA10 M5 sepenuhnya) ──
@@ -878,6 +880,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
     armed_m5          = {}   # f"{symbol}|Long"/"Short" -> {'ind','from_i','swing_idx','swing_level','scan_from'}
     active_positions  = {}   # f"{symbol}|Long"/"Short" -> {...}
     blocked_by_ema4_break = 0  # counter: batal total krn body candle menembus EMA4 saat menunggu konfirmasi
+    blocked_by_ema4_neutral = 0  # counter: batal krn candle setelah cross netral (tdk sentuh wick, tdk body-break)
     trades            = []
     blocked_by_slot   = 0    # counter: berapa kali sinyal valid terpaksa dilewati krn slot penuh
     blocked_by_margin = 0    # counter: dilewati krn margin (leverage) sudah habis -- constraint ASLI Bybit
@@ -1300,24 +1303,27 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                         else:
                             waiting_confirm[key_long] = {'cross_i': i, 'ind': ind}
 
-                # ── 5b) KONFIRMASI EMA4 H1 -- dicek di candle INI (i) utk sinyal yg sedang
-                # 'waiting_confirm' dari cross SEBELUMNYA (cross_i < i). Body-break -> batal
+                # ── 5b) KONFIRMASI EMA4 H1 -- HANYA DICEK SEKALI, di candle TEPAT SETELAH
+                # cross (cross_i == i-1, alias wc['cross_i'] == i-1). Body-break -> batal
                 # total. Wick-touch + close searah -> lolos, mulai armed_m5 dari candle
-                # BERIKUTNYA (i+1). Belum keduanya -> tetap menunggu, cek lagi candle depan. ──
+                # BERIKUTNYA (i+1). NETRAL (bukan keduanya) -> setup GAGAL juga -- TIDAK
+                # ditunggu lagi di candle-candle selanjutnya (beda dari versi sebelumnya). ──
                 for direction, key in (('Short', key_short), ('Long', key_long)):
                     wc = waiting_confirm.get(key)
-                    if wc is None or wc['cross_i'] >= i:
-                        continue   # belum ada sinyal menunggu, atau ini candle cross itu sendiri
+                    if wc is None or wc['cross_i'] != i - 1:
+                        continue   # bukan candle tepat setelah cross utk sinyal ini -> lewati
                     if _ema4_body_break(O, C_, ema_fast, i, direction):
                         blocked_by_ema4_break += 1
-                        del waiting_confirm[key]
                     elif _ema4_wick_confirm(H, L, C_, ema_fast, i, direction):
                         armed_m5[key] = {'ind': wc['ind'], 'from_i': i,
                                           'swing_idx': None, 'swing_level': None,
                                           'scan_from': None}
-                        del waiting_confirm[key]
-                    # else: belum body-break maupun wick-confirm -> tetap waiting_confirm,
-                    # dicek lagi di candle H1 berikutnya (loop natural krn tidak dihapus).
+                    else:
+                        # netral: wick tidak menyentuh EMA4 sama sekali (atau menyentuh tapi
+                        # close berlawanan bias) -> setup gagal, HANYA dicek 1x jd tidak
+                        # ditunggu lagi di candle berikutnya.
+                        blocked_by_ema4_neutral += 1
+                    del waiting_confirm[key]   # apapun hasilnya, selesai -- hanya 1x cek
 
                 # ── 5c) MONITORING M5 BERBASIS SWING -- utk sinyal yg sudah 'armed_m5' DAN
                 # candle H1 ini (i) adalah candle SETELAH konfirmasi ('from_i' < i). Kerja di
@@ -1451,6 +1457,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
         'blocked_by_no_trade_session': blocked_by_no_trade_session,
         'closed_by_no_trade_session': closed_by_no_trade_session,
         'blocked_by_ema4_break': blocked_by_ema4_break,
+        'blocked_by_ema4_neutral': blocked_by_ema4_neutral,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
         'total_pnl': total_pnl,
@@ -1873,6 +1880,7 @@ def _render_html() -> bytes:
     blocked_nts = cr.get('blocked_by_no_trade_session', 0)
     closed_nts = cr.get('closed_by_no_trade_session', 0)
     blocked_ema4_break = cr.get('blocked_by_ema4_break', 0)
+    blocked_ema4_neutral = cr.get('blocked_by_ema4_neutral', 0)
 
     summary_html = f'''
     <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
@@ -1883,6 +1891,7 @@ def _render_html() -> bytes:
           <th>Blokir: Sesi</th><th>Blokir: Min Order</th><th>Qty Dipaksa Naik</th><th>Blokir: Swing</th>
           <th>Blokir: Arah Candle</th>
           <th>Blokir: EMA4 Body-Break</th>
+          <th>Blokir: EMA4 Netral</th>
           <th>Flip Ditahan (&lt;1R)</th><th>No-Trade: Pending Batal</th><th>No-Trade: Posisi Ditutup</th></tr>
       <tr>
         <td>{total_trades}</td>
@@ -1904,6 +1913,7 @@ def _render_html() -> bytes:
         <td class="y">{blocked_swing}</td>
         <td class="y">{blocked_candle_dir}</td>
         <td class="y">{blocked_ema4_break}</td>
+        <td class="y">{blocked_ema4_neutral}</td>
         <td class="y">{flip_held}</td>
         <td class="y">{blocked_nts}</td>
         <td class="y">{closed_nts}</td>
@@ -2319,12 +2329,14 @@ def _render_html() -> bytes:
     💡 Mode entry: <b>{'KONFIRMASI EMA4 H1 + TRIGGER M5' if EMA_CONFIRM_MODE else 'LIMIT DI WICK (LEGACY)'}</b>
     (atur via env var <code>EMA_CONFIRM_MODE</code>).
     {"""Setelah cross H1 lolos RSI gate/swing/arah-candle/filter: TIDAK langsung pasang limit --
-    tunggu candle H1 berikutnya sentuh WICK EMA4 dengan close masih searah bias (golden cross:
-    low candle &le; EMA4 &amp; close &gt; EMA4; death cross: high candle &ge; EMA4 &amp; close
-    &lt; EMA4). Kalau BODY candle malah menembus EMA4 penuh (EMA4 di antara open &amp; close) →
-    batal total (lihat kolom "Blokir: EMA4 Body-Break"). Kalau belum keduanya → tetap ditunggu
-    candle demi candle. Begitu konfirmasi lolos, monitoring M5 dimulai 5 menit setelah candle H1
-    berikutnya buka (candle M5 pertama dlm jam itu dilewati) -- sistem mencari SWING POINT M5
+    konfirmasi EMA4 HANYA DICEK SEKALI, di candle TEPAT SETELAH cross. Golden cross: lolos kalau
+    WICK candle itu sentuh EMA4 (low &le; EMA4) DAN close masih di atas EMA4. Death cross: high
+    &ge; EMA4 DAN close di bawah EMA4. Kalau BODY candle menembus EMA4 penuh (EMA4 di antara open
+    &amp; close) → batal (lihat kolom "Blokir: EMA4 Body-Break"). Kalau NETRAL (wick tidak
+    menyentuh EMA4 sama sekali, atau nyentuh tapi close berlawanan bias) → setup JUGA gagal (lihat
+    kolom "Blokir: EMA4 Netral") -- TIDAK ditunggu lagi di candle-candle berikutnya, cukup 1x cek.
+    Begitu konfirmasi lolos, monitoring M5 dimulai 5 menit setelah candle H1 berikutnya buka
+    (candle M5 pertama dlm jam itu dilewati) -- sistem mencari SWING POINT M5
     PERTAMA yg valid searah bias (low/high candle M5 tsb tdk terlampaui oleh """
     f"""<b>{SWING_M5_RIGHT}</b> candle M5 setelahnya), lalu level itu jadi patokan TETAP sampai
     tersentuh atau flip H1. Begitu ada candle M5 berikutnya yg WICK-nya menyentuh level swing itu
