@@ -371,10 +371,13 @@ def prepare_m5(df_m5):
     if df_m5 is None or df_m5.empty:
         return None
     df_m5 = df_m5.sort_values('ts').reset_index(drop=True)
+    ema_fast_m5 = df_m5['close'].ewm(span=EMA_FAST, adjust=False).mean().values
+    ema_slow_m5 = df_m5['close'].ewm(span=EMA_SLOW, adjust=False).mean().values
     return {
         'TS': df_m5['ts'].values.astype(np.int64),
         'O': df_m5['open'].values, 'H': df_m5['high'].values,
         'L': df_m5['low'].values, 'C': df_m5['close'].values,
+        'EMA_FAST': ema_fast_m5, 'EMA_SLOW': ema_slow_m5,
     }
 
 
@@ -533,6 +536,24 @@ def _passes_candle_direction_filter(O, C, i, direction):
 # DIBIARKAN jalan terus, cuma keluar lewat TRAIL/SL normal. Limit PENDING (belum filled)
 # TIDAK terpengaruh -- tetap dibatalkan seperti biasa oleh cross berlawanan, apapun nilainya.
 FLIP_MIN_R = float(os.environ.get('FLIP_MIN_R', '1.0'))
+
+# ── KONFIRMASI EMA4 H1 + TRIGGER M5 (menggantikan limit-di-wick lama sepenuhnya) ──
+# Setelah cross H1 lolos RSI gate/swing/candle-direction/filter (persis alur lama), TIDAK
+# langsung pasang limit. Tunggu candle H1 BERIKUTNYA (j > i, candle cross):
+#   - BATAL TOTAL kalau BODY candle j "menembus" EMA4 -- utk golden cross: open[j] > EMA4[j]
+#     > close[j] (open di atas EMA, close di bawah EMA, EMA ada di tengah body). Utk death
+#     cross: open[j] < EMA4[j] < close[j]. Ini beda dari "wick nyentuh" -- body break berarti
+#     EMA4 dilibas penuh, sinyal awal dianggap gagal.
+#   - LOLOS (konfirmasi OK) kalau WICK candle j menyentuh EMA4 TAPI close masih searah bias:
+#     golden cross -> low[j] <= EMA4[j] dan close[j] > EMA4[j]. Death cross -> high[j] >=
+#     EMA4[j] dan close[j] < EMA4[j].
+#   - Kalau belum body-break dan belum lolos -> tetap tunggu, cek lagi di candle H1
+#     berikutnya (bisa berkali-kali), sampai salah satu dari 2 kondisi di atas terjadi atau
+#     muncul FLIP cross H1 berlawanan (batalkan monitoring, sama seperti flip protection biasa).
+# Begitu lolos konfirmasi di candle j, MULAI monitoring M5 dari candle H1 BERIKUTNYA (j+1) --
+# cari cross EMA_FAST/EMA_SLOW M5 (searah bias awal) dan begitu ketemu, MARKET ORDER langsung
+# di close candle M5 itu. SL = SL_PCT% dari harga entry market (bukan lagi dari wick H1 lama).
+EMA_CONFIRM_MODE = os.environ.get('EMA_CONFIRM_MODE', '1').strip() not in ('0', 'false', 'False', '')
 
 # ── Rentang FOKUS utk tabel Analisis Khusus RSI Gate (TERPISAH dari gate aktual di atas --
 # ini cuma menyempitkan rentang yg dianalisis & dibagi 3 bucket, tidak mempengaruhi entry
@@ -736,6 +757,30 @@ def _passes_swing_filter(H, L, O, C, i, direction):
         return L[i-1] < L[i-2] and L[i-1] < L[i]
 
 
+def _ema4_body_break(O, C, ema_fast, j, direction):
+    """True kalau BODY candle j menembus EMA4 sepenuhnya (open di satu sisi, close di sisi
+    lain, EMA4 di tengah) -- sinyal dianggap gagal total. direction='Long' (golden cross)
+    -> open[j] > EMA4[j] > close[j]. direction='Short' (death cross) -> open[j] < EMA4[j] <
+    close[j]."""
+    e = ema_fast[j]
+    if direction == 'Long':
+        return O[j] > e > C[j]
+    else:
+        return O[j] < e < C[j]
+
+
+def _ema4_wick_confirm(H, L, C, ema_fast, j, direction):
+    """True kalau WICK candle j menyentuh EMA4 tapi close masih searah bias (konfirmasi OK,
+    body TIDAK menembus). direction='Long' (golden cross) -> low[j] <= EMA4[j] dan
+    close[j] > EMA4[j]. direction='Short' (death cross) -> high[j] >= EMA4[j] dan
+    close[j] < EMA4[j]."""
+    e = ema_fast[j]
+    if direction == 'Long':
+        return L[j] <= e and C[j] > e
+    else:
+        return H[j] >= e and C[j] < e
+
+
 def prepare_coin(symbol, df):
     """Precompute semua yang dibutuhkan simulasi + indikator (utk analisis win/loss) utk 1 koin.
     None kalau data kurang."""
@@ -794,8 +839,11 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
 
     balance = INITIAL_BALANCE
     armed             = {}   # f"{symbol}|Short"/"Long" -> {'c1_ts'}
-    pending           = {}   # f"{symbol}|Long"/"Short" -> {...}
+    pending           = {}   # f"{symbol}|Long"/"Short" -> {...} (LEGACY, dipakai kalau EMA_CONFIRM_MODE=0)
+    waiting_confirm   = {}   # f"{symbol}|Long"/"Short" -> {'cross_i', 'ind'} -- menunggu konfirmasi EMA4 H1
+    armed_m5          = {}   # f"{symbol}|Long"/"Short" -> {'ind', 'from_i'} -- menunggu cross M5 utk market order
     active_positions  = {}   # f"{symbol}|Long"/"Short" -> {...}
+    blocked_by_ema4_break = 0  # counter: batal total krn body candle menembus EMA4 saat menunggu konfirmasi
     trades            = []
     blocked_by_slot   = 0    # counter: berapa kali sinyal valid terpaksa dilewati krn slot penuh
     blocked_by_margin = 0    # counter: dilewati krn margin (leverage) sudah habis -- constraint ASLI Bybit
@@ -824,11 +872,22 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
         lo, hi = _m5_slice_idx(m5, int(TS_h1[i]), int(TS_h1[i + 1]))
         if hi <= lo:
             return None   # tidak ada candle M5 di rentang ini (gap data) -> fallback H1
+        # lo0: index M5 SEBELUM window ini (utk cek cross EMA M5 di candle M5 pertama window
+        # -- butuh nilai ema_fast/ema_slow M5 di candle sebelumnya juga, bukan cuma di dalam
+        # window). Kalau lo==0 (tidak ada candle M5 sebelumnya sama sekali), pakai lo sendiri
+        # (cross tidak akan terdeteksi di candle M5 pertama itu -- wajar, data belum cukup).
+        lo0 = max(lo - 1, 0)
         return {'TS': m5['TS'][lo:hi], 'O': m5['O'][lo:hi], 'H': m5['H'][lo:hi],
-                'L': m5['L'][lo:hi], 'C': m5['C'][lo:hi]}
+                'L': m5['L'][lo:hi], 'C': m5['C'][lo:hi],
+                'EMA_FAST': m5['EMA_FAST'][lo0:hi], 'EMA_SLOW': m5['EMA_SLOW'][lo0:hi],
+                '_ema_offset': lo - lo0}   # offset: EMA_FAST[k+offset] cocok dgn TS[k]
 
     def _slots_used():
-        return len(active_positions) + len(pending)
+        # pending (legacy limit-di-wick) DAN armed_m5 (sudah lolos konfirmasi EMA4, tinggal
+        # tunggu cross M5 utk market order) dihitung sbg slot terpakai -- keduanya representasi
+        # "sinyal yg sudah lolos semua gate, tinggal nunggu trigger eksekusi". waiting_confirm
+        # BELUM dihitung -- msh tahap konfirmasi H1, belum tentu lolos.
+        return len(active_positions) + len(pending) + len(armed_m5)
 
     def _current_margin_used():
         """Total margin yg sedang dipakai SEMUA posisi terbuka (notional/leverage) --
@@ -953,6 +1012,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
             #    KEPUTUSANnya berdasarkan close candle cross. ──
             if death_cross:
                 pending.pop(key_long, None)
+                waiting_confirm.pop(key_long, None)
+                armed_m5.pop(key_long, None)
                 pos_long = active_positions.get(key_long)
                 if pos_long is not None and pos_long['dist'] > 0:
                     current_r = (C_[i] - pos_long['entry']) / pos_long['dist']
@@ -962,6 +1023,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                         flip_held_below_1r += 1
             if golden_cross:
                 pending.pop(key_short, None)
+                waiting_confirm.pop(key_short, None)
+                armed_m5.pop(key_short, None)
                 pos_short = active_positions.get(key_short)
                 if pos_short is not None and pos_short['dist'] > 0:
                     current_r = (pos_short['entry'] - C_[i]) / pos_short['dist']
@@ -1130,12 +1193,58 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                 else:
                     armed[key_long] = {'c1_ts': e['c1_ts']}
 
-            # ── 5) cross SEARAH -> pasang/ganti limit di wick, TUNDUK ke RSI GATE, MAX_CONCURRENT & FILTER ──
-            # Tangkap indikator PERSIS di candle cross ini -> dipakai jg utk filter & analisis win/loss.
-            if death_cross and key_short in armed and key_short not in active_positions:
-                wick = H[i] - ENTRY_LEVEL_PCT * (H[i] - L[i])   # 0.5 = titik tengah candle cross (bukan lagi wick H)
-                old_dist = wick * SL_PCT   # SL = SL_PCT dari entry, bukan jarak struktural candle
-                if old_dist > 0:
+            if not EMA_CONFIRM_MODE:
+                # ── 5-LEGACY) cross SEARAH -> pasang/ganti limit di wick, TUNDUK ke RSI GATE,
+                # MAX_CONCURRENT & FILTER (perilaku LAMA, dipakai kalau EMA_CONFIRM_MODE=0). ──
+                if death_cross and key_short in armed and key_short not in active_positions:
+                    wick = H[i] - ENTRY_LEVEL_PCT * (H[i] - L[i])
+                    old_dist = wick * SL_PCT
+                    if old_dist > 0:
+                        if not _passes_rsi_gate(c, i, 'Short'):
+                            blocked_by_rsi_gate += 1
+                        elif not _passes_swing_filter(H, L, O, C_, i, 'Short'):
+                            blocked_by_swing += 1
+                        elif not _passes_candle_direction_filter(O, C_, i, 'Short'):
+                            blocked_by_candle_direction += 1
+                        else:
+                            ind = _capture_indicators(c, i)
+                            ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
+                            if not _passes_filters(ind, filters_enabled):
+                                blocked_by_filter += 1
+                            elif key_short not in pending and _slots_used() >= MAX_CONCURRENT:
+                                blocked_by_slot += 1
+                            else:
+                                pending[key_short] = {
+                                    'entry': wick, 'sl': wick + old_dist, 'dist': old_dist, 'ind': ind,
+                                }
+
+                if golden_cross and key_long in armed and key_long not in active_positions:
+                    wick = L[i] + ENTRY_LEVEL_PCT * (H[i] - L[i])
+                    old_dist = wick * SL_PCT
+                    if old_dist > 0:
+                        if not _passes_rsi_gate(c, i, 'Long'):
+                            blocked_by_rsi_gate += 1
+                        elif not _passes_swing_filter(H, L, O, C_, i, 'Long'):
+                            blocked_by_swing += 1
+                        elif not _passes_candle_direction_filter(O, C_, i, 'Long'):
+                            blocked_by_candle_direction += 1
+                        else:
+                            ind = _capture_indicators(c, i)
+                            ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
+                            if not _passes_filters(ind, filters_enabled):
+                                blocked_by_filter += 1
+                            elif key_long not in pending and _slots_used() >= MAX_CONCURRENT:
+                                blocked_by_slot += 1
+                            else:
+                                pending[key_long] = {
+                                    'entry': wick, 'sl': wick - old_dist, 'dist': old_dist, 'ind': ind,
+                                }
+            else:
+                # ── 5) cross SEARAH -> lolos RSI GATE/swing/candle-direction/FILTER (persis
+                # gate lama), tapi BELUM pasang limit -- masuk 'waiting_confirm' dulu, menunggu
+                # candle H1 berikutnya sentuh wick EMA4 + close searah (lihat bagian 5b). ──
+                if death_cross and key_short in armed and key_short not in active_positions \
+                        and key_short not in waiting_confirm and key_short not in armed_m5:
                     if not _passes_rsi_gate(c, i, 'Short'):
                         blocked_by_rsi_gate += 1
                     elif not _passes_swing_filter(H, L, O, C_, i, 'Short'):
@@ -1144,20 +1253,13 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                         blocked_by_candle_direction += 1
                     else:
                         ind = _capture_indicators(c, i)
-                        ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
                         if not _passes_filters(ind, filters_enabled):
                             blocked_by_filter += 1
-                        elif key_short not in pending and _slots_used() >= MAX_CONCURRENT:
-                            blocked_by_slot += 1
                         else:
-                            pending[key_short] = {
-                                'entry': wick, 'sl': wick + old_dist, 'dist': old_dist, 'ind': ind,
-                            }
+                            waiting_confirm[key_short] = {'cross_i': i, 'ind': ind}
 
-            if golden_cross and key_long in armed and key_long not in active_positions:
-                wick = L[i] + ENTRY_LEVEL_PCT * (H[i] - L[i])   # 0.5 = titik tengah candle cross (bukan lagi wick L)
-                old_dist = wick * SL_PCT   # SL = SL_PCT dari entry, bukan jarak struktural candle
-                if old_dist > 0:
+                if golden_cross and key_long in armed and key_long not in active_positions \
+                        and key_long not in waiting_confirm and key_long not in armed_m5:
                     if not _passes_rsi_gate(c, i, 'Long'):
                         blocked_by_rsi_gate += 1
                     elif not _passes_swing_filter(H, L, O, C_, i, 'Long'):
@@ -1166,15 +1268,109 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                         blocked_by_candle_direction += 1
                     else:
                         ind = _capture_indicators(c, i)
-                        ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
                         if not _passes_filters(ind, filters_enabled):
                             blocked_by_filter += 1
-                        elif key_long not in pending and _slots_used() >= MAX_CONCURRENT:
-                            blocked_by_slot += 1
                         else:
-                            pending[key_long] = {
-                                'entry': wick, 'sl': wick - old_dist, 'dist': old_dist, 'ind': ind,
-                            }
+                            waiting_confirm[key_long] = {'cross_i': i, 'ind': ind}
+
+                # ── 5b) KONFIRMASI EMA4 H1 -- dicek di candle INI (i) utk sinyal yg sedang
+                # 'waiting_confirm' dari cross SEBELUMNYA (cross_i < i). Body-break -> batal
+                # total. Wick-touch + close searah -> lolos, mulai armed_m5 dari candle
+                # BERIKUTNYA (i+1). Belum keduanya -> tetap menunggu, cek lagi candle depan. ──
+                for direction, key in (('Short', key_short), ('Long', key_long)):
+                    wc = waiting_confirm.get(key)
+                    if wc is None or wc['cross_i'] >= i:
+                        continue   # belum ada sinyal menunggu, atau ini candle cross itu sendiri
+                    if _ema4_body_break(O, C_, ema_fast, i, direction):
+                        blocked_by_ema4_break += 1
+                        del waiting_confirm[key]
+                    elif _ema4_wick_confirm(H, L, C_, ema_fast, i, direction):
+                        armed_m5[key] = {'ind': wc['ind'], 'from_i': i}
+                        del waiting_confirm[key]
+                    # else: belum body-break maupun wick-confirm -> tetap waiting_confirm,
+                    # dicek lagi di candle H1 berikutnya (loop natural krn tidak dihapus).
+
+                # ── 5c) MONITORING M5 -- utk sinyal yg sudah 'armed_m5' DAN candle H1 ini (i)
+                # adalah candle SETELAH konfirmasi ('from_i' < i, monitoring baru mulai di candle
+                # H1 berikutnya dari konfirmasi, persis sesuai spek). Cari cross EMA_FAST/EMA_SLOW
+                # M5 SEARAH bias, dalam window candle H1 ini -> begitu ketemu, MARKET ORDER
+                # langsung di close candle M5 itu. Kalau tidak ada data M5 utk symbol/window ini,
+                # fallback: treat candle H1 INI sbg 1 "candle M5 raksasa" (pakai H1 close sbg
+                # proxy cross, less precise tapi tetap jalan tanpa data M5). ──
+                for direction, key in (('Short', key_short), ('Long', key_long)):
+                    am = armed_m5.get(key)
+                    if am is None or am['from_i'] >= i or key in active_positions:
+                        continue
+                    m5w = _m5_window_for(symbol, i, TS)
+                    entry_price = None
+                    entry_ts_final = None
+                    if m5w is not None and '_ema_offset' in m5w and len(m5w['TS']) > 0:
+                        off = m5w['_ema_offset']
+                        ef5, es5 = m5w['EMA_FAST'], m5w['EMA_SLOW']
+                        n5 = len(m5w['TS'])
+                        for mi in range(n5):
+                            k = mi + off   # index ke array EMA_FAST/EMA_SLOW (yg mundur 1 extra)
+                            if k < 1:
+                                continue   # tidak cukup histori EMA utk cek cross di titik ini
+                            if direction == 'Long':
+                                cross5 = ef5[k-1] <= es5[k-1] and ef5[k] > es5[k]
+                            else:
+                                cross5 = ef5[k-1] >= es5[k-1] and ef5[k] < es5[k]
+                            if cross5:
+                                entry_price = m5w['C'][mi]
+                                entry_ts_final = int(m5w['TS'][mi])
+                                break
+                    if entry_price is None:
+                        if m5w is None:
+                            # FALLBACK tanpa data M5 sama sekali utk symbol ini: pakai cross
+                            # EMA H1 candle INI sbg proxy (kasar, tapi mencegah sinyal macet
+                            # selamanya kalau data M5 memang tidak tersedia).
+                            if direction == 'Long' and golden_cross:
+                                entry_price = C_[i]; entry_ts_final = int(TS[i])
+                            elif direction == 'Short' and death_cross:
+                                entry_price = C_[i]; entry_ts_final = int(TS[i])
+                        if entry_price is None:
+                            continue   # belum ada cross M5 searah di window H1 ini -> tetap armed_m5
+
+                    dist = entry_price * SL_PCT
+                    min_dist = entry_price * MIN_DIST_PCT
+                    if dist < min_dist:
+                        dist = min_dist
+                    if dist <= 0:
+                        continue
+                    risk_usd = balance * RISK_PCT
+                    raw_qty = risk_usd / dist
+                    qty, skipped_min_order, bumped_min_order = _apply_min_order_size(raw_qty, entry_price)
+                    if skipped_min_order:
+                        blocked_by_min_order += 1
+                        del armed_m5[key]
+                        continue
+                    if bumped_min_order:
+                        bumped_by_min_order += 1
+                    # slot ini sendiri sudah dihitung di armed_m5 (lihat _slots_used) -- kurangi
+                    # 1 dari perbandingan spy tidak memblok dirinya sendiri, konsisten dgn pola
+                    # "key not in pending" pada alur limit lama.
+                    if _slots_used() - 1 >= MAX_CONCURRENT:
+                        blocked_by_slot += 1
+                        del armed_m5[key]
+                        continue
+                    margin_needed = (entry_price * qty) / LEVERAGE
+                    if _current_margin_used() + margin_needed > balance * MARGIN_USAGE_CAP:
+                        blocked_by_margin += 1
+                        del armed_m5[key]
+                        continue
+                    sl_price = entry_price + dist if direction == 'Short' else entry_price - dist
+                    act_price = (entry_price + TRAIL_ACT_R * dist) if direction == 'Long' \
+                                else (entry_price - TRAIL_ACT_R * dist)
+                    ind = dict(am.get('ind') or {})
+                    ind['dist_pct_est'] = (dist / entry_price * 100) if entry_price else None
+                    ind['dist_pct'] = ind['dist_pct_est']
+                    active_positions[key] = {
+                        'entry': entry_price, 'sl': sl_price, 'dist': dist, 'stop': sl_price,
+                        'trail_active': False, 'peak': entry_price, 'act_price': act_price,
+                        'qty': qty, 'entry_ts': entry_ts_final, 'ind': ind,
+                    }
+                    del armed_m5[key]
 
     wins = [t for t in trades if t['r_mult'] > 0]
     total_pnl = sum(t['pnl_usd'] for t in trades)
@@ -1189,6 +1385,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
         'flip_held_below_1r': flip_held_below_1r,
         'blocked_by_no_trade_session': blocked_by_no_trade_session,
         'closed_by_no_trade_session': closed_by_no_trade_session,
+        'blocked_by_ema4_break': blocked_by_ema4_break,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
         'total_pnl': total_pnl,
@@ -1526,7 +1723,8 @@ def _run():
               f"Balance akhir ${result['final_balance']:.2f} | "
               f"blocked: {result['blocked_by_slot']} (slot), {result['blocked_by_margin']} (margin), "
               f"{result['blocked_by_filter']} (filter indikator), "
-              f"{result['blocked_by_rsi_gate']} (RSI{RSI_GATE_PERIOD} gate)")
+              f"{result['blocked_by_rsi_gate']} (RSI{RSI_GATE_PERIOD} gate), "
+              f"{result.get('blocked_by_ema4_break', 0)} (EMA4 body-break)")
 
 
 # ============================================================
@@ -1609,6 +1807,7 @@ def _render_html() -> bytes:
     flip_held = cr.get('flip_held_below_1r', 0)
     blocked_nts = cr.get('blocked_by_no_trade_session', 0)
     closed_nts = cr.get('closed_by_no_trade_session', 0)
+    blocked_ema4_break = cr.get('blocked_by_ema4_break', 0)
 
     summary_html = f'''
     <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
@@ -1618,6 +1817,7 @@ def _render_html() -> bytes:
           <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th><th>Blokir: RSI Gate</th>
           <th>Blokir: Sesi</th><th>Blokir: Min Order</th><th>Qty Dipaksa Naik</th><th>Blokir: Swing</th>
           <th>Blokir: Arah Candle</th>
+          <th>Blokir: EMA4 Body-Break</th>
           <th>Flip Ditahan (&lt;1R)</th><th>No-Trade: Pending Batal</th><th>No-Trade: Posisi Ditutup</th></tr>
       <tr>
         <td>{total_trades}</td>
@@ -1638,6 +1838,7 @@ def _render_html() -> bytes:
         <td class="y">{bumped_min_order}</td>
         <td class="y">{blocked_swing}</td>
         <td class="y">{blocked_candle_dir}</td>
+        <td class="y">{blocked_ema4_break}</td>
         <td class="y">{flip_held}</td>
         <td class="y">{blocked_nts}</td>
         <td class="y">{closed_nts}</td>
@@ -2050,11 +2251,23 @@ def _render_html() -> bytes:
   {session_day_html}
   {monthly_html}
   <div class="note">
-    💡 Entry = LIMIT di <b>{ENTRY_LEVEL_PCT*100:.0f}%</b> range candle penyebab EMA cross
-    (0%=wick, 50%=titik tengah, 100%=sisi berlawanan) — atur via env var <code>ENTRY_LEVEL_PCT</code>.
-    SL = <b>{SL_PCT*100:.2f}%</b> dari entry (bukan lagi jarak struktural candle) — atur via env var <code>SL_PCT</code>.
+    💡 Mode entry: <b>{'KONFIRMASI EMA4 H1 + TRIGGER M5' if EMA_CONFIRM_MODE else 'LIMIT DI WICK (LEGACY)'}</b>
+    (atur via env var <code>EMA_CONFIRM_MODE</code>).
+    {"""Setelah cross H1 lolos RSI gate/swing/arah-candle/filter: TIDAK langsung pasang limit --
+    tunggu candle H1 berikutnya sentuh WICK EMA4 dengan close masih searah bias (golden cross:
+    low candle &le; EMA4 &amp; close &gt; EMA4; death cross: high candle &ge; EMA4 &amp; close
+    &lt; EMA4). Kalau BODY candle malah menembus EMA4 penuh (EMA4 di antara open &amp; close) →
+    batal total (lihat kolom "Blokir: EMA4 Body-Break"). Kalau belum keduanya → tetap ditunggu
+    candle demi candle. Begitu konfirmasi lolos, mulai candle H1 berikutnya sistem memonitor
+    candle M5 mencari cross EMA4/EMA10 M5 SEARAH bias -- begitu ketemu, MARKET ORDER langsung di
+    close candle M5 itu. SL = <b>{SL_PCT*100:.2f}%</b> dari harga entry market M5 (bukan lagi dari
+    wick H1).""" if EMA_CONFIRM_MODE else f"""Entry = LIMIT di <b>{ENTRY_LEVEL_PCT*100:.0f}%</b> range
+    candle penyebab EMA cross (0%=wick, 50%=titik tengah, 100%=sisi berlawanan) — atur via env var
+    <code>ENTRY_LEVEL_PCT</code>. SL = <b>{SL_PCT*100:.2f}%</b> dari entry (bukan jarak struktural
+    candle) — atur via env var <code>SL_PCT</code>."""}
     Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
-    Flip protection: cross berlawanan → keluar/batal seketika, tunggu cross searah lagi.
+    Flip protection: cross berlawanan → keluar/batal seketika (termasuk membatalkan proses
+    konfirmasi/monitoring M5 yang sedang berjalan), tunggu cross searah lagi.
     Trailing aktif di rasio 1:{TRAIL_ACT_R:.0f}, lebar {TRAIL_STOP:.1f}x dist.
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dihitung dari balance TERKINI (compounding, 1 akun bersama —
     bukan modal terpisah per coin). Kalau slot ({MAX_CONCURRENT}) penuh saat sinyal valid baru
