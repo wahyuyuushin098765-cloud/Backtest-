@@ -371,13 +371,10 @@ def prepare_m5(df_m5):
     if df_m5 is None or df_m5.empty:
         return None
     df_m5 = df_m5.sort_values('ts').reset_index(drop=True)
-    ema_fast_m5 = df_m5['close'].ewm(span=EMA_FAST, adjust=False).mean().values
-    ema_slow_m5 = df_m5['close'].ewm(span=EMA_SLOW, adjust=False).mean().values
     return {
         'TS': df_m5['ts'].values.astype(np.int64),
         'O': df_m5['open'].values, 'H': df_m5['high'].values,
         'L': df_m5['low'].values, 'C': df_m5['close'].values,
-        'EMA_FAST': ema_fast_m5, 'EMA_SLOW': ema_slow_m5,
     }
 
 
@@ -554,6 +551,20 @@ FLIP_MIN_R = float(os.environ.get('FLIP_MIN_R', '1.0'))
 # cari cross EMA_FAST/EMA_SLOW M5 (searah bias awal) dan begitu ketemu, MARKET ORDER langsung
 # di close candle M5 itu. SL = SL_PCT% dari harga entry market (bukan lagi dari wick H1 lama).
 EMA_CONFIRM_MODE = os.environ.get('EMA_CONFIRM_MODE', '1').strip() not in ('0', 'false', 'False', '')
+
+# ── TRIGGER M5 BERBASIS SWING (menggantikan cross EMA4/EMA10 M5 sepenuhnya) ──
+# Begitu konfirmasi EMA4 H1 lolos & monitoring M5 dimulai (dari candle H1 berikutnya), sistem
+# TIDAK lagi mencari cross EMA M5. Sebagai gantinya:
+#   1) Cari SWING POINT M5 pertama yg valid, searah bias: utk Long -> swing LOW (low candle M5
+#      di index k adalah yg TERENDAH dibanding SWING_M5_RIGHT candle M5 SETELAHNYA -- artinya
+#      low[k] <= low[k+1..k+R]). Utk Short -> swing HIGH (high[k] >= high[k+1..k+R]). Krn butuh
+#      R candle setelahnya utk konfirmasi, swing baru "diketahui valid" R candle M5 (= R*5 menit)
+#      setelah candle swing itu sendiri (confirm mundur, wajar lag).
+#   2) Swing PERTAMA yg valid ditemukan jadi LEVEL PATOKAN TETAP -- tidak berubah lagi meski ada
+#      swing baru yg lebih ekstrem setelahnya (sampai tersentuh atau flip H1 membatalkan).
+#   3) Tunggu candle M5 berikutnya yg WICK menyentuh level itu (Long: low candle <= level;
+#      Short: high candle >= level) -> MARKET ORDER langsung di close candle M5 itu.
+SWING_M5_RIGHT = int(os.environ.get('SWING_M5_RIGHT', '5'))
 
 # ── Rentang FOKUS utk tabel Analisis Khusus RSI Gate (TERPISAH dari gate aktual di atas --
 # ini cuma menyempitkan rentang yg dianalisis & dibagi 3 bucket, tidak mempengaruhi entry
@@ -757,6 +768,29 @@ def _passes_swing_filter(H, L, O, C, i, direction):
         return L[i-1] < L[i-2] and L[i-1] < L[i]
 
 
+def _find_first_valid_swing_m5(m5_L, m5_H, start_idx, max_idx, direction):
+    """Cari SWING POINT M5 PERTAMA yg valid, mulai scan dari `start_idx`, dibatasi tidak
+    melebihi `max_idx` (exclusive -- representasi "candle M5 yg sudah terjadi sampai
+    sekarang", mencegah look-ahead). direction='Long' -> cari swing LOW: index k valid kalau
+    low[k] adalah TERENDAH dibanding SWING_M5_RIGHT candle setelahnya (low[k] <= low[k+1..k+R]).
+    direction='Short' -> swing HIGH: high[k] >= high[k+1..k+R].
+    Return (swing_idx, swing_level) kalau ketemu, atau (None, None) kalau belum ada yg valid
+    dlm rentang data yg tersedia (masih harus nunggu lbh banyak candle M5 muncul)."""
+    R = SWING_M5_RIGHT
+    k = start_idx
+    while k + R < max_idx:   # butuh R candle SETELAH k yg sudah "terjadi" (< max_idx)
+        if direction == 'Long':
+            level = m5_L[k]
+            if np.all(m5_L[k+1:k+1+R] >= level):
+                return k, level
+        else:
+            level = m5_H[k]
+            if np.all(m5_H[k+1:k+1+R] <= level):
+                return k, level
+        k += 1
+    return None, None
+
+
 def _ema4_body_break(O, C, ema_fast, j, direction):
     """True kalau BODY candle j menembus EMA4 sepenuhnya (open di satu sisi, close di sisi
     lain, EMA4 di tengah) -- sinyal dianggap gagal total. direction='Long' (golden cross)
@@ -841,7 +875,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
     armed             = {}   # f"{symbol}|Short"/"Long" -> {'c1_ts'}
     pending           = {}   # f"{symbol}|Long"/"Short" -> {...} (LEGACY, dipakai kalau EMA_CONFIRM_MODE=0)
     waiting_confirm   = {}   # f"{symbol}|Long"/"Short" -> {'cross_i', 'ind'} -- menunggu konfirmasi EMA4 H1
-    armed_m5          = {}   # f"{symbol}|Long"/"Short" -> {'ind', 'from_i'} -- menunggu cross M5 utk market order
+    armed_m5          = {}   # f"{symbol}|Long"/"Short" -> {'ind','from_i','swing_idx','swing_level','scan_from'}
     active_positions  = {}   # f"{symbol}|Long"/"Short" -> {...}
     blocked_by_ema4_break = 0  # counter: batal total krn body candle menembus EMA4 saat menunggu konfirmasi
     trades            = []
@@ -872,15 +906,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
         lo, hi = _m5_slice_idx(m5, int(TS_h1[i]), int(TS_h1[i + 1]))
         if hi <= lo:
             return None   # tidak ada candle M5 di rentang ini (gap data) -> fallback H1
-        # lo0: index M5 SEBELUM window ini (utk cek cross EMA M5 di candle M5 pertama window
-        # -- butuh nilai ema_fast/ema_slow M5 di candle sebelumnya juga, bukan cuma di dalam
-        # window). Kalau lo==0 (tidak ada candle M5 sebelumnya sama sekali), pakai lo sendiri
-        # (cross tidak akan terdeteksi di candle M5 pertama itu -- wajar, data belum cukup).
-        lo0 = max(lo - 1, 0)
         return {'TS': m5['TS'][lo:hi], 'O': m5['O'][lo:hi], 'H': m5['H'][lo:hi],
-                'L': m5['L'][lo:hi], 'C': m5['C'][lo:hi],
-                'EMA_FAST': m5['EMA_FAST'][lo0:hi], 'EMA_SLOW': m5['EMA_SLOW'][lo0:hi],
-                '_ema_offset': lo - lo0}   # offset: EMA_FAST[k+offset] cocok dgn TS[k]
+                'L': m5['L'][lo:hi], 'C': m5['C'][lo:hi]}
 
     def _slots_used():
         # pending (legacy limit-di-wick) DAN armed_m5 (sudah lolos konfirmasi EMA4, tinggal
@@ -1285,52 +1312,90 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                         blocked_by_ema4_break += 1
                         del waiting_confirm[key]
                     elif _ema4_wick_confirm(H, L, C_, ema_fast, i, direction):
-                        armed_m5[key] = {'ind': wc['ind'], 'from_i': i}
+                        armed_m5[key] = {'ind': wc['ind'], 'from_i': i,
+                                          'swing_idx': None, 'swing_level': None,
+                                          'scan_from': None}
                         del waiting_confirm[key]
                     # else: belum body-break maupun wick-confirm -> tetap waiting_confirm,
                     # dicek lagi di candle H1 berikutnya (loop natural krn tidak dihapus).
 
-                # ── 5c) MONITORING M5 -- utk sinyal yg sudah 'armed_m5' DAN candle H1 ini (i)
-                # adalah candle SETELAH konfirmasi ('from_i' < i, monitoring baru mulai di candle
-                # H1 berikutnya dari konfirmasi, persis sesuai spek). Cari cross EMA_FAST/EMA_SLOW
-                # M5 SEARAH bias, dalam window candle H1 ini -> begitu ketemu, MARKET ORDER
-                # langsung di close candle M5 itu. Kalau tidak ada data M5 utk symbol/window ini,
-                # fallback: treat candle H1 INI sbg 1 "candle M5 raksasa" (pakai H1 close sbg
-                # proxy cross, less precise tapi tetap jalan tanpa data M5). ──
+                # ── 5c) MONITORING M5 BERBASIS SWING -- utk sinyal yg sudah 'armed_m5' DAN
+                # candle H1 ini (i) adalah candle SETELAH konfirmasi ('from_i' < i). Kerja di
+                # ARRAY M5 ABSOLUT (bukan window per-H1) krn swing butuh melongok candle M5
+                # lintas batas jam. `max_idx` dibatasi TS[i+1] (akhir candle H1 SAAT INI) --
+                # inilah batas "candle M5 yg sudah benar-benar terjadi sejauh simulasi berjalan
+                # ke jam ini", mencegah look-ahead. Tahap per key:
+                #   a) swing_level belum ada -> scan cari swing PERTAMA yg valid (butuh
+                #      SWING_M5_RIGHT candle M5 setelah calon swing, dibatasi max_idx).
+                #      Kalau ketemu -> simpan sbg patokan TETAP. Kalau belum (data blm cukup)
+                #      -> tetap armed_m5, coba lagi di candle H1 berikutnya (max_idx lbh besar).
+                #   b) swing_level sudah ada -> scan candle M5 SETELAH swing_idx (yg belum
+                #      pernah discan) apakah WICK menyentuh level -> begitu ketemu, MARKET
+                #      ORDER di close candle M5 itu.
+                # Fallback tanpa data M5 sama sekali: proxy pakai close candle H1 ini (sama
+                # spt sebelumnya), krn swing structural butuh data M5 & tidak bisa direplikasi
+                # dari H1 semata.
                 for direction, key in (('Short', key_short), ('Long', key_long)):
                     am = armed_m5.get(key)
                     if am is None or am['from_i'] >= i or key in active_positions:
                         continue
-                    m5w = _m5_window_for(symbol, i, TS)
+                    m5 = m5_data.get(symbol)
                     entry_price = None
                     entry_ts_final = None
-                    if m5w is not None and '_ema_offset' in m5w and len(m5w['TS']) > 0:
-                        off = m5w['_ema_offset']
-                        ef5, es5 = m5w['EMA_FAST'], m5w['EMA_SLOW']
-                        n5 = len(m5w['TS'])
-                        for mi in range(n5):
-                            k = mi + off   # index ke array EMA_FAST/EMA_SLOW (yg mundur 1 extra)
-                            if k < 1:
-                                continue   # tidak cukup histori EMA utk cek cross di titik ini
-                            if direction == 'Long':
-                                cross5 = ef5[k-1] <= es5[k-1] and ef5[k] > es5[k]
+                    if M5_PRECISION_MODE and m5 is not None and len(m5['TS']) > 0:
+                        max_idx = int(np.searchsorted(m5['TS'], int(TS[i + 1]), side='left'))
+                        m5_L, m5_H, m5_C, m5_TS = m5['L'], m5['H'], m5['C'], m5['TS']
+
+                        if am['swing_level'] is None:
+                            # tahap a) belum ada swing patokan -- mulai scan dari awal window
+                            # konfirmasi (from_i+1, dikonversi ke index M5) kalau blm pernah
+                            # discan, atau lanjut dari scan_from kalau sudah pernah dicoba.
+                            if am['scan_from'] is None:
+                                # Monitoring M5 dimulai BUKAN pas candle H1 berikutnya genap
+                                # jam, tapi +5 menit setelah candle H1 sebelumnya close --
+                                # candle M5 PERTAMA dlm jam itu (mis. 09:00-09:05) dilewati,
+                                # candle M5 KEDUA (09:05) yg jadi titik awal scan.
+                                monitor_start_ts = int(TS[am['from_i'] + 1]) + 5 * 60_000
+                                start_idx = int(np.searchsorted(m5_TS, monitor_start_ts, side='left'))
                             else:
-                                cross5 = ef5[k-1] >= es5[k-1] and ef5[k] < es5[k]
-                            if cross5:
-                                entry_price = m5w['C'][mi]
-                                entry_ts_final = int(m5w['TS'][mi])
-                                break
+                                start_idx = am['scan_from']
+                            s_idx, s_level = _find_first_valid_swing_m5(m5_L, m5_H, start_idx, max_idx, direction)
+                            if s_idx is not None:
+                                am['swing_idx'] = s_idx
+                                am['swing_level'] = s_level
+                                # scan wick-touch mulai dari candle SETELAH swing_idx
+                                am['scan_from'] = s_idx + 1
+                            else:
+                                # belum ketemu swing valid dlm data yg sudah ada -- simpan
+                                # posisi scan biar candle H1 berikutnya lanjut dari sana,
+                                # tidak scan ulang dari awal.
+                                am['scan_from'] = max(start_idx, max_idx - SWING_M5_RIGHT - 1, start_idx)
+
+                        if am['swing_level'] is not None:
+                            # tahap b) sudah ada swing patokan -- cari candle M5 pertama sejak
+                            # scan_from yg WICK-nya menyentuh level.
+                            level = am['swing_level']
+                            k = am['scan_from']
+                            while k < max_idx:
+                                touched = (m5_L[k] <= level) if direction == 'Long' else (m5_H[k] >= level)
+                                if touched:
+                                    entry_price = m5_C[k]
+                                    entry_ts_final = int(m5_TS[k])
+                                    break
+                                k += 1
+                            am['scan_from'] = max(k, am['scan_from'])
                     if entry_price is None:
-                        if m5w is None:
-                            # FALLBACK tanpa data M5 sama sekali utk symbol ini: pakai cross
-                            # EMA H1 candle INI sbg proxy (kasar, tapi mencegah sinyal macet
+                        if m5 is None or not M5_PRECISION_MODE:
+                            # FALLBACK tanpa data M5 sama sekali: proxy pakai close candle H1
+                            # INI, hanya kalau candle H1 ini sendiri jg cross searah bias (cara
+                            # kasar, sama spt mode EMA M5 sebelumnya, mencegah sinyal macet
                             # selamanya kalau data M5 memang tidak tersedia).
                             if direction == 'Long' and golden_cross:
                                 entry_price = C_[i]; entry_ts_final = int(TS[i])
                             elif direction == 'Short' and death_cross:
                                 entry_price = C_[i]; entry_ts_final = int(TS[i])
                         if entry_price is None:
-                            continue   # belum ada cross M5 searah di window H1 ini -> tetap armed_m5
+                            continue   # msh menunggu (swing blm valid / wick blm menyentuh)
 
                     dist = entry_price * SL_PCT
                     min_dist = entry_price * MIN_DIST_PCT
@@ -2258,10 +2323,13 @@ def _render_html() -> bytes:
     low candle &le; EMA4 &amp; close &gt; EMA4; death cross: high candle &ge; EMA4 &amp; close
     &lt; EMA4). Kalau BODY candle malah menembus EMA4 penuh (EMA4 di antara open &amp; close) →
     batal total (lihat kolom "Blokir: EMA4 Body-Break"). Kalau belum keduanya → tetap ditunggu
-    candle demi candle. Begitu konfirmasi lolos, mulai candle H1 berikutnya sistem memonitor
-    candle M5 mencari cross EMA4/EMA10 M5 SEARAH bias -- begitu ketemu, MARKET ORDER langsung di
-    close candle M5 itu. SL = <b>{SL_PCT*100:.2f}%</b> dari harga entry market M5 (bukan lagi dari
-    wick H1).""" if EMA_CONFIRM_MODE else f"""Entry = LIMIT di <b>{ENTRY_LEVEL_PCT*100:.0f}%</b> range
+    candle demi candle. Begitu konfirmasi lolos, monitoring M5 dimulai 5 menit setelah candle H1
+    berikutnya buka (candle M5 pertama dlm jam itu dilewati) -- sistem mencari SWING POINT M5
+    PERTAMA yg valid searah bias (low/high candle M5 tsb tdk terlampaui oleh """
+    f"""<b>{SWING_M5_RIGHT}</b> candle M5 setelahnya), lalu level itu jadi patokan TETAP sampai
+    tersentuh atau flip H1. Begitu ada candle M5 berikutnya yg WICK-nya menyentuh level swing itu
+    -- MARKET ORDER langsung di close candle M5 itu. SL = <b>{SL_PCT*100:.2f}%</b> dari harga
+    entry market M5.""" if EMA_CONFIRM_MODE else f"""Entry = LIMIT di <b>{ENTRY_LEVEL_PCT*100:.0f}%</b> range
     candle penyebab EMA cross (0%=wick, 50%=titik tengah, 100%=sisi berlawanan) — atur via env var
     <code>ENTRY_LEVEL_PCT</code>. SL = <b>{SL_PCT*100:.2f}%</b> dari entry (bukan jarak struktural
     candle) — atur via env var <code>SL_PCT</code>."""}
