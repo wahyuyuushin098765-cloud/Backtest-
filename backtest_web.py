@@ -55,6 +55,15 @@ ENTRY_LEVEL_PCT  = float(os.environ.get('ENTRY_LEVEL_PCT', '0.0'))     # posisi 
 BACKTEST_START_DATE = os.environ.get('BACKTEST_START_DATE', '2025-08-01')
 BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', '2026-07-31')
 
+# ── M5 PRECISION MODE: pakai candle M5 (5 menit) HANYA utk fase presisi setelah limit
+# dipasang -- fill, SL, trailing dicek per-M5 alih-alih per-H1 candle penuh (yg jauh lebih
+# kasar krn 1 candle H1 = 12 candle M5, urutan kejadian di dalamnya bisa ambigu kalau
+# semuanya disamakan "terjadi bersamaan"). EMA cross, gate RSI/swing/arah-candle, S/R
+# detection, dan FLIP PROTECTION tetap 100% di H1 spt biasa -- M5 murni utk presisi
+# eksekusi (kapan tepatnya fill/SL/trail kena), bukan mengubah sinyal itu sendiri.
+# 0/false = nonaktif (kembali ke mode H1 murni spt sebelumnya).
+M5_PRECISION_MODE = os.environ.get('M5_PRECISION_MODE', '1').strip() not in ('0', 'false', 'False', '')
+
 # LEVERAGE & MARGIN: constraint paling realistis dari exchange asli. Risk 1% BUKAN berarti
 # ada "99 kesempatan lagi" -- tiap posisi tetap butuh MARGIN (notional/leverage), dan kalau
 # margin yg dipakai SEMUA posisi terbuka sudah habis, Bybit tidak akan izinkan order baru
@@ -287,9 +296,97 @@ def fetch_bybit_h1(symbol: str) -> pd.DataFrame:
     return df
 
 
+def _cache_path_m5(symbol: str) -> str:
+    return os.path.join(CACHE_DIR, f"{symbol}_M5_{BACKTEST_START_DATE}_{BACKTEST_END_DATE}.csv")
+
+
+def _load_cache_m5(symbol: str):
+    path = _cache_path_m5(symbol)
+    if os.path.exists(path):
+        try:
+            df = pd.read_csv(path)
+            if not df.empty and {'ts', 'open', 'high', 'low', 'close', 'vol'}.issubset(df.columns):
+                return df
+        except Exception as e:
+            _log_msg(f"   ⚠ {symbol} M5: cache korup ({e}), fetch ulang dari Bybit.")
+    return None
+
+
+def _save_cache_m5(symbol: str, df: pd.DataFrame):
+    try:
+        df.to_csv(_cache_path_m5(symbol), index=False)
+    except Exception as e:
+        _log_msg(f"   ⚠ {symbol} M5: gagal simpan cache — {e}")
+
+
+def fetch_bybit_m5(symbol: str) -> pd.DataFrame:
+    """Identik dgn fetch_bybit_h1 tapi interval=5 (M5) & cache file terpisah (_M5_ di nama
+    file) -- disimpan di CACHE_DIR yg sama (Railway Volume), tidak bentrok dgn cache H1."""
+    cached = _load_cache_m5(symbol)
+    if cached is not None:
+        _log_msg(f"   💾 {symbol} M5: pakai cache ({len(cached):,} candle) — skip fetch Bybit.")
+        return cached
+
+    session = HTTP(testnet=False)
+    rows, cur_end, n_call = [], _END_MS, 0
+    while True:
+        for attempt in range(4):
+            try:
+                res = session.get_kline(symbol=symbol, category='linear', interval=5,
+                                        limit=1000, start=_START_MS, end=cur_end)
+                data = res['result']['list']
+                break
+            except Exception as e:
+                wait = 2 ** attempt
+                _log_msg(f"   ⚠ {symbol} M5 API error (attempt {attempt+1}): {e} — retry {wait}s")
+                time.sleep(wait)
+        else:
+            _log_msg(f"   ❌ {symbol} M5: gagal fetch setelah 4 percobaan.")
+            break
+        if not data:
+            break
+        for kl in data:
+            rows.append({'ts': int(kl[0]), 'open': float(kl[1]), 'high': float(kl[2]),
+                         'low': float(kl[3]), 'close': float(kl[4]), 'vol': float(kl[5])})
+        n_call += 1
+        oldest_ts = int(data[-1][0])
+        if oldest_ts <= _START_MS:
+            break
+        cur_end = oldest_ts - 1
+        time.sleep(0.15)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).drop_duplicates(subset='ts').sort_values('ts').reset_index(drop=True)
+    _save_cache_m5(symbol, df)
+    return df
+
+
 # ============================================================
 # DETEKSI SUPPORT / RESISTANCE (identik dgn bot_ema_flip.py)
 # ============================================================
+
+def prepare_m5(df_m5):
+    """Precompute array numpy dari candle M5 utk lookup cepat via searchsorted (bukan
+    filter pandas per-panggilan, krn M5 dipanggil berulang kali per posisi/limit aktif)."""
+    if df_m5 is None or df_m5.empty:
+        return None
+    df_m5 = df_m5.sort_values('ts').reset_index(drop=True)
+    return {
+        'TS': df_m5['ts'].values.astype(np.int64),
+        'O': df_m5['open'].values, 'H': df_m5['high'].values,
+        'L': df_m5['low'].values, 'C': df_m5['close'].values,
+    }
+
+
+def _m5_slice_idx(m5, start_ts_ms, end_ts_ms):
+    """Return (start_idx, end_idx) exclusive-end utk candle M5 dgn start_ts_ms <= ts < end_ts_ms.
+    m5=None (data M5 tidak tersedia utk symbol ini) -> return (0, 0), caller fallback ke H1."""
+    if m5 is None:
+        return 0, 0
+    lo = np.searchsorted(m5['TS'], start_ts_ms, side='left')
+    hi = np.searchsorted(m5['TS'], end_ts_ms, side='left')
+    return int(lo), int(hi)
+
 
 def find_sr_events(df):
     """Versi O(n) — logika & hasil identik dgn versi lama (O(n^2)), hanya cara
@@ -680,10 +777,15 @@ def prepare_coin(symbol, df):
 # dipakai bersama oleh semua koin, bukan simulasi per-koin terisolasi)
 # ============================================================
 
-def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
+def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: dict = None) -> dict:
     """coins: {symbol: prepared_dict dari prepare_coin()}
     filters_enabled=False -> semua FILTER_* diabaikan (dipakai utk simulasi pembanding
-    'tanpa filter' pada bagian Dampak Filter Aktif)."""
+    'tanpa filter' pada bagian Dampak Filter Aktif).
+    m5_data: {symbol: prepare_m5(df_m5)} atau None -- kalau tersedia & M5_PRECISION_MODE
+    aktif, fill/SL/trailing utk symbol itu dicek per-candle-M5 (bukan per-H1) begitu limit
+    dipasang, sampai posisi keluar. EMA cross, gate, S/R, flip protection TETAP di H1."""
+    if m5_data is None:
+        m5_data = {}
     # ── timeline global: semua timestamp dari semua koin, urut kronologis ──
     all_ts = set()
     for c in coins.values():
@@ -710,6 +812,20 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
 
     def _akey(symbol, direction):
         return f"{symbol}|{direction}" if ALLOW_HEDGE else symbol
+
+    def _m5_window_for(symbol, i, TS_h1):
+        """Return array M5 (TS,O,H,L,C) utk rentang [TS_h1[i], TS_h1[i+1]) symbol ini, atau
+        None kalau M5_PRECISION_MODE nonaktif / data M5 tidak tersedia utk symbol ini."""
+        if not M5_PRECISION_MODE:
+            return None
+        m5 = m5_data.get(symbol)
+        if m5 is None:
+            return None
+        lo, hi = _m5_slice_idx(m5, int(TS_h1[i]), int(TS_h1[i + 1]))
+        if hi <= lo:
+            return None   # tidak ada candle M5 di rentang ini (gap data) -> fallback H1
+        return {'TS': m5['TS'][lo:hi], 'O': m5['O'][lo:hi], 'H': m5['H'][lo:hi],
+                'L': m5['L'][lo:hi], 'C': m5['C'][lo:hi]}
 
     def _slots_used():
         return len(active_positions) + len(pending)
@@ -854,81 +970,156 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True) -> dict:
                     else:
                         flip_held_below_1r += 1
 
-            # ── 2) SL / trailing normal ──
-            for direction, key in (('Short', key_short), ('Long', key_long)):
-                pos = active_positions.get(key)
-                if pos is None:
-                    continue
-                h, l = H[i], L[i]
-                if direction == 'Long':
-                    if l <= pos['stop']:
-                        reason = 'TRAIL' if pos['trail_active'] else 'SL'
-                        close_trade(symbol, 'Long', pos['stop'], reason, int(TS[i]))
+            # ── 2+3) SL/TRAILING + FILL PENDING — presisi M5 kalau tersedia, fallback H1 ──
+            m5w = _m5_window_for(symbol, i, TS)
+            if m5w is not None:
+                # ── MODE M5: iterasi tiap candle 5-menit dlm rentang candle H1 ini, urutan
+                # kejadian (SL/trail kena, lalu fill pending) dicek per-M5 candle -- presisi
+                # jauh lebih tinggi drpd asumsi "semua kejadian dalam 1 jam itu bersamaan". ──
+                n_m5 = len(m5w['TS'])
+                for mi in range(n_m5):
+                    hh, ll = m5w['H'][mi], m5w['L'][mi]
+                    m5_ts = int(m5w['TS'][mi])
+                    # -- 2) SL/trailing (posisi yg SUDAH filled) --
+                    for direction, key in (('Short', key_short), ('Long', key_long)):
+                        pos = active_positions.get(key)
+                        if pos is None:
+                            continue
+                        if direction == 'Long':
+                            if ll <= pos['stop']:
+                                reason = 'TRAIL' if pos['trail_active'] else 'SL'
+                                close_trade(symbol, 'Long', pos['stop'], reason, m5_ts)
+                                continue
+                            pos['peak'] = max(pos['peak'], hh)
+                            if not pos['trail_active'] and pos['peak'] >= pos['act_price']:
+                                pos['trail_active'] = True
+                            if pos['trail_active']:
+                                pos['stop'] = max(pos['stop'], pos['peak'] - TRAIL_STOP * pos['dist'])
+                        else:
+                            if hh >= pos['stop']:
+                                reason = 'TRAIL' if pos['trail_active'] else 'SL'
+                                close_trade(symbol, 'Short', pos['stop'], reason, m5_ts)
+                                continue
+                            pos['peak'] = min(pos['peak'], ll)
+                            if not pos['trail_active'] and pos['peak'] <= pos['act_price']:
+                                pos['trail_active'] = True
+                            if pos['trail_active']:
+                                pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
+                    # -- 3) fill pending (limit blm filled) --
+                    for direction, key in (('Short', key_short), ('Long', key_long)):
+                        p = pending.get(key)
+                        if p is not None and key not in active_positions:
+                            filled = (hh >= p['entry']) if direction == 'Short' else (ll <= p['entry'])
+                            if filled and _session_blocked(m5_ts):
+                                blocked_by_session += 1
+                                del pending[key]
+                                continue
+                            if filled:
+                                dist = p['dist']
+                                min_dist = p['entry'] * MIN_DIST_PCT
+                                if dist < min_dist:
+                                    dist = min_dist
+                                risk_usd = balance * RISK_PCT
+                                raw_qty = risk_usd / dist if dist > 0 else 0
+                                qty, skipped_min_order, bumped_min_order = _apply_min_order_size(raw_qty, p['entry'])
+                                if skipped_min_order:
+                                    blocked_by_min_order += 1
+                                    del pending[key]
+                                    continue
+                                if bumped_min_order:
+                                    bumped_by_min_order += 1
+                                margin_needed = (p['entry'] * qty) / LEVERAGE
+                                if _current_margin_used() + margin_needed > balance * MARGIN_USAGE_CAP:
+                                    blocked_by_margin += 1
+                                    del pending[key]
+                                    continue
+                                act_price = (p['entry'] + TRAIL_ACT_R * dist) if direction == 'Long' \
+                                            else (p['entry'] - TRAIL_ACT_R * dist)
+                                ind = dict(p.get('ind') or {})
+                                ind['dist_pct'] = (dist / p['entry'] * 100) if p['entry'] else None
+                                active_positions[key] = {
+                                    'entry': p['entry'], 'sl': p['sl'], 'dist': dist, 'stop': p['sl'],
+                                    'trail_active': False, 'peak': p['entry'], 'act_price': act_price,
+                                    'qty': qty, 'entry_ts': m5_ts, 'ind': ind,
+                                }
+                                del pending[key]
+            else:
+                # ── FALLBACK MODE H1 (data M5 tdk tersedia utk symbol ini, atau mode nonaktif) ──
+                # -- 2) SL / trailing normal --
+                for direction, key in (('Short', key_short), ('Long', key_long)):
+                    pos = active_positions.get(key)
+                    if pos is None:
                         continue
-                    pos['peak'] = max(pos['peak'], h)
-                    if not pos['trail_active'] and pos['peak'] >= pos['act_price']:
-                        pos['trail_active'] = True
-                    if pos['trail_active']:
-                        pos['stop'] = max(pos['stop'], pos['peak'] - TRAIL_STOP * pos['dist'])
-                else:
-                    if h >= pos['stop']:
-                        reason = 'TRAIL' if pos['trail_active'] else 'SL'
-                        close_trade(symbol, 'Short', pos['stop'], reason, int(TS[i]))
-                        continue
-                    pos['peak'] = min(pos['peak'], l)
-                    if not pos['trail_active'] and pos['peak'] <= pos['act_price']:
-                        pos['trail_active'] = True
-                    if pos['trail_active']:
-                        pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
+                    h, l = H[i], L[i]
+                    if direction == 'Long':
+                        if l <= pos['stop']:
+                            reason = 'TRAIL' if pos['trail_active'] else 'SL'
+                            close_trade(symbol, 'Long', pos['stop'], reason, int(TS[i]))
+                            continue
+                        pos['peak'] = max(pos['peak'], h)
+                        if not pos['trail_active'] and pos['peak'] >= pos['act_price']:
+                            pos['trail_active'] = True
+                        if pos['trail_active']:
+                            pos['stop'] = max(pos['stop'], pos['peak'] - TRAIL_STOP * pos['dist'])
+                    else:
+                        if h >= pos['stop']:
+                            reason = 'TRAIL' if pos['trail_active'] else 'SL'
+                            close_trade(symbol, 'Short', pos['stop'], reason, int(TS[i]))
+                            continue
+                        pos['peak'] = min(pos['peak'], l)
+                        if not pos['trail_active'] and pos['peak'] <= pos['act_price']:
+                            pos['trail_active'] = True
+                        if pos['trail_active']:
+                            pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
 
-            # ── 3) cek fill pending (limit di wick), TUNDUK ke MARGIN (leverage) ──
-            for direction, key in (('Short', key_short), ('Long', key_long)):
-                p = pending.get(key)
-                if p is not None and key not in active_positions:
-                    filled = (H[i] >= p['entry']) if direction == 'Short' else (L[i] <= p['entry'])
-                    if filled and _session_blocked(int(TS[i])):
-                        # Waktu FILL jatuh di sesi yg diblokir (SESSION_BLOCK_LIST) -> batalkan
-                        # limit, jangan buka posisi. Bukan cuma "skip candle ini": limit yg
-                        # sama tidak akan dicoba fill lagi di candle berikutnya krn sudah
-                        # dihapus dari pending (persis kayak "berhenti trading" di sesi ini).
-                        blocked_by_session += 1
-                        del pending[key]
-                        continue
-                    if filled:
-                        dist = p['dist']
-                        min_dist = p['entry'] * MIN_DIST_PCT
-                        if dist < min_dist:
-                            dist = min_dist
-                        risk_usd = balance * RISK_PCT   # <-- COMPOUNDING: 1% dari balance TERKINI (shared)
-                        raw_qty = risk_usd / dist if dist > 0 else 0
-                        qty, skipped_min_order, bumped_min_order = _apply_min_order_size(raw_qty, p['entry'])
-                        if skipped_min_order:
-                            blocked_by_min_order += 1
+                # -- 3) cek fill pending (limit di wick), TUNDUK ke MARGIN (leverage) --
+                for direction, key in (('Short', key_short), ('Long', key_long)):
+                    p = pending.get(key)
+                    if p is not None and key not in active_positions:
+                        filled = (H[i] >= p['entry']) if direction == 'Short' else (L[i] <= p['entry'])
+                        if filled and _session_blocked(int(TS[i])):
+                            # Waktu FILL jatuh di sesi yg diblokir (SESSION_BLOCK_LIST) -> batalkan
+                            # limit, jangan buka posisi. Bukan cuma "skip candle ini": limit yg
+                            # sama tidak akan dicoba fill lagi di candle berikutnya krn sudah
+                            # dihapus dari pending (persis kayak "berhenti trading" di sesi ini).
+                            blocked_by_session += 1
                             del pending[key]
                             continue
-                        if bumped_min_order:
-                            bumped_by_min_order += 1
+                        if filled:
+                            dist = p['dist']
+                            min_dist = p['entry'] * MIN_DIST_PCT
+                            if dist < min_dist:
+                                dist = min_dist
+                            risk_usd = balance * RISK_PCT   # <-- COMPOUNDING: 1% dari balance TERKINI (shared)
+                            raw_qty = risk_usd / dist if dist > 0 else 0
+                            qty, skipped_min_order, bumped_min_order = _apply_min_order_size(raw_qty, p['entry'])
+                            if skipped_min_order:
+                                blocked_by_min_order += 1
+                                del pending[key]
+                                continue
+                            if bumped_min_order:
+                                bumped_by_min_order += 1
 
-                        # MARGIN CHECK (persis Bybit asli): notional = qty*entry, margin = notional/leverage.
-                        # Kalau margin yg sudah dipakai + margin posisi baru ini > batas (mis. 90% balance),
-                        # order DITOLAK exchange -- risk 1% tidak berarti "99 kesempatan lagi", karena
-                        # margin-nya sendiri yg akan habis duluan jauh sebelum itu.
-                        margin_needed = (p['entry'] * qty) / LEVERAGE
-                        if _current_margin_used() + margin_needed > balance * MARGIN_USAGE_CAP:
-                            blocked_by_margin += 1
+                            # MARGIN CHECK (persis Bybit asli): notional = qty*entry, margin = notional/leverage.
+                            # Kalau margin yg sudah dipakai + margin posisi baru ini > batas (mis. 90% balance),
+                            # order DITOLAK exchange -- risk 1% tidak berarti "99 kesempatan lagi", karena
+                            # margin-nya sendiri yg akan habis duluan jauh sebelum itu.
+                            margin_needed = (p['entry'] * qty) / LEVERAGE
+                            if _current_margin_used() + margin_needed > balance * MARGIN_USAGE_CAP:
+                                blocked_by_margin += 1
+                                del pending[key]
+                                continue
+
+                            act_price = (p['entry'] + TRAIL_ACT_R * dist) if direction == 'Long' \
+                                        else (p['entry'] - TRAIL_ACT_R * dist)
+                            ind = dict(p.get('ind') or {})
+                            ind['dist_pct'] = (dist / p['entry'] * 100) if p['entry'] else None
+                            active_positions[key] = {
+                                'entry': p['entry'], 'sl': p['sl'], 'dist': dist, 'stop': p['sl'],
+                                'trail_active': False, 'peak': p['entry'], 'act_price': act_price,
+                                'qty': qty, 'entry_ts': int(TS[i]), 'ind': ind,
+                            }
                             del pending[key]
-                            continue
-
-                        act_price = (p['entry'] + TRAIL_ACT_R * dist) if direction == 'Long' \
-                                    else (p['entry'] - TRAIL_ACT_R * dist)
-                        ind = dict(p.get('ind') or {})
-                        ind['dist_pct'] = (dist / p['entry'] * 100) if p['entry'] else None
-                        active_positions[key] = {
-                            'entry': p['entry'], 'sl': p['sl'], 'dist': dist, 'stop': p['sl'],
-                            'trail_active': False, 'peak': p['entry'], 'act_price': act_price,
-                            'qty': qty, 'entry_ts': int(TS[i]), 'ind': ind,
-                        }
-                        del pending[key]
 
             # ── 4) daftarkan support/resistance valid baru -> armed (bias arah, tetap hidup) ──
             for e in c['events_by_c3'].get(i, []):
@@ -1256,8 +1447,12 @@ def _run():
     _log_msg(f"   EMA {EMA_FAST}/{EMA_SLOW} | Trail 1:{TRAIL_ACT_R:.0f} | Risk {RISK_PCT*100:.0f}%/trade "
               f"(compounding, 1 balance bersama) | MAX_CONCURRENT {_fmt_max_concurrent()} slot (global, semua koin) | "
               f"Modal awal ${INITIAL_BALANCE:.0f}")
+    if M5_PRECISION_MODE:
+        _log_msg("   🔬 M5 Precision Mode: AKTIF — fill/SL/trailing dicek per-candle-5-menit "
+                  "(EMA cross & sinyal tetap 100% di H1).")
 
     coins = {}
+    m5_data = {}
     for sym in SYMBOLS:
         try:
             _log_msg(f"📥 {sym}: mengambil data H1 dari Bybit...")
@@ -1271,6 +1466,17 @@ def _run():
                 continue
             coins[sym] = prepared
             _log_msg(f"   {len(df):,} candle H1 diperoleh & siap.")
+
+            if M5_PRECISION_MODE:
+                try:
+                    df_m5 = fetch_bybit_m5(sym)
+                    if not df_m5.empty:
+                        m5_data[sym] = prepare_m5(df_m5)
+                        _log_msg(f"   🔬 {sym}: {len(df_m5):,} candle M5 diperoleh & siap (mode presisi).")
+                    else:
+                        _log_msg(f"   ⚠ {sym}: data M5 kosong — fallback ke H1 utk symbol ini.")
+                except Exception as e:
+                    _log_msg(f"   ⚠ {sym}: gagal fetch M5 ({e}) — fallback ke H1 utk symbol ini.")
         except Exception as e:
             _log_msg(f"   ❌ {sym}: error fetch — {e}")
 
@@ -1283,7 +1489,7 @@ def _run():
     _log_msg(f"✅ {len(coins)}/{len(SYMBOLS)} koin siap. Menjalankan SIMULASI GABUNGAN "
               f"(semua koin berbarengan sesuai waktu, 1 balance, {_fmt_max_concurrent()} slot global)...")
 
-    result = run_combined_backtest(coins)
+    result = run_combined_backtest(coins, m5_data=m5_data)
     ind_analysis = indicator_analysis(result['trades'])
     rsi_gate_res = rsi_gate_analysis(result['trades'])
     session_day_res = session_day_analysis(result['trades'])
@@ -1293,7 +1499,7 @@ def _run():
     if _any_filter_active():
         _log_msg("🔁 Filter aktif terdeteksi — menjalankan simulasi PEMBANDING tanpa filter "
                   "utk mengukur dampaknya (n trade, WR, PnL)...")
-        result_nf = run_combined_backtest(coins, filters_enabled=False)
+        result_nf = run_combined_backtest(coins, filters_enabled=False, m5_data=m5_data)
         no_filter_summary = {
             'n_trades': result_nf['n_trades'], 'wr': result_nf['wr'],
             'total_pnl': result_nf['total_pnl'], 'roi': result_nf['roi'],
