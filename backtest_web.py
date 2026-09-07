@@ -41,8 +41,19 @@ FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))   # fee saa
 FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))  # fee saat TUTUP posisi = 3x fee entry
 EMA_FAST         = int(os.environ.get('EMA_FAST', '4'))
 EMA_SLOW         = int(os.environ.get('EMA_SLOW', '10'))
-TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '5.0'))        # trailing aktif di rasio 1:5
+TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '999'))        # trailing EFEKTIF NONAKTIF drfault -- TP_R jadi exit utama, set TRAIL_ACT_R lbh kecil dari TP_R utk pakai trailing lagi
 TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar trailing = 1x dist
+
+# ── TAKE PROFIT TETAP (LIMIT ORDER) -- independen dari trailing. Begitu posisi terbuka, TP
+# langsung "dipasang" di rasio TP_R dari entry (Long: entry + TP_R*dist; Short: entry -
+# TP_R*dist). Dieksekusi sbg LIMIT ORDER sungguhan: baru FILL kalau candle M5/H1 berikutnya
+# WICK-nya benar2 menyentuh level TP itu, fill PERSIS di harga TP (bukan close candle
+# penyentuh). Kalau dalam 1 candle SL & TP sama2 tersentuh (candle extreme), SL yg dianggap
+# kena duluan (worst-case/konservatif). TP_R=0 -> TP nonaktif sepenuhnya (exit hanya via
+# SL/trailing/breakeven-guard spt sebelumnya). Independen dari TRAIL_ACT_R -- keduanya BISA
+# aktif bersamaan (siapa lebih dulu tersentuh yg menang), tapi default TRAIL_ACT_R diset
+# sangat besar (999) supaya TP jadi satu2nya exit profit by default.
+TP_R = float(os.environ.get('TP_R', '2.0'))
 
 # ── BREAKEVEN-GUARD -- independen dari trailing, aktif LEBIH DULU ──
 # Begitu profit floating mencapai +BE_GUARD_TRIGGER_R (default 2R) dari entry, SL langsung
@@ -1001,8 +1012,11 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
         del active_positions[key]
 
     def _check_sl_trailing_one_candle(symbol, direction, key, hh, ll, candle_ts):
-        """Cek SL/breakeven-guard/trailing utk 1 posisi di 1 candle (M5 atau H1 fallback).
-        Return True kalau posisi closed di candle ini (caller harus stop iterasi utk key ini)."""
+        """Cek SL/TP/breakeven-guard/trailing utk 1 posisi di 1 candle (M5 atau H1 fallback).
+        Urutan cek dlm 1 candle: SL dulu (worst-case/konservatif -- kalau candle extreme bisa
+        kena SL & TP sekaligus, SL yg dianggap kena duluan), baru TP (limit order sungguhan --
+        fill PERSIS di harga TP kalau wick menyentuhnya). Return True kalau posisi closed di
+        candle ini (caller harus stop iterasi utk key ini)."""
         pos = active_positions.get(key)
         if pos is None:
             return False
@@ -1010,6 +1024,9 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
             if ll <= pos['stop']:
                 reason = 'TRAIL' if pos['trail_active'] else 'SL'
                 close_trade(symbol, 'Long', pos['stop'], reason, candle_ts)
+                return True
+            if TP_R > 0 and hh >= pos['entry'] + TP_R * pos['dist']:
+                close_trade(symbol, 'Long', pos['entry'] + TP_R * pos['dist'], 'TP', candle_ts)
                 return True
             pos['peak'] = max(pos['peak'], hh)
             if (BE_GUARD_TRIGGER_R > 0 and not pos['breakeven_done']
@@ -1024,6 +1041,9 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
             if hh >= pos['stop']:
                 reason = 'TRAIL' if pos['trail_active'] else 'SL'
                 close_trade(symbol, 'Short', pos['stop'], reason, candle_ts)
+                return True
+            if TP_R > 0 and ll <= pos['entry'] - TP_R * pos['dist']:
+                close_trade(symbol, 'Short', pos['entry'] - TP_R * pos['dist'], 'TP', candle_ts)
                 return True
             pos['peak'] = min(pos['peak'], ll)
             if (BE_GUARD_TRIGGER_R > 0 and not pos['breakeven_done']
@@ -2370,7 +2390,11 @@ def _render_html() -> bytes:
     Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
     Flip protection: cross berlawanan → keluar/batal seketika (termasuk membatalkan proses
     konfirmasi/monitoring M5 yang sedang berjalan), tunggu cross searah lagi.
-    Trailing aktif di rasio 1:{TRAIL_ACT_R:.0f}, lebar {TRAIL_STOP:.1f}x dist.
+    {"""Take Profit TETAP (limit order) di rasio 1:{:.1f}R dari entry -- begitu wick candle
+    berikutnya menyentuh level TP, fill PERSIS di harga TP itu (reason "TP"). SL diprioritaskan
+    kalau SL & TP sama2 tersentuh di candle yg sama (worst-case). Atur via env var
+    TP_R (0 = nonaktif).""".format(TP_R) if TP_R > 0 else ""}
+    {"Trailing juga aktif di rasio 1:{:.0f}, lebar {:.1f}x dist (independen dari TP di atas — mana lebih dulu tersentuh yg menang).".format(TRAIL_ACT_R, TRAIL_STOP) if TRAIL_ACT_R < 100 else ""}
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dihitung dari balance TERKINI (compounding, 1 akun bersama —
     bukan modal terpisah per coin). Kalau slot ({MAX_CONCURRENT}) penuh saat sinyal valid baru
     muncul di koin lain, sinyal itu dilewati (lihat kolom "Sinyal Terblokir" di ringkasan).
