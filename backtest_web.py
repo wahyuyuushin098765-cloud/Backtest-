@@ -11,11 +11,14 @@ Strategi (hasil riset & backtest terbaik, lihat Readme.md):
   3. Entry: LIMIT order di ENTRY_LEVEL_PCT (default 0.5 = titik tengah) dari range
      candle yang menyebabkan EMA cross (EMA4/EMA10) -- 0.0 = wick asli, 1.0 = sisi
      berlawanan. SL = SL_PCT (default 0.3%) dari entry, arah berlawanan dari entry.
-  4. FLIP PROTECTION: EMA cross berlawanan muncul saat pending/aktif -> batal/tutup
-     SEKARANG, apapun P&L-nya. Bias tetap hidup, tunggu cross searah lagi.
-  5. Trailing stop aktif di rasio 1:TRAIL_ACT_R (default 4) dari jarak entry-SL.
+  4. TIDAK ADA FLIP PROTECTION LINTAS ARAH -- Long & Short berjalan PARALEL PENUH,
+     saling tidak mengganggu. Pembatalan yang tersisa: body-break EMA4 saat
+     menunggu konfirmasi, atau cross H1 SEARAH BARU yang me-reset proses
+     waiting_confirm/monitoring-M5 arah yang sama yang belum selesai. Posisi yang
+     sudah FILLED hanya bisa ditutup oleh SL/trailing/breakeven-guard.
+  5. Trailing stop aktif di rasio 1:TRAIL_ACT_R (default 10) dari jarak entry-SL.
   6. Long & Short BISA aktif bersamaan (ALLOW_HEDGE=true, default) -- baik utk
-     coin yang sama maupun lintas coin (masing2 arah punya bias & flip sendiri).
+     coin yang sama maupun lintas coin (masing2 arah independen sepenuhnya).
 
 Deploy ke Railway:
   Start command -> python backtest_web.py
@@ -41,10 +44,20 @@ FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))   # fee saa
 FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))  # fee saat TUTUP posisi = 3x fee entry
 EMA_FAST         = int(os.environ.get('EMA_FAST', '4'))
 EMA_SLOW         = int(os.environ.get('EMA_SLOW', '10'))
-TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '4.0'))        # trailing aktif di rasio 1:4
+TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '10.0'))       # trailing aktif di rasio 1:10
 TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar trailing = 1x dist
+
+# ── BREAKEVEN-GUARD -- independen dari trailing, aktif LEBIH DULU ──
+# Begitu profit floating mencapai +BE_GUARD_TRIGGER_R (default 2R) dari entry, SL langsung
+# dipindah ke +BE_GUARD_LOCK_R (default 1R) profit dari entry -- REPLACE apapun stop
+# sebelumnya (baik SL awal di -1R maupun trailing yg mungkin sudah jalan duluan kalau
+# TRAIL_ACT_R lbh kecil dari trigger ini). Hanya terjadi SEKALI per posisi (breakeven_done),
+# TIDAK naik lagi setelahnya sampai trailing (di TRAIL_ACT_R) ambil alih dgn mekanismenya
+# sendiri. Set BE_GUARD_TRIGGER_R=0 utk menonaktifkan guard ini sepenuhnya.
+BE_GUARD_TRIGGER_R = float(os.environ.get('BE_GUARD_TRIGGER_R', '2.0'))
+BE_GUARD_LOCK_R    = float(os.environ.get('BE_GUARD_LOCK_R', '1.0'))
 MIN_DIST_PCT     = float(os.environ.get('MIN_DIST_PCT', '0.002'))     # floor SL minimum 0.2%
-SL_PCT           = float(os.environ.get('SL_PCT', '0.003'))           # jarak SL = 0.3% dari entry,
+SL_PCT           = float(os.environ.get('SL_PCT', '0.004'))           # jarak SL = 0.4% dari entry,
                                                                         # MENGGANTIKAN jarak struktural candle
 ENTRY_LEVEL_PCT  = float(os.environ.get('ENTRY_LEVEL_PCT', '0.0'))     # posisi limit entry dalam range
                                                                         # candle cross: 0.0=wick low, 1.0=wick
@@ -59,8 +72,8 @@ BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', '2026-07-31')
 # dipasang -- fill, SL, trailing dicek per-M5 alih-alih per-H1 candle penuh (yg jauh lebih
 # kasar krn 1 candle H1 = 12 candle M5, urutan kejadian di dalamnya bisa ambigu kalau
 # semuanya disamakan "terjadi bersamaan"). EMA cross, gate RSI/swing/arah-candle, S/R
-# detection, dan FLIP PROTECTION tetap 100% di H1 spt biasa -- M5 murni utk presisi
-# eksekusi (kapan tepatnya fill/SL/trail kena), bukan mengubah sinyal itu sendiri.
+# detection tetap 100% di H1 spt biasa -- M5 murni utk presisi eksekusi (kapan
+# tepatnya fill/SL/trail kena), bukan mengubah sinyal itu sendiri.
 # 0/false = nonaktif (kembali ke mode H1 murni spt sebelumnya).
 M5_PRECISION_MODE = os.environ.get('M5_PRECISION_MODE', '1').strip() not in ('0', 'false', 'False', '')
 
@@ -371,10 +384,13 @@ def prepare_m5(df_m5):
     if df_m5 is None or df_m5.empty:
         return None
     df_m5 = df_m5.sort_values('ts').reset_index(drop=True)
+    ema_fast_m5 = df_m5['close'].ewm(span=EMA_FAST, adjust=False).mean().values
+    ema_slow_m5 = df_m5['close'].ewm(span=EMA_SLOW, adjust=False).mean().values
     return {
         'TS': df_m5['ts'].values.astype(np.int64),
         'O': df_m5['open'].values, 'H': df_m5['high'].values,
         'L': df_m5['low'].values, 'C': df_m5['close'].values,
+        'EMA_FAST': ema_fast_m5, 'EMA_SLOW': ema_slow_m5,
     }
 
 
@@ -524,15 +540,6 @@ def _passes_candle_direction_filter(O, C, i, direction):
         return O[i] < C[i]
     else:
         return O[i] > C[i]
-
-# ── FLIP MIN R: posisi yang SUDAH FILLED hanya ditutup oleh cross berlawanan (flip) kalau
-# CLOSE candle yang menyebabkan cross berlawanan itu (bukan candle setelahnya) sudah
-# >= FLIP_MIN_R dari entry (dihitung dari entry & jarak SL posisi itu). Contoh: entry $1.6,
-# SL $1.3 (dist=$0.3, FLIP_MIN_R=1.0) -> close candle cross harus > $1.9 baru boleh
-# membatalkan posisi Long itu. Kalau msh dibawah ambang ini (termasuk floating loss), posisi
-# DIBIARKAN jalan terus, cuma keluar lewat TRAIL/SL normal. Limit PENDING (belum filled)
-# TIDAK terpengaruh -- tetap dibatalkan seperti biasa oleh cross berlawanan, apapun nilainya.
-FLIP_MIN_R = float(os.environ.get('FLIP_MIN_R', '1.0'))
 
 # ── KONFIRMASI EMA4 H1 (SEKALI CEK) + TRIGGER M5 SWING (menggantikan limit-di-wick lama) ──
 # Setelah cross H1 lolos RSI gate/swing/candle-direction/filter (persis alur lama), TIDAK
@@ -891,7 +898,6 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
     bumped_by_min_order = 0    # counter: qty DIPAKSA NAIK krn order_value < MIN_ORDER_USD -- risk aktual > target
     blocked_by_swing = 0       # counter: dilewati krn candle sblm cross bukan swing point asli
     blocked_by_candle_direction = 0  # counter: dilewati krn candle cross tidak searah dgn cross-nya
-    flip_held_below_1r = 0     # counter: cross berlawanan MUNCUL tp posisi TIDAK ditutup krn msh <1R
     blocked_by_no_trade_session = 0   # counter: pending dibatalkan krn masuk sesi no-trade (full halt)
     closed_by_no_trade_session = 0    # counter: posisi filled ditutup paksa krn masuk sesi no-trade
 
@@ -988,6 +994,42 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
         trades.append(trade)
         del active_positions[key]
 
+    def _check_sl_trailing_one_candle(symbol, direction, key, hh, ll, candle_ts):
+        """Cek SL/breakeven-guard/trailing utk 1 posisi di 1 candle (M5 atau H1 fallback).
+        Return True kalau posisi closed di candle ini (caller harus stop iterasi utk key ini)."""
+        pos = active_positions.get(key)
+        if pos is None:
+            return False
+        if direction == 'Long':
+            if ll <= pos['stop']:
+                reason = 'TRAIL' if pos['trail_active'] else 'SL'
+                close_trade(symbol, 'Long', pos['stop'], reason, candle_ts)
+                return True
+            pos['peak'] = max(pos['peak'], hh)
+            if (BE_GUARD_TRIGGER_R > 0 and not pos['breakeven_done']
+                    and pos['peak'] >= pos['entry'] + BE_GUARD_TRIGGER_R * pos['dist']):
+                pos['stop'] = pos['entry'] + BE_GUARD_LOCK_R * pos['dist']
+                pos['breakeven_done'] = True
+            if not pos['trail_active'] and pos['peak'] >= pos['act_price']:
+                pos['trail_active'] = True
+            if pos['trail_active']:
+                pos['stop'] = max(pos['stop'], pos['peak'] - TRAIL_STOP * pos['dist'])
+        else:
+            if hh >= pos['stop']:
+                reason = 'TRAIL' if pos['trail_active'] else 'SL'
+                close_trade(symbol, 'Short', pos['stop'], reason, candle_ts)
+                return True
+            pos['peak'] = min(pos['peak'], ll)
+            if (BE_GUARD_TRIGGER_R > 0 and not pos['breakeven_done']
+                    and pos['peak'] <= pos['entry'] - BE_GUARD_TRIGGER_R * pos['dist']):
+                pos['stop'] = pos['entry'] - BE_GUARD_LOCK_R * pos['dist']
+                pos['breakeven_done'] = True
+            if not pos['trail_active'] and pos['peak'] <= pos['act_price']:
+                pos['trail_active'] = True
+            if pos['trail_active']:
+                pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
+        return False
+
     n_ts = len(timeline)
     for step, ts in enumerate(timeline):
         if step % 500 == 0:
@@ -1031,37 +1073,26 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
             death_cross  = ema_fast[i-1] >= ema_slow[i-1] and ema_fast[i] < ema_slow[i]
             golden_cross = ema_fast[i-1] <= ema_slow[i-1] and ema_fast[i] > ema_slow[i]
 
-            # ── 1) FLIP PROTECTION murni EMA cross (TANPA syarat RSI) — cross berlawanan
-            #    LANGSUNG membatalkan limit pending (tidak ada urusan profit, blm ada entry).
-            #    Untuk posisi FILLED: HANYA ditutup kalau CLOSE candle yang menyebabkan cross
-            #    berlawanan (C_[i], candle cross itu sendiri -- BUKAN candle setelahnya) SUDAH
-            #    >= FLIP_MIN_R dari entry (dihitung dari entry & dist posisi itu). Kalau msh
-            #    < FLIP_MIN_R (termasuk floating loss), posisi DIBIARKAN jalan terus -- cuma
-            #    keluar lewat TRAIL/SL normal di bagian (2). Eksekusi close tetap di O[i+1]
-            #    (konsisten dgn model eksekusi entry/exit lain di backtest ini), tapi
-            #    KEPUTUSANnya berdasarkan close candle cross. ──
-            if death_cross:
-                pending.pop(key_long, None)
+            # ── 1) TIDAK ADA FLIP PROTECTION LINTAS ARAH -- Long & Short berjalan PARALEL
+            #    PENUH, saling tidak mengganggu. Satu2nya "pembatalan" yg tersisa:
+            #    - waiting_confirm: dibatalkan oleh body-break EMA4 di candle konfirmasi
+            #      (bagian 5b) -- TIDAK oleh cross arah lain.
+            #    - armed_m5 (monitoring M5 sedang berjalan): HANYA bisa dibatalkan/di-RESET
+            #      oleh cross H1 SEARAH yang BARU (mis. golden cross baru muncul saat masih
+            #      ada proses Long lama yg blm selesai) -- proses lama dihapus, mulai lagi dari
+            #      cross baru itu (via bagian 4+5 di bawah, yg akan mengisi waiting_confirm lagi
+            #      krn armed_m5 lama sudah dihapus di sini).
+            #    - active_positions (sudah FILLED): TIDAK ADA yg bisa membatalkan kecuali
+            #      SL/trailing/breakeven-guard normal (bagian 2). Cross apapun (searah atau
+            #      berlawanan) TIDAK menyentuh posisi yg sudah terisi. ──
+            if golden_cross:
                 waiting_confirm.pop(key_long, None)
                 armed_m5.pop(key_long, None)
-                pos_long = active_positions.get(key_long)
-                if pos_long is not None and pos_long['dist'] > 0:
-                    current_r = (C_[i] - pos_long['entry']) / pos_long['dist']
-                    if current_r >= FLIP_MIN_R - 1e-9:
-                        close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
-                    else:
-                        flip_held_below_1r += 1
-            if golden_cross:
-                pending.pop(key_short, None)
+                pending.pop(key_long, None)    # legacy mode: reset arah SEARAH (golden->Long)
+            if death_cross:
                 waiting_confirm.pop(key_short, None)
                 armed_m5.pop(key_short, None)
-                pos_short = active_positions.get(key_short)
-                if pos_short is not None and pos_short['dist'] > 0:
-                    current_r = (pos_short['entry'] - C_[i]) / pos_short['dist']
-                    if current_r >= FLIP_MIN_R - 1e-9:
-                        close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
-                    else:
-                        flip_held_below_1r += 1
+                pending.pop(key_short, None)   # legacy mode: reset arah SEARAH (death->Short)
 
             # ── 2+3) SL/TRAILING + FILL PENDING — presisi M5 kalau tersedia, fallback H1 ──
             m5w = _m5_window_for(symbol, i, TS)
@@ -1075,29 +1106,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                     m5_ts = int(m5w['TS'][mi])
                     # -- 2) SL/trailing (posisi yg SUDAH filled) --
                     for direction, key in (('Short', key_short), ('Long', key_long)):
-                        pos = active_positions.get(key)
-                        if pos is None:
-                            continue
-                        if direction == 'Long':
-                            if ll <= pos['stop']:
-                                reason = 'TRAIL' if pos['trail_active'] else 'SL'
-                                close_trade(symbol, 'Long', pos['stop'], reason, m5_ts)
-                                continue
-                            pos['peak'] = max(pos['peak'], hh)
-                            if not pos['trail_active'] and pos['peak'] >= pos['act_price']:
-                                pos['trail_active'] = True
-                            if pos['trail_active']:
-                                pos['stop'] = max(pos['stop'], pos['peak'] - TRAIL_STOP * pos['dist'])
-                        else:
-                            if hh >= pos['stop']:
-                                reason = 'TRAIL' if pos['trail_active'] else 'SL'
-                                close_trade(symbol, 'Short', pos['stop'], reason, m5_ts)
-                                continue
-                            pos['peak'] = min(pos['peak'], ll)
-                            if not pos['trail_active'] and pos['peak'] <= pos['act_price']:
-                                pos['trail_active'] = True
-                            if pos['trail_active']:
-                                pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
+                        _check_sl_trailing_one_candle(symbol, direction, key, hh, ll, m5_ts)
                     # -- 3) fill pending (limit blm filled) --
                     for direction, key in (('Short', key_short), ('Long', key_long)):
                         p = pending.get(key)
@@ -1133,6 +1142,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                                 active_positions[key] = {
                                     'entry': p['entry'], 'sl': p['sl'], 'dist': dist, 'stop': p['sl'],
                                     'trail_active': False, 'peak': p['entry'], 'act_price': act_price,
+                                    'breakeven_done': False,
                                     'qty': qty, 'entry_ts': m5_ts, 'ind': ind,
                                 }
                                 del pending[key]
@@ -1140,30 +1150,8 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                 # ── FALLBACK MODE H1 (data M5 tdk tersedia utk symbol ini, atau mode nonaktif) ──
                 # -- 2) SL / trailing normal --
                 for direction, key in (('Short', key_short), ('Long', key_long)):
-                    pos = active_positions.get(key)
-                    if pos is None:
-                        continue
                     h, l = H[i], L[i]
-                    if direction == 'Long':
-                        if l <= pos['stop']:
-                            reason = 'TRAIL' if pos['trail_active'] else 'SL'
-                            close_trade(symbol, 'Long', pos['stop'], reason, int(TS[i]))
-                            continue
-                        pos['peak'] = max(pos['peak'], h)
-                        if not pos['trail_active'] and pos['peak'] >= pos['act_price']:
-                            pos['trail_active'] = True
-                        if pos['trail_active']:
-                            pos['stop'] = max(pos['stop'], pos['peak'] - TRAIL_STOP * pos['dist'])
-                    else:
-                        if h >= pos['stop']:
-                            reason = 'TRAIL' if pos['trail_active'] else 'SL'
-                            close_trade(symbol, 'Short', pos['stop'], reason, int(TS[i]))
-                            continue
-                        pos['peak'] = min(pos['peak'], l)
-                        if not pos['trail_active'] and pos['peak'] <= pos['act_price']:
-                            pos['trail_active'] = True
-                        if pos['trail_active']:
-                            pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
+                    _check_sl_trailing_one_candle(symbol, direction, key, h, l, int(TS[i]))
 
                 # -- 3) cek fill pending (limit di wick), TUNDUK ke MARGIN (leverage) --
                 for direction, key in (('Short', key_short), ('Long', key_long)):
@@ -1210,6 +1198,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                             active_positions[key] = {
                                 'entry': p['entry'], 'sl': p['sl'], 'dist': dist, 'stop': p['sl'],
                                 'trail_active': False, 'peak': p['entry'], 'act_price': act_price,
+                                    'breakeven_done': False,
                                 'qty': qty, 'entry_ts': int(TS[i]), 'ind': ind,
                             }
                             del pending[key]
@@ -1303,44 +1292,49 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                         else:
                             waiting_confirm[key_long] = {'cross_i': i, 'ind': ind}
 
-                # ── 5b) KONFIRMASI EMA4 H1 -- HANYA DICEK SEKALI, di candle TEPAT SETELAH
-                # cross (cross_i == i-1, alias wc['cross_i'] == i-1). Body-break -> batal
+                # ── 5b) KONFIRMASI EMA4 H1 -- dicek di candle INI (i) utk sinyal yg sedang
+                # 'waiting_confirm' dari cross SEBELUMNYA (cross_i < i). Body-break -> batal
                 # total. Wick-touch + close searah -> lolos, mulai armed_m5 dari candle
-                # BERIKUTNYA (i+1). NETRAL (bukan keduanya) -> setup GAGAL juga -- TIDAK
-                # ditunggu lagi di candle-candle selanjutnya (beda dari versi sebelumnya). ──
+                # BERIKUTNYA (i+1). Belum keduanya -> tetap menunggu, cek lagi candle depan. ──
                 for direction, key in (('Short', key_short), ('Long', key_long)):
                     wc = waiting_confirm.get(key)
-                    if wc is None or wc['cross_i'] != i - 1:
-                        continue   # bukan candle tepat setelah cross utk sinyal ini -> lewati
+                    if wc is None or wc['cross_i'] >= i:
+                        continue   # belum ada sinyal menunggu, atau ini candle cross itu sendiri
                     if _ema4_body_break(O, C_, ema_fast, i, direction):
                         blocked_by_ema4_break += 1
+                        del waiting_confirm[key]
                     elif _ema4_wick_confirm(H, L, C_, ema_fast, i, direction):
                         armed_m5[key] = {'ind': wc['ind'], 'from_i': i,
                                           'swing_idx': None, 'swing_level': None,
-                                          'scan_from': None}
-                    else:
-                        # netral: wick tidak menyentuh EMA4 sama sekali (atau menyentuh tapi
-                        # close berlawanan bias) -> setup gagal, HANYA dicek 1x jd tidak
-                        # ditunggu lagi di candle berikutnya.
-                        blocked_by_ema4_neutral += 1
-                    del waiting_confirm[key]   # apapun hasilnya, selesai -- hanya 1x cek
+                                          'scan_from': None, 'swing_touched_idx': None,
+                                          'ema_scan_from': None, 'limit_price': None,
+                                          'limit_scan_from': None}
+                        del waiting_confirm[key]
+                    # else: belum body-break maupun wick-confirm -> tetap waiting_confirm,
+                    # dicek lagi di candle H1 berikutnya (loop natural krn tidak dihapus).
 
-                # ── 5c) MONITORING M5 BERBASIS SWING -- utk sinyal yg sudah 'armed_m5' DAN
-                # candle H1 ini (i) adalah candle SETELAH konfirmasi ('from_i' < i). Kerja di
-                # ARRAY M5 ABSOLUT (bukan window per-H1) krn swing butuh melongok candle M5
-                # lintas batas jam. `max_idx` dibatasi TS[i+1] (akhir candle H1 SAAT INI) --
-                # inilah batas "candle M5 yg sudah benar-benar terjadi sejauh simulasi berjalan
-                # ke jam ini", mencegah look-ahead. Tahap per key:
-                #   a) swing_level belum ada -> scan cari swing PERTAMA yg valid (butuh
-                #      SWING_M5_RIGHT candle M5 setelah calon swing, dibatasi max_idx).
-                #      Kalau ketemu -> simpan sbg patokan TETAP. Kalau belum (data blm cukup)
-                #      -> tetap armed_m5, coba lagi di candle H1 berikutnya (max_idx lbh besar).
-                #   b) swing_level sudah ada -> scan candle M5 SETELAH swing_idx (yg belum
-                #      pernah discan) apakah WICK menyentuh level -> begitu ketemu, MARKET
-                #      ORDER di close candle M5 itu.
-                # Fallback tanpa data M5 sama sekali: proxy pakai close candle H1 ini (sama
-                # spt sebelumnya), krn swing structural butuh data M5 & tidak bisa direplikasi
-                # dari H1 semata.
+                # ── 5c) MONITORING M5 -- 4 TAHAP BERURUTAN, dikerjakan di ARRAY M5 ABSOLUT
+                # (bukan window per-H1) krn semua tahap butuh melongok candle M5 lintas batas
+                # jam. `max_idx` dibatasi TS[i+1] (akhir candle H1 SAAT INI) -- batas "candle
+                # M5 yg sudah benar-benar terjadi sejauh simulasi berjalan ke jam ini", mencegah
+                # look-ahead. Tahap per key (state persisten di dict armed_m5[key]):
+                #   a) swing_level None -> cari SWING POINT M5 pertama valid searah bias (low/
+                #      high candle tsb tdk terlampaui oleh SWING_M5_RIGHT candle setelahnya).
+                #      Ketemu -> jadi patokan TETAP (swing_level, swing_idx).
+                #   b) swing_level ada, swing_touched_idx None -> tunggu candle M5 SETELAH
+                #      swing_idx yg WICK-nya menyentuh swing_level. Ketemu -> catat
+                #      swing_touched_idx (BUKAN entry -- cuma trigger utk mulai cari EMA cross).
+                #   c) swing_touched_idx ada, limit_price None -> MULAI dari swing_touched_idx,
+                #      cari EMA4/EMA10 M5 CROSS SEARAH bias (golden cross utk Long, death cross
+                #      utk Short), tanpa batas waktu. Ketemu -> limit_price = low candle cross
+                #      itu (Long) / high candle cross itu (Short); limit_scan_from = candle
+                #      SETELAH candle cross (limit BELUM fill di candle cross itu sendiri).
+                #   d) limit_price ada -> tunggu candle M5 SETELAHNYA yg WICK-nya menyentuh
+                #      limit_price (Long: low <= limit; Short: high >= limit) -> ENTRY di harga
+                #      limit_price itu sendiri (bukan close candle penyentuh -- ini limit order
+                #      sungguhan, fill persis di harga limit).
+                # Fallback tanpa data M5 sama sekali: proxy pakai close candle H1 ini (spt
+                # sebelumnya), krn swing & EMA M5 butuh data M5 & tidak bisa direplikasi dari H1.
                 for direction, key in (('Short', key_short), ('Long', key_long)):
                     am = armed_m5.get(key)
                     if am is None or am['from_i'] >= i or key in active_positions:
@@ -1351,16 +1345,13 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                     if M5_PRECISION_MODE and m5 is not None and len(m5['TS']) > 0:
                         max_idx = int(np.searchsorted(m5['TS'], int(TS[i + 1]), side='left'))
                         m5_L, m5_H, m5_C, m5_TS = m5['L'], m5['H'], m5['C'], m5['TS']
+                        m5_ef, m5_es = m5['EMA_FAST'], m5['EMA_SLOW']
 
                         if am['swing_level'] is None:
-                            # tahap a) belum ada swing patokan -- mulai scan dari awal window
-                            # konfirmasi (from_i+1, dikonversi ke index M5) kalau blm pernah
-                            # discan, atau lanjut dari scan_from kalau sudah pernah dicoba.
+                            # tahap a) belum ada swing patokan.
                             if am['scan_from'] is None:
-                                # Monitoring M5 dimulai BUKAN pas candle H1 berikutnya genap
-                                # jam, tapi +5 menit setelah candle H1 sebelumnya close --
-                                # candle M5 PERTAMA dlm jam itu (mis. 09:00-09:05) dilewati,
-                                # candle M5 KEDUA (09:05) yg jadi titik awal scan.
+                                # Monitoring M5 dimulai +5 menit setelah candle H1 berikutnya
+                                # buka -- candle M5 pertama dlm jam itu dilewati.
                                 monitor_start_ts = int(TS[am['from_i'] + 1]) + 5 * 60_000
                                 start_idx = int(np.searchsorted(m5_TS, monitor_start_ts, side='left'))
                             else:
@@ -1369,39 +1360,65 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                             if s_idx is not None:
                                 am['swing_idx'] = s_idx
                                 am['swing_level'] = s_level
-                                # scan wick-touch mulai dari candle SETELAH swing_idx
-                                am['scan_from'] = s_idx + 1
+                                am['scan_from'] = s_idx + 1   # scan wick-touch mulai stlh swing_idx
                             else:
-                                # belum ketemu swing valid dlm data yg sudah ada -- simpan
-                                # posisi scan biar candle H1 berikutnya lanjut dari sana,
-                                # tidak scan ulang dari awal.
                                 am['scan_from'] = max(start_idx, max_idx - SWING_M5_RIGHT - 1, start_idx)
 
-                        if am['swing_level'] is not None:
-                            # tahap b) sudah ada swing patokan -- cari candle M5 pertama sejak
-                            # scan_from yg WICK-nya menyentuh level.
+                        if am['swing_level'] is not None and am['swing_touched_idx'] is None:
+                            # tahap b) swing ada, tunggu wick menyentuh level -- BUKAN entry,
+                            # cuma trigger utk mulai cari EMA cross M5 (tahap c).
                             level = am['swing_level']
                             k = am['scan_from']
                             while k < max_idx:
                                 touched = (m5_L[k] <= level) if direction == 'Long' else (m5_H[k] >= level)
                                 if touched:
-                                    entry_price = m5_C[k]
-                                    entry_ts_final = int(m5_TS[k])
+                                    am['swing_touched_idx'] = k
+                                    am['ema_scan_from'] = k   # cari EMA cross MULAI DARI candle penyentuh ini
                                     break
                                 k += 1
                             am['scan_from'] = max(k, am['scan_from'])
+
+                        if am['swing_touched_idx'] is not None and am['limit_price'] is None:
+                            # tahap c) swing sudah tersentuh -- cari EMA4/EMA10 M5 CROSS searah
+                            # bias, mulai dari candle penyentuh swing (ema_scan_from), tanpa
+                            # batas waktu. k harus >= 1 (butuh k-1 utk bandingkan cross).
+                            k = max(am['ema_scan_from'], 1)
+                            while k < max_idx:
+                                if direction == 'Long':
+                                    cross5 = m5_ef[k-1] <= m5_es[k-1] and m5_ef[k] > m5_es[k]
+                                else:
+                                    cross5 = m5_ef[k-1] >= m5_es[k-1] and m5_ef[k] < m5_es[k]
+                                if cross5:
+                                    am['limit_price'] = m5_L[k] if direction == 'Long' else m5_H[k]
+                                    am['limit_scan_from'] = k + 1   # limit BELUM fill di candle cross itu sendiri
+                                    break
+                                k += 1
+                            am['ema_scan_from'] = max(k, am['ema_scan_from'])
+
+                        if am['limit_price'] is not None:
+                            # tahap d) limit sudah dipasang -- tunggu candle M5 SETELAHNYA yg
+                            # WICK-nya menyentuh harga limit -> fill PERSIS di harga limit itu.
+                            level = am['limit_price']
+                            k = am['limit_scan_from']
+                            while k < max_idx:
+                                touched = (m5_L[k] <= level) if direction == 'Long' else (m5_H[k] >= level)
+                                if touched:
+                                    entry_price = level   # fill di harga LIMIT, bukan close candle
+                                    entry_ts_final = int(m5_TS[k])
+                                    break
+                                k += 1
+                            am['limit_scan_from'] = max(k, am['limit_scan_from'])
                     if entry_price is None:
                         if m5 is None or not M5_PRECISION_MODE:
                             # FALLBACK tanpa data M5 sama sekali: proxy pakai close candle H1
                             # INI, hanya kalau candle H1 ini sendiri jg cross searah bias (cara
-                            # kasar, sama spt mode EMA M5 sebelumnya, mencegah sinyal macet
-                            # selamanya kalau data M5 memang tidak tersedia).
+                            # kasar, mencegah sinyal macet selamanya kalau data M5 tdk tersedia).
                             if direction == 'Long' and golden_cross:
                                 entry_price = C_[i]; entry_ts_final = int(TS[i])
                             elif direction == 'Short' and death_cross:
                                 entry_price = C_[i]; entry_ts_final = int(TS[i])
                         if entry_price is None:
-                            continue   # msh menunggu (swing blm valid / wick blm menyentuh)
+                            continue   # msh menunggu (salah satu dari tahap a/b/c/d blm lolos)
 
                     dist = entry_price * SL_PCT
                     min_dist = entry_price * MIN_DIST_PCT
@@ -1439,9 +1456,23 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                     active_positions[key] = {
                         'entry': entry_price, 'sl': sl_price, 'dist': dist, 'stop': sl_price,
                         'trail_active': False, 'peak': entry_price, 'act_price': act_price,
+                                    'breakeven_done': False,
                         'qty': qty, 'entry_ts': entry_ts_final, 'ind': ind,
                     }
                     del armed_m5[key]
+                    # ── CATCH-UP: posisi baru ini entry di TENGAH window H1 (candle M5 index
+                    # `entry_k`), tapi loop SL/trailing utama (bagian 2, di atas) sudah lewat
+                    # candle2 M5 window ini SEBELUM posisi ini ada. Tanpa catch-up, posisi baru
+                    # baru mulai "dijaga" SL/trailing/breakeven-guard di JAM BERIKUTNYA -- celah
+                    # sampai 1 jam. Proses sisa candle M5 (dari SETELAH entry_k sampai max_idx)
+                    # SEKARANG, di window H1 yg sama, spy presisi konsisten dgn posisi lain. ──
+                    if M5_PRECISION_MODE and m5 is not None and len(m5['TS']) > 0:
+                        entry_k = int(np.searchsorted(m5['TS'], entry_ts_final, side='left'))
+                        for kk in range(entry_k + 1, max_idx):
+                            if key not in active_positions:
+                                break   # sudah closed oleh candle M5 sebelumnya dlm catch-up ini
+                            _check_sl_trailing_one_candle(symbol, direction, key,
+                                                           m5['H'][kk], m5['L'][kk], int(m5['TS'][kk]))
 
     wins = [t for t in trades if t['r_mult'] > 0]
     total_pnl = sum(t['pnl_usd'] for t in trades)
@@ -1453,7 +1484,6 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
         'blocked_by_min_order': blocked_by_min_order, 'bumped_by_min_order': bumped_by_min_order,
         'blocked_by_swing': blocked_by_swing,
         'blocked_by_candle_direction': blocked_by_candle_direction,
-        'flip_held_below_1r': flip_held_below_1r,
         'blocked_by_no_trade_session': blocked_by_no_trade_session,
         'closed_by_no_trade_session': closed_by_no_trade_session,
         'blocked_by_ema4_break': blocked_by_ema4_break,
@@ -1876,7 +1906,6 @@ def _render_html() -> bytes:
     bumped_min_order = cr.get('bumped_by_min_order', 0)
     blocked_swing = cr.get('blocked_by_swing', 0)
     blocked_candle_dir = cr.get('blocked_by_candle_direction', 0)
-    flip_held = cr.get('flip_held_below_1r', 0)
     blocked_nts = cr.get('blocked_by_no_trade_session', 0)
     closed_nts = cr.get('closed_by_no_trade_session', 0)
     blocked_ema4_break = cr.get('blocked_by_ema4_break', 0)
@@ -1892,7 +1921,7 @@ def _render_html() -> bytes:
           <th>Blokir: Arah Candle</th>
           <th>Blokir: EMA4 Body-Break</th>
           <th>Blokir: EMA4 Netral</th>
-          <th>Flip Ditahan (&lt;1R)</th><th>No-Trade: Pending Batal</th><th>No-Trade: Posisi Ditutup</th></tr>
+          <th>No-Trade: Pending Batal</th><th>No-Trade: Posisi Ditutup</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
@@ -1914,7 +1943,6 @@ def _render_html() -> bytes:
         <td class="y">{blocked_candle_dir}</td>
         <td class="y">{blocked_ema4_break}</td>
         <td class="y">{blocked_ema4_neutral}</td>
-        <td class="y">{flip_held}</td>
         <td class="y">{blocked_nts}</td>
         <td class="y">{closed_nts}</td>
       </tr>
@@ -1930,12 +1958,13 @@ def _render_html() -> bytes:
     dan TIDAK ADA entry/setup baru sampai sesi berakhir. Beda dari <code>SESSION_BLOCK_LIST</code>
     (yang cuma mencegah fill baru, posisi lama tetap jalan) — ini menghentikan trading total.
     Atur via env var <code>NO_TRADE_SESSIONS</code> (comma-separated, kosongkan utk nonaktifkan).</p>
-    <p style="font-size:12px;color:#8b949e">Flip protection: posisi filled HANYA ditutup oleh cross
-    berlawanan kalau <b>CLOSE candle yang menyebabkan cross</b> itu sudah <b>≥ {FLIP_MIN_R:.1f}R</b> dari
-    entry (dihitung dari entry & jarak SL posisi itu — misal entry $1.6, SL $1.3, dist=$0.3, maka
-    close candle cross harus di atas $1.9 baru boleh membatalkan Long). Dibawah ambang ini (kolom
-    "Flip Ditahan") posisi dibiarkan jalan, cuma keluar lewat TRAIL/SL normal. Limit pending TETAP
-    dibatalkan seperti biasa, tidak terpengaruh ambang ini. Atur via env var <code>FLIP_MIN_R</code>.</p>
+    <p style="font-size:12px;color:#8b949e">Long & Short berjalan <b>PARALEL PENUH</b>, tidak ada flip
+    protection lintas arah — cross berlawanan (mis. death cross saat masih ada proses Long) TIDAK
+    menyentuh apapun milik arah lain. Satu2nya pembatalan yg tersisa: (1) body-break EMA4 di candle
+    konfirmasi (lihat "Blokir: EMA4 Body-Break"), (2) cross H1 SEARAH yang BARU me-reset proses
+    <code>waiting_confirm</code>/monitoring-M5 arah yg sama yg belum selesai (mulai lagi dari cross
+    baru), (3) SL/trailing/breakeven-guard normal setelah posisi FILLED — begitu posisi terisi, tidak
+    ada cross apapun (searah maupun berlawanan) yang bisa membatalkannya lagi.</p>
     <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
     <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
     terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Fee: entry
