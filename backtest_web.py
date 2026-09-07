@@ -41,7 +41,7 @@ FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))   # fee saa
 FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))  # fee saat TUTUP posisi = 3x fee entry
 EMA_FAST         = int(os.environ.get('EMA_FAST', '4'))
 EMA_SLOW         = int(os.environ.get('EMA_SLOW', '10'))
-TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '10.0'))       # trailing aktif di rasio 1:10
+TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '5.0'))        # trailing aktif di rasio 1:5
 TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar trailing = 1x dist
 
 # ── BREAKEVEN-GUARD -- independen dari trailing, aktif LEBIH DULU ──
@@ -54,7 +54,7 @@ TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar tr
 BE_GUARD_TRIGGER_R = float(os.environ.get('BE_GUARD_TRIGGER_R', '2.0'))
 BE_GUARD_LOCK_R    = float(os.environ.get('BE_GUARD_LOCK_R', '1.0'))
 MIN_DIST_PCT     = float(os.environ.get('MIN_DIST_PCT', '0.002'))     # floor SL minimum 0.2%
-SL_PCT           = float(os.environ.get('SL_PCT', '0.004'))           # jarak SL = 0.4% dari entry,
+SL_PCT           = float(os.environ.get('SL_PCT', '0.008'))           # jarak SL = 0.8% dari entry,
                                                                         # MENGGANTIKAN jarak struktural candle
 ENTRY_LEVEL_PCT  = float(os.environ.get('ENTRY_LEVEL_PCT', '0.0'))     # posisi limit entry dalam range
                                                                         # candle cross: 0.0=wick low, 1.0=wick
@@ -381,13 +381,10 @@ def prepare_m5(df_m5):
     if df_m5 is None or df_m5.empty:
         return None
     df_m5 = df_m5.sort_values('ts').reset_index(drop=True)
-    ema_fast_m5 = df_m5['close'].ewm(span=EMA_FAST, adjust=False).mean().values
-    ema_slow_m5 = df_m5['close'].ewm(span=EMA_SLOW, adjust=False).mean().values
     return {
         'TS': df_m5['ts'].values.astype(np.int64),
         'O': df_m5['open'].values, 'H': df_m5['high'].values,
         'L': df_m5['low'].values, 'C': df_m5['close'].values,
-        'EMA_FAST': ema_fast_m5, 'EMA_SLOW': ema_slow_m5,
     }
 
 
@@ -558,13 +555,15 @@ FLIP_MIN_R = float(os.environ.get('FLIP_MIN_R', '1.0'))
 #   - LOLOS (konfirmasi OK) kalau WICK candle j menyentuh EMA4 TAPI close masih searah bias:
 #     golden cross -> low[j] <= EMA4[j] dan close[j] > EMA4[j]. Death cross -> high[j] >=
 #     EMA4[j] dan close[j] < EMA4[j].
-#   - NETRAL (bukan body-break maupun wick-confirm, mis. wick sama sekali tidak menyentuh
-#     EMA4) -> setup JUGA GAGAL (counter: blocked_by_ema4_neutral). TIDAK ditunggu lagi di
-#     candle-candle berikutnya -- cukup 1x kesempatan cek di candle j ini saja.
+#   - Kalau belum body-break dan belum lolos -> tetap tunggu, cek lagi di candle H1
+#     berikutnya (bisa berkali-kali), sampai salah satu dari 2 kondisi di atas terjadi atau
+#     muncul FLIP cross H1 berlawanan (batalkan monitoring, sama seperti flip protection biasa).
 # Begitu lolos konfirmasi di candle j, MULAI monitoring M5 dari candle H1 BERIKUTNYA (j+1),
-# dimulai 5 menit setelah candle itu buka -- cari SWING POINT M5 pertama valid (searah bias),
-# tunggu wick M5 menyentuh level itu -> MARKET ORDER di close candle M5 itu. SL = SL_PCT% dari
-# harga entry market (bukan lagi dari wick H1 lama).
+# dimulai 5 menit setelah candle itu buka -- cari SWING POINT M5 pertama valid (searah bias).
+# Begitu swing ditemukan, LIMIT ORDER LANGSUNG dipasang PERSIS di level swing itu sendiri
+# (tanpa tahap tunggu-tersentuh atau EMA-cross lagi) -- lalu tunggu candle M5 berikutnya yg
+# WICK-nya menyentuh level itu utk FILL (entry persis di harga limit = level swing). SL =
+# SL_PCT% dari harga entry (bukan lagi dari wick H1 lama).
 EMA_CONFIRM_MODE = os.environ.get('EMA_CONFIRM_MODE', '1').strip() not in ('0', 'false', 'False', '')
 
 # ── TRIGGER M5 BERBASIS SWING (menggantikan cross EMA4/EMA10 M5 sepenuhnya) ──
@@ -1335,35 +1334,27 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                     elif _ema4_wick_confirm(H, L, C_, ema_fast, i, direction):
                         armed_m5[key] = {'ind': wc['ind'], 'from_i': i,
                                           'swing_idx': None, 'swing_level': None,
-                                          'scan_from': None, 'swing_touched_idx': None,
-                                          'ema_scan_from': None, 'limit_price': None,
+                                          'scan_from': None, 'limit_price': None,
                                           'limit_scan_from': None}
                         del waiting_confirm[key]
                     # else: belum body-break maupun wick-confirm -> tetap waiting_confirm,
                     # dicek lagi di candle H1 berikutnya (loop natural krn tidak dihapus).
 
-                # ── 5c) MONITORING M5 -- 4 TAHAP BERURUTAN, dikerjakan di ARRAY M5 ABSOLUT
-                # (bukan window per-H1) krn semua tahap butuh melongok candle M5 lintas batas
-                # jam. `max_idx` dibatasi TS[i+1] (akhir candle H1 SAAT INI) -- batas "candle
-                # M5 yg sudah benar-benar terjadi sejauh simulasi berjalan ke jam ini", mencegah
+                # ── 5c) MONITORING M5 -- 2 TAHAP BERURUTAN, dikerjakan di ARRAY M5 ABSOLUT
+                # (bukan window per-H1) krn swing butuh melongok candle M5 lintas batas jam.
+                # `max_idx` dibatasi TS[i+1] (akhir candle H1 SAAT INI) -- batas "candle M5 yg
+                # sudah benar-benar terjadi sejauh simulasi berjalan ke jam ini", mencegah
                 # look-ahead. Tahap per key (state persisten di dict armed_m5[key]):
                 #   a) swing_level None -> cari SWING POINT M5 pertama valid searah bias (low/
                 #      high candle tsb tdk terlampaui oleh SWING_M5_RIGHT candle setelahnya).
-                #      Ketemu -> jadi patokan TETAP (swing_level, swing_idx).
-                #   b) swing_level ada, swing_touched_idx None -> tunggu candle M5 SETELAH
-                #      swing_idx yg WICK-nya menyentuh swing_level. Ketemu -> catat
-                #      swing_touched_idx (BUKAN entry -- cuma trigger utk mulai cari EMA cross).
-                #   c) swing_touched_idx ada, limit_price None -> MULAI dari swing_touched_idx,
-                #      cari EMA4/EMA10 M5 CROSS SEARAH bias (golden cross utk Long, death cross
-                #      utk Short), tanpa batas waktu. Ketemu -> limit_price = low candle cross
-                #      itu (Long) / high candle cross itu (Short); limit_scan_from = candle
-                #      SETELAH candle cross (limit BELUM fill di candle cross itu sendiri).
-                #   d) limit_price ada -> tunggu candle M5 SETELAHNYA yg WICK-nya menyentuh
-                #      limit_price (Long: low <= limit; Short: high >= limit) -> ENTRY di harga
-                #      limit_price itu sendiri (bukan close candle penyentuh -- ini limit order
-                #      sungguhan, fill persis di harga limit).
+                #      Ketemu -> LANGSUNG jadi limit_price (limit dipasang PERSIS di level
+                #      swing itu sendiri, tanpa tahap tunggu-tersentuh atau EMA-cross lagi).
+                #   b) limit_price ada -> tunggu candle M5 SETELAH swing_idx yg WICK-nya
+                #      menyentuh limit_price (Long: low <= limit; Short: high >= limit) ->
+                #      ENTRY (fill) persis di harga limit itu sendiri.
                 # Fallback tanpa data M5 sama sekali: proxy pakai close candle H1 ini (spt
-                # sebelumnya), krn swing & EMA M5 butuh data M5 & tidak bisa direplikasi dari H1.
+                # sebelumnya), krn swing structural butuh data M5 & tidak bisa direplikasi
+                # dari H1 semata.
                 for direction, key in (('Short', key_short), ('Long', key_long)):
                     am = armed_m5.get(key)
                     if am is None or am['from_i'] >= i or key in active_positions:
@@ -1374,10 +1365,9 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                     if M5_PRECISION_MODE and m5 is not None and len(m5['TS']) > 0:
                         max_idx = int(np.searchsorted(m5['TS'], int(TS[i + 1]), side='left'))
                         m5_L, m5_H, m5_C, m5_TS = m5['L'], m5['H'], m5['C'], m5['TS']
-                        m5_ef, m5_es = m5['EMA_FAST'], m5['EMA_SLOW']
 
-                        if am['swing_level'] is None:
-                            # tahap a) belum ada swing patokan.
+                        if am['limit_price'] is None:
+                            # tahap a) belum ada swing/limit patokan.
                             if am['scan_from'] is None:
                                 # Monitoring M5 dimulai +5 menit setelah candle H1 berikutnya
                                 # buka -- candle M5 pertama dlm jam itu dilewati.
@@ -1389,44 +1379,15 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                             if s_idx is not None:
                                 am['swing_idx'] = s_idx
                                 am['swing_level'] = s_level
-                                am['scan_from'] = s_idx + 1   # scan wick-touch mulai stlh swing_idx
+                                am['limit_price'] = s_level   # limit LANGSUNG di level swing
+                                am['limit_scan_from'] = s_idx + 1   # scan fill mulai stlh swing_idx
                             else:
                                 am['scan_from'] = max(start_idx, max_idx - SWING_M5_RIGHT - 1, start_idx)
 
-                        if am['swing_level'] is not None and am['swing_touched_idx'] is None:
-                            # tahap b) swing ada, tunggu wick menyentuh level -- BUKAN entry,
-                            # cuma trigger utk mulai cari EMA cross M5 (tahap c).
-                            level = am['swing_level']
-                            k = am['scan_from']
-                            while k < max_idx:
-                                touched = (m5_L[k] <= level) if direction == 'Long' else (m5_H[k] >= level)
-                                if touched:
-                                    am['swing_touched_idx'] = k
-                                    am['ema_scan_from'] = k   # cari EMA cross MULAI DARI candle penyentuh ini
-                                    break
-                                k += 1
-                            am['scan_from'] = max(k, am['scan_from'])
-
-                        if am['swing_touched_idx'] is not None and am['limit_price'] is None:
-                            # tahap c) swing sudah tersentuh -- cari EMA4/EMA10 M5 CROSS searah
-                            # bias, mulai dari candle penyentuh swing (ema_scan_from), tanpa
-                            # batas waktu. k harus >= 1 (butuh k-1 utk bandingkan cross).
-                            k = max(am['ema_scan_from'], 1)
-                            while k < max_idx:
-                                if direction == 'Long':
-                                    cross5 = m5_ef[k-1] <= m5_es[k-1] and m5_ef[k] > m5_es[k]
-                                else:
-                                    cross5 = m5_ef[k-1] >= m5_es[k-1] and m5_ef[k] < m5_es[k]
-                                if cross5:
-                                    am['limit_price'] = m5_L[k] if direction == 'Long' else m5_H[k]
-                                    am['limit_scan_from'] = k + 1   # limit BELUM fill di candle cross itu sendiri
-                                    break
-                                k += 1
-                            am['ema_scan_from'] = max(k, am['ema_scan_from'])
-
                         if am['limit_price'] is not None:
-                            # tahap d) limit sudah dipasang -- tunggu candle M5 SETELAHNYA yg
-                            # WICK-nya menyentuh harga limit -> fill PERSIS di harga limit itu.
+                            # tahap b) limit sudah dipasang di level swing -- tunggu candle M5
+                            # SETELAHNYA yg WICK-nya menyentuh harga limit -> fill PERSIS di
+                            # harga limit itu.
                             level = am['limit_price']
                             k = am['limit_scan_from']
                             while k < max_idx:
@@ -2391,19 +2352,18 @@ def _render_html() -> bytes:
     💡 Mode entry: <b>{'KONFIRMASI EMA4 H1 + TRIGGER M5' if EMA_CONFIRM_MODE else 'LIMIT DI WICK (LEGACY)'}</b>
     (atur via env var <code>EMA_CONFIRM_MODE</code>).
     {"""Setelah cross H1 lolos RSI gate/swing/arah-candle/filter: TIDAK langsung pasang limit --
-    konfirmasi EMA4 HANYA DICEK SEKALI, di candle TEPAT SETELAH cross. Golden cross: lolos kalau
-    WICK candle itu sentuh EMA4 (low &le; EMA4) DAN close masih di atas EMA4. Death cross: high
-    &ge; EMA4 DAN close di bawah EMA4. Kalau BODY candle menembus EMA4 penuh (EMA4 di antara open
-    &amp; close) → batal (lihat kolom "Blokir: EMA4 Body-Break"). Kalau NETRAL (wick tidak
-    menyentuh EMA4 sama sekali, atau nyentuh tapi close berlawanan bias) → setup JUGA gagal (lihat
-    kolom "Blokir: EMA4 Netral") -- TIDAK ditunggu lagi di candle-candle berikutnya, cukup 1x cek.
-    Begitu konfirmasi lolos, monitoring M5 dimulai 5 menit setelah candle H1 berikutnya buka
-    (candle M5 pertama dlm jam itu dilewati) -- sistem mencari SWING POINT M5
+    tunggu candle H1 berikutnya sentuh WICK EMA4 dengan close masih searah bias (golden cross:
+    low candle &le; EMA4 &amp; close &gt; EMA4; death cross: high candle &ge; EMA4 &amp; close
+    &lt; EMA4). Kalau BODY candle malah menembus EMA4 penuh (EMA4 di antara open &amp; close) →
+    batal total (lihat kolom "Blokir: EMA4 Body-Break"). Kalau belum keduanya → tetap ditunggu
+    candle demi candle. Begitu konfirmasi lolos, monitoring M5 dimulai 5 menit setelah candle H1
+    berikutnya buka (candle M5 pertama dlm jam itu dilewati) -- sistem mencari SWING POINT M5
     PERTAMA yg valid searah bias (low/high candle M5 tsb tdk terlampaui oleh """
-    f"""<b>{SWING_M5_RIGHT}</b> candle M5 setelahnya), lalu level itu jadi patokan TETAP sampai
-    tersentuh atau flip H1. Begitu ada candle M5 berikutnya yg WICK-nya menyentuh level swing itu
-    -- MARKET ORDER langsung di close candle M5 itu. SL = <b>{SL_PCT*100:.2f}%</b> dari harga
-    entry market M5.""" if EMA_CONFIRM_MODE else f"""Entry = LIMIT di <b>{ENTRY_LEVEL_PCT*100:.0f}%</b> range
+    f"""<b>{SWING_M5_RIGHT}</b> candle M5 setelahnya). Begitu swing ditemukan, LIMIT ORDER
+    LANGSUNG dipasang PERSIS di level swing itu sendiri (tanpa tahap tunggu-tersentuh atau
+    EMA-cross lagi) -- lalu tunggu candle M5 berikutnya yg WICK-nya menyentuh level itu utk FILL,
+    entry persis di harga limit (= level swing). SL = <b>{SL_PCT*100:.2f}%</b> dari harga entry
+    itu.""" if EMA_CONFIRM_MODE else f"""Entry = LIMIT di <b>{ENTRY_LEVEL_PCT*100:.0f}%</b> range
     candle penyebab EMA cross (0%=wick, 50%=titik tengah, 100%=sisi berlawanan) — atur via env var
     <code>ENTRY_LEVEL_PCT</code>. SL = <b>{SL_PCT*100:.2f}%</b> dari entry (bukan jarak struktural
     candle) — atur via env var <code>SL_PCT</code>."""}
