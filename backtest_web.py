@@ -11,14 +11,11 @@ Strategi (hasil riset & backtest terbaik, lihat Readme.md):
   3. Entry: LIMIT order di ENTRY_LEVEL_PCT (default 0.5 = titik tengah) dari range
      candle yang menyebabkan EMA cross (EMA4/EMA10) -- 0.0 = wick asli, 1.0 = sisi
      berlawanan. SL = SL_PCT (default 0.3%) dari entry, arah berlawanan dari entry.
-  4. TIDAK ADA FLIP PROTECTION LINTAS ARAH -- Long & Short berjalan PARALEL PENUH,
-     saling tidak mengganggu. Pembatalan yang tersisa: body-break EMA4 saat
-     menunggu konfirmasi, atau cross H1 SEARAH BARU yang me-reset proses
-     waiting_confirm/monitoring-M5 arah yang sama yang belum selesai. Posisi yang
-     sudah FILLED hanya bisa ditutup oleh SL/trailing/breakeven-guard.
+  4. FLIP PROTECTION: EMA cross berlawanan muncul saat pending/aktif -> batal/tutup
+     SEKARANG, apapun P&L-nya. Bias tetap hidup, tunggu cross searah lagi.
   5. Trailing stop aktif di rasio 1:TRAIL_ACT_R (default 10) dari jarak entry-SL.
   6. Long & Short BISA aktif bersamaan (ALLOW_HEDGE=true, default) -- baik utk
-     coin yang sama maupun lintas coin (masing2 arah independen sepenuhnya).
+     coin yang sama maupun lintas coin (masing2 arah punya bias & flip sendiri).
 
 Deploy ke Railway:
   Start command -> python backtest_web.py
@@ -72,8 +69,8 @@ BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', '2026-07-31')
 # dipasang -- fill, SL, trailing dicek per-M5 alih-alih per-H1 candle penuh (yg jauh lebih
 # kasar krn 1 candle H1 = 12 candle M5, urutan kejadian di dalamnya bisa ambigu kalau
 # semuanya disamakan "terjadi bersamaan"). EMA cross, gate RSI/swing/arah-candle, S/R
-# detection tetap 100% di H1 spt biasa -- M5 murni utk presisi eksekusi (kapan
-# tepatnya fill/SL/trail kena), bukan mengubah sinyal itu sendiri.
+# detection, dan FLIP PROTECTION tetap 100% di H1 spt biasa -- M5 murni utk presisi
+# eksekusi (kapan tepatnya fill/SL/trail kena), bukan mengubah sinyal itu sendiri.
 # 0/false = nonaktif (kembali ke mode H1 murni spt sebelumnya).
 M5_PRECISION_MODE = os.environ.get('M5_PRECISION_MODE', '1').strip() not in ('0', 'false', 'False', '')
 
@@ -541,6 +538,15 @@ def _passes_candle_direction_filter(O, C, i, direction):
     else:
         return O[i] > C[i]
 
+# ── FLIP MIN R: posisi yang SUDAH FILLED hanya ditutup oleh cross berlawanan (flip) kalau
+# CLOSE candle yang menyebabkan cross berlawanan itu (bukan candle setelahnya) sudah
+# >= FLIP_MIN_R dari entry (dihitung dari entry & jarak SL posisi itu). Contoh: entry $1.6,
+# SL $1.3 (dist=$0.3, FLIP_MIN_R=1.0) -> close candle cross harus > $1.9 baru boleh
+# membatalkan posisi Long itu. Kalau msh dibawah ambang ini (termasuk floating loss), posisi
+# DIBIARKAN jalan terus, cuma keluar lewat TRAIL/SL normal. Limit PENDING (belum filled)
+# TIDAK terpengaruh -- tetap dibatalkan seperti biasa oleh cross berlawanan, apapun nilainya.
+FLIP_MIN_R = float(os.environ.get('FLIP_MIN_R', '1.0'))
+
 # ── KONFIRMASI EMA4 H1 (SEKALI CEK) + TRIGGER M5 SWING (menggantikan limit-di-wick lama) ──
 # Setelah cross H1 lolos RSI gate/swing/candle-direction/filter (persis alur lama), TIDAK
 # langsung pasang limit. Konfirmasi EMA4 HANYA DICEK SEKALI, di candle H1 TEPAT SETELAH cross
@@ -898,6 +904,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
     bumped_by_min_order = 0    # counter: qty DIPAKSA NAIK krn order_value < MIN_ORDER_USD -- risk aktual > target
     blocked_by_swing = 0       # counter: dilewati krn candle sblm cross bukan swing point asli
     blocked_by_candle_direction = 0  # counter: dilewati krn candle cross tidak searah dgn cross-nya
+    flip_held_below_1r = 0     # counter: cross berlawanan MUNCUL tp posisi TIDAK ditutup krn msh <1R
     blocked_by_no_trade_session = 0   # counter: pending dibatalkan krn masuk sesi no-trade (full halt)
     closed_by_no_trade_session = 0    # counter: posisi filled ditutup paksa krn masuk sesi no-trade
 
@@ -1073,18 +1080,18 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
             death_cross  = ema_fast[i-1] >= ema_slow[i-1] and ema_fast[i] < ema_slow[i]
             golden_cross = ema_fast[i-1] <= ema_slow[i-1] and ema_fast[i] > ema_slow[i]
 
-            # ── 1) TIDAK ADA FLIP PROTECTION LINTAS ARAH -- Long & Short berjalan PARALEL
-            #    PENUH, saling tidak mengganggu. Satu2nya "pembatalan" yg tersisa:
-            #    - waiting_confirm: dibatalkan oleh body-break EMA4 di candle konfirmasi
-            #      (bagian 5b) -- TIDAK oleh cross arah lain.
-            #    - armed_m5 (monitoring M5 sedang berjalan): HANYA bisa dibatalkan/di-RESET
-            #      oleh cross H1 SEARAH yang BARU (mis. golden cross baru muncul saat masih
-            #      ada proses Long lama yg blm selesai) -- proses lama dihapus, mulai lagi dari
-            #      cross baru itu (via bagian 4+5 di bawah, yg akan mengisi waiting_confirm lagi
-            #      krn armed_m5 lama sudah dihapus di sini).
-            #    - active_positions (sudah FILLED): TIDAK ADA yg bisa membatalkan kecuali
-            #      SL/trailing/breakeven-guard normal (bagian 2). Cross apapun (searah atau
-            #      berlawanan) TIDAK menyentuh posisi yg sudah terisi. ──
+            # ── 1) FLIP PROTECTION murni EMA cross (TANPA syarat RSI) — cross berlawanan
+            #    LANGSUNG membatalkan waiting_confirm/armed_m5/pending (tidak ada urusan
+            #    profit, blm ada entry). Untuk posisi FILLED: HANYA ditutup kalau CLOSE candle
+            #    yang menyebabkan cross berlawanan (C_[i], candle cross itu sendiri -- BUKAN
+            #    candle setelahnya) SUDAH >= FLIP_MIN_R dari entry (dihitung dari entry & dist
+            #    posisi itu). Kalau msh < FLIP_MIN_R (termasuk floating loss), posisi DIBIARKAN
+            #    jalan terus -- cuma keluar lewat TRAIL/SL/breakeven-guard normal di bagian (2).
+            #    Eksekusi close tetap di O[i+1] (konsisten dgn model eksekusi entry/exit lain
+            #    di backtest ini), tapi KEPUTUSANnya berdasarkan close candle cross.
+            #    Selain flip berlawanan, cross H1 SEARAH yang BARU juga tetap me-RESET proses
+            #    waiting_confirm/armed_m5 arah yg sama yg belum selesai (mulai lagi dari cross
+            #    baru itu) -- ini TIDAK terkait flip, jadi tetap dipertahankan. ──
             if golden_cross:
                 waiting_confirm.pop(key_long, None)
                 armed_m5.pop(key_long, None)
@@ -1093,6 +1100,28 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
                 waiting_confirm.pop(key_short, None)
                 armed_m5.pop(key_short, None)
                 pending.pop(key_short, None)   # legacy mode: reset arah SEARAH (death->Short)
+            if death_cross:
+                pending.pop(key_long, None)
+                waiting_confirm.pop(key_long, None)
+                armed_m5.pop(key_long, None)
+                pos_long = active_positions.get(key_long)
+                if pos_long is not None and pos_long['dist'] > 0:
+                    current_r = (C_[i] - pos_long['entry']) / pos_long['dist']
+                    if current_r >= FLIP_MIN_R - 1e-9:
+                        close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
+                    else:
+                        flip_held_below_1r += 1
+            if golden_cross:
+                pending.pop(key_short, None)
+                waiting_confirm.pop(key_short, None)
+                armed_m5.pop(key_short, None)
+                pos_short = active_positions.get(key_short)
+                if pos_short is not None and pos_short['dist'] > 0:
+                    current_r = (pos_short['entry'] - C_[i]) / pos_short['dist']
+                    if current_r >= FLIP_MIN_R - 1e-9:
+                        close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
+                    else:
+                        flip_held_below_1r += 1
 
             # ── 2+3) SL/TRAILING + FILL PENDING — presisi M5 kalau tersedia, fallback H1 ──
             m5w = _m5_window_for(symbol, i, TS)
@@ -1488,6 +1517,7 @@ def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: di
         'closed_by_no_trade_session': closed_by_no_trade_session,
         'blocked_by_ema4_break': blocked_by_ema4_break,
         'blocked_by_ema4_neutral': blocked_by_ema4_neutral,
+        'flip_held_below_1r': flip_held_below_1r,
         'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
         'wr': (len(wins) / len(trades) * 100) if trades else 0,
         'total_pnl': total_pnl,
@@ -1910,6 +1940,7 @@ def _render_html() -> bytes:
     closed_nts = cr.get('closed_by_no_trade_session', 0)
     blocked_ema4_break = cr.get('blocked_by_ema4_break', 0)
     blocked_ema4_neutral = cr.get('blocked_by_ema4_neutral', 0)
+    flip_held = cr.get('flip_held_below_1r', 0)
 
     summary_html = f'''
     <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
@@ -1921,7 +1952,7 @@ def _render_html() -> bytes:
           <th>Blokir: Arah Candle</th>
           <th>Blokir: EMA4 Body-Break</th>
           <th>Blokir: EMA4 Netral</th>
-          <th>No-Trade: Pending Batal</th><th>No-Trade: Posisi Ditutup</th></tr>
+          <th>Flip Ditahan (&lt;1R)</th><th>No-Trade: Pending Batal</th><th>No-Trade: Posisi Ditutup</th></tr>
       <tr>
         <td>{total_trades}</td>
         <td class="g">{total_win}</td>
@@ -1943,6 +1974,7 @@ def _render_html() -> bytes:
         <td class="y">{blocked_candle_dir}</td>
         <td class="y">{blocked_ema4_break}</td>
         <td class="y">{blocked_ema4_neutral}</td>
+        <td class="y">{flip_held}</td>
         <td class="y">{blocked_nts}</td>
         <td class="y">{closed_nts}</td>
       </tr>
@@ -1958,13 +1990,14 @@ def _render_html() -> bytes:
     dan TIDAK ADA entry/setup baru sampai sesi berakhir. Beda dari <code>SESSION_BLOCK_LIST</code>
     (yang cuma mencegah fill baru, posisi lama tetap jalan) — ini menghentikan trading total.
     Atur via env var <code>NO_TRADE_SESSIONS</code> (comma-separated, kosongkan utk nonaktifkan).</p>
-    <p style="font-size:12px;color:#8b949e">Long & Short berjalan <b>PARALEL PENUH</b>, tidak ada flip
-    protection lintas arah — cross berlawanan (mis. death cross saat masih ada proses Long) TIDAK
-    menyentuh apapun milik arah lain. Satu2nya pembatalan yg tersisa: (1) body-break EMA4 di candle
-    konfirmasi (lihat "Blokir: EMA4 Body-Break"), (2) cross H1 SEARAH yang BARU me-reset proses
-    <code>waiting_confirm</code>/monitoring-M5 arah yg sama yg belum selesai (mulai lagi dari cross
-    baru), (3) SL/trailing/breakeven-guard normal setelah posisi FILLED — begitu posisi terisi, tidak
-    ada cross apapun (searah maupun berlawanan) yang bisa membatalkannya lagi.</p>
+    <p style="font-size:12px;color:#8b949e">Flip protection: posisi filled HANYA ditutup oleh cross
+    berlawanan kalau <b>CLOSE candle yang menyebabkan cross</b> itu sudah <b>≥ {FLIP_MIN_R:.1f}R</b> dari
+    entry (dihitung dari entry & jarak SL posisi itu — misal entry $1.6, SL $1.3, dist=$0.3, maka
+    close candle cross harus di atas $1.9 baru boleh membatalkan Long). Dibawah ambang ini (kolom
+    "Flip Ditahan") posisi dibiarkan jalan, cuma keluar lewat TRAIL/SL normal. Limit pending TETAP
+    dibatalkan seperti biasa, tidak terpengaruh ambang ini. Atur via env var <code>FLIP_MIN_R</code>.
+    Selain flip berlawanan, cross H1 SEARAH yang BARU tetap me-reset proses <code>waiting_confirm</code>
+    /monitoring-M5 arah yg sama yg belum selesai (mulai lagi dari cross baru).</p>
     <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
     <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
     terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Fee: entry
