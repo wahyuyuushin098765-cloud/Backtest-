@@ -51,7 +51,7 @@ TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar tr
 # TRAIL_ACT_R lbh kecil dari trigger ini). Hanya terjadi SEKALI per posisi (breakeven_done),
 # TIDAK naik lagi setelahnya sampai trailing (di TRAIL_ACT_R) ambil alih dgn mekanismenya
 # sendiri. Set BE_GUARD_TRIGGER_R=0 utk menonaktifkan guard ini sepenuhnya.
-BE_GUARD_TRIGGER_R = float(os.environ.get('BE_GUARD_TRIGGER_R', '2.0'))
+BE_GUARD_TRIGGER_R = float(os.environ.get('BE_GUARD_TRIGGER_R', '0'))
 BE_GUARD_LOCK_R    = float(os.environ.get('BE_GUARD_LOCK_R', '1.0'))
 MIN_DIST_PCT     = float(os.environ.get('MIN_DIST_PCT', '0.002'))     # floor SL minimum 0.2%
 SL_PCT           = float(os.environ.get('SL_PCT', '0.008'))           # jarak SL = 0.8% dari entry,
