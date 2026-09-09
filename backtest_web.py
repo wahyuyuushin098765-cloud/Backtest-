@@ -1,31 +1,50 @@
 """
-backtest_web.py — Backtest strategi EMA-Cross Entry, murni TRAIL/SL exit (H1)
-==============================================================================
-Semua coin, data H1 live dari Bybit API.
+backtest_sbr.py — Backtest strategi SBR (Support/Resistance Break & Retest), H1
+================================================================================
+Kembali ke dasar: deteksi Level Support & Resistance lanjutan di H1, lalu jadi
+sinyal SBR (Support Break & Retest) begitu level itu di-test, di-break, lalu
+break-nya dikonfirmasi. Entry & manajemen presisi pakai candle M5.
 
-Strategi (hasil riset & backtest terbaik, lihat Readme.md):
-  1. Deteksi support/resistance valid (basis body candle H1, strict + validasi
-     "level sebelumnya masih hidup").
-  2. Arah DIBALIK: support valid -> bias SHORT, resistance valid -> bias LONG.
-     Bias tetap hidup untuk re-entry berulang sampai ada S/R valid baru.
-  3. Entry: LIMIT order di ENTRY_LEVEL_PCT (default 0.5 = titik tengah) dari range
-     candle yang menyebabkan EMA cross (EMA4/EMA10) -- 0.0 = wick asli, 1.0 = sisi
-     berlawanan. SL = SL_PCT (default 0.3%) dari entry, arah berlawanan dari entry.
-  4. FLIP PROTECTION: EMA cross berlawanan muncul saat pending/aktif -> batal/tutup
-     SEKARANG, apapun P&L-nya. Bias tetap hidup, tunggu cross searah lagi.
-  5. Trailing stop aktif di rasio 1:TRAIL_ACT_R (default 10) dari jarak entry-SL.
-  6. Long & Short BISA aktif bersamaan (ALLOW_HEDGE=true, default) -- baik utk
-     coin yang sama maupun lintas coin (masing2 arah punya bias & flip sendiri).
+RINGKASAN STRATEGI
+-------------------
+1) DETEKSI LEVEL (H1) — identik pola lama:
+   Support: candle c1 bearish (close<open) lalu c2 bullish (close>open).
+            Level = close[c1]. Valid kalau low candle c3 (setelahnya) TIDAK
+            lebih rendah dari body-bottom c1/c2 (low[c3] > level).
+   Resistance: kebalikannya (c1 bullish, c2 bearish). Level = close[c1].
+            Valid kalau high[c3] < level.
+
+2) JADI LEVEL "SBR" (Break & Retest) — SETELAH level terbentuk (mulai dari c3
+   dan seterusnya, scan maju candle demi candle H1):
+   a. TEST: minimal 1 candle yang wick-nya menyentuh level tapi CLOSE masih di
+      sisi aman (support: low<=level tapi close>level). Boleh lebih dari 1x.
+   b. BREAK: candle yang closenya menembus level (support: close<level).
+   c. KONFIRMASI: candle TEPAT SETELAH candle break, wick-nya TIDAK balik
+      menyentuh level itu lagi (support: low candle konfirmasi > level).
+   Begitu (a),(b),(c) semua terpenuhi -> level jadi SBR AKTIF (arah SHORT utk
+   support, LONG utk resistance), disimpan dgn status 'menunggu harga mendekat'.
+
+3) TRIGGER ENTRY (dipantau di candle M5, presisi) — SETELAH SBR aktif:
+   Selama level belum dipakai, tiap candle M5 dicek jaraknya ke level:
+     - Kalau harga masuk radius 2% dari level -> limit order dipasang PERSIS
+       di level itu (arah short utk support, long utk resistance).
+     - Selama limit terpasang, kalau wick M5 menyentuh level -> FILL persis
+       di level (harga limit).
+     - Kalau sebelum fill harga malah menjauh lagi >2% dari level -> limit
+       DIBATALKAN (order dicabut), tapi level TETAP tersimpan aktif -- bisa
+       terpasang ulang nanti kalau harga mendekat lagi dalam radius 2%.
+   SL = SL_PCT (default 1%) dari harga entry, arah berlawanan dari entry.
+   Level MATI (tidak dipakai lagi) setelah 1x FILLED (menang ataupun kalah).
 
 Deploy ke Railway:
-  Start command -> python backtest_web.py
+  Start command -> python backtest_sbr.py
   Buka domain Railway -> lihat progress & hasil di browser (auto-refresh)
 """
 
 import os, threading, time, io, csv
 from datetime import datetime, timezone, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse
 
 import numpy as np
 import pandas as pd
@@ -35,139 +54,31 @@ from pybit.unified_trading import HTTP
 # CONFIG (override via environment variable kalau perlu)
 # ============================================================
 PORT             = int(os.environ.get('PORT', 8080))
-INITIAL_BALANCE  = float(os.environ.get('INITIAL_BALANCE', '30.0'))   # modal awal, 1 AKUN BERSAMA (bukan per coin)
+INITIAL_BALANCE  = float(os.environ.get('INITIAL_BALANCE', '30.0'))   # modal awal, 1 akun bersama
 RISK_PCT         = float(os.environ.get('RISK_PCT', '0.01'))          # risk 1% balance/trade (compound)
-FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))   # fee saat BUKA posisi (taker, Bybit USDT perp)
-FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))  # fee saat TUTUP posisi = 3x fee entry
-EMA_FAST         = int(os.environ.get('EMA_FAST', '4'))
-EMA_SLOW         = int(os.environ.get('EMA_SLOW', '10'))
-TRAIL_ACT_R      = float(os.environ.get('TRAIL_ACT_R', '999'))        # trailing EFEKTIF NONAKTIF drfault -- TP_R jadi exit utama, set TRAIL_ACT_R lbh kecil dari TP_R utk pakai trailing lagi
-TRAIL_STOP       = float(os.environ.get('TRAIL_STOP', '1.0'))         # lebar trailing = 1x dist
+FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))
+FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))
 
-# ── TAKE PROFIT TETAP (LIMIT ORDER) -- independen dari trailing. Begitu posisi terbuka, TP
-# langsung "dipasang" di rasio TP_R dari entry (Long: entry + TP_R*dist; Short: entry -
-# TP_R*dist). Dieksekusi sbg LIMIT ORDER sungguhan: baru FILL kalau candle M5/H1 berikutnya
-# WICK-nya benar2 menyentuh level TP itu, fill PERSIS di harga TP (bukan close candle
-# penyentuh). Kalau dalam 1 candle SL & TP sama2 tersentuh (candle extreme), SL yg dianggap
-# kena duluan (worst-case/konservatif). TP_R=0 -> TP nonaktif sepenuhnya (exit hanya via
-# SL/trailing/breakeven-guard spt sebelumnya). Independen dari TRAIL_ACT_R -- keduanya BISA
-# aktif bersamaan (siapa lebih dulu tersentuh yg menang), tapi default TRAIL_ACT_R diset
-# sangat besar (999) supaya TP jadi satu2nya exit profit by default.
-TP_R = float(os.environ.get('TP_R', '2.0'))
+SL_PCT           = float(os.environ.get('SL_PCT', '0.01'))            # SL fix 1% dari entry
+TP_R             = float(os.environ.get('TP_R', '4.0'))               # TP fix rasio 1:4R dari entry
+APPROACH_PCT     = float(os.environ.get('APPROACH_PCT', '0.02'))      # radius 2% utk pasang/cabut limit
 
-# ── BREAKEVEN-GUARD -- independen dari trailing, aktif LEBIH DULU ──
-# Begitu profit floating mencapai +BE_GUARD_TRIGGER_R (default 2R) dari entry, SL langsung
-# dipindah ke +BE_GUARD_LOCK_R (default 1R) profit dari entry -- REPLACE apapun stop
-# sebelumnya (baik SL awal di -1R maupun trailing yg mungkin sudah jalan duluan kalau
-# TRAIL_ACT_R lbh kecil dari trigger ini). Hanya terjadi SEKALI per posisi (breakeven_done),
-# TIDAK naik lagi setelahnya sampai trailing (di TRAIL_ACT_R) ambil alih dgn mekanismenya
-# sendiri. Set BE_GUARD_TRIGGER_R=0 utk menonaktifkan guard ini sepenuhnya.
-BE_GUARD_TRIGGER_R = float(os.environ.get('BE_GUARD_TRIGGER_R', '0'))
-BE_GUARD_LOCK_R    = float(os.environ.get('BE_GUARD_LOCK_R', '1.0'))
-MIN_DIST_PCT     = float(os.environ.get('MIN_DIST_PCT', '0.002'))     # floor SL minimum 0.2%
-SL_PCT           = float(os.environ.get('SL_PCT', '0.008'))           # jarak SL = 0.8% dari entry,
-                                                                        # MENGGANTIKAN jarak struktural candle
-ENTRY_LEVEL_PCT  = float(os.environ.get('ENTRY_LEVEL_PCT', '0.0'))     # posisi limit entry dalam range
-                                                                        # candle cross: 0.0=wick low, 1.0=wick
-                                                                        # high, 0.5=titik tengah (default)
-
-# Rentang backtest: FIX (bukan "N hari terakhir") supaya data bisa di-cache & tidak
-# perlu fetch ulang dari Bybit tiap kali variable diubah. Format: YYYY-MM-DD.
-BACKTEST_START_DATE = os.environ.get('BACKTEST_START_DATE', '2025-08-01')
-BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', '2026-07-31')
-
-# ── M5 PRECISION MODE: pakai candle M5 (5 menit) HANYA utk fase presisi setelah limit
-# dipasang -- fill, SL, trailing dicek per-M5 alih-alih per-H1 candle penuh (yg jauh lebih
-# kasar krn 1 candle H1 = 12 candle M5, urutan kejadian di dalamnya bisa ambigu kalau
-# semuanya disamakan "terjadi bersamaan"). EMA cross, gate RSI/swing/arah-candle, S/R
-# detection, dan FLIP PROTECTION tetap 100% di H1 spt biasa -- M5 murni utk presisi
-# eksekusi (kapan tepatnya fill/SL/trail kena), bukan mengubah sinyal itu sendiri.
-# 0/false = nonaktif (kembali ke mode H1 murni spt sebelumnya).
-M5_PRECISION_MODE = os.environ.get('M5_PRECISION_MODE', '1').strip() not in ('0', 'false', 'False', '')
-
-# LEVERAGE & MARGIN: constraint paling realistis dari exchange asli. Risk 1% BUKAN berarti
-# ada "99 kesempatan lagi" -- tiap posisi tetap butuh MARGIN (notional/leverage), dan kalau
-# margin yg dipakai SEMUA posisi terbuka sudah habis, Bybit tidak akan izinkan order baru
-# sampai ada yg closed. Constraint inilah yg secara alami membatasi berapa banyak posisi
-# bisa dibuka bersamaan -- BUKAN cuma persentase risiko semata.
 LEVERAGE           = float(os.environ.get('LEVERAGE', '50'))
-MARGIN_USAGE_CAP    = float(os.environ.get('MARGIN_USAGE_CAP', '0.90'))   # max 90% balance dipakai jd margin
+MARGIN_USAGE_CAP    = float(os.environ.get('MARGIN_USAGE_CAP', '0.90'))
 
-# ── SIMULASI MIN ORDER SIZE & QTY ROUNDING (approksimasi Bybit real, PERSIS logika
-# place_limit_order() di bot_ema_flip.py). Tanpa ini, backtest MENGASUMSIKAN qty selalu
-# presisi penuh & risk selalu tepat RISK_PCT -- padahal di Bybit real, order kecil (modal
-# kecil) sering DIPAKSA NAIK ke MIN_ORDER_USD (risk aktual > target) atau malah DI-SKIP
-# total kalau order_value < ORDER_BUMP_FLOOR. Ini approksimasi (qty_step generik, BUKAN
-# per-coin asli dari API) -- cukup utk melihat efek MIN_ORDER_USD thd risk aktual, bukan
-# presisi tick-level per-coin.
+MAX_CONCURRENT_RAW = os.environ.get('MAX_CONCURRENT', '0').strip().lower()
+MAX_CONCURRENT = float('inf') if MAX_CONCURRENT_RAW in ('', '0', 'unlimited', 'inf') else int(MAX_CONCURRENT_RAW)
+
+ALLOW_HEDGE      = os.environ.get('ALLOW_HEDGE', 'true').lower() == 'true'
+
 SIMULATE_MIN_ORDER  = os.environ.get('SIMULATE_MIN_ORDER', '1').strip() not in ('0', 'false', 'False', '')
 MIN_ORDER_USD       = float(os.environ.get('MIN_ORDER_USD', '5.0'))
 ORDER_BUMP_FLOOR     = float(os.environ.get('ORDER_BUMP_FLOOR', '4.0'))
-QTY_STEP_APPROX      = float(os.environ.get('QTY_STEP_APPROX', '0.000001'))   # generik, halus
+QTY_STEP_APPROX      = float(os.environ.get('QTY_STEP_APPROX', '0.000001'))
 
+BACKTEST_START_DATE = os.environ.get('BACKTEST_START_DATE', '2025-08-01')
+BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', '2026-07-31')
 
-def _apply_min_order_size(raw_qty, entry_p):
-    """Replikasi persis alur place_limit_order(): round qty ke step generik, cek min_qty
-    (didekati dgn 1 step), lalu cek MIN_ORDER_USD/ORDER_BUMP_FLOOR (bump atau skip).
-    Return (qty_final, skipped_bool, bumped_bool). qty_final=0 kalau skipped."""
-    if not SIMULATE_MIN_ORDER:
-        return raw_qty, False, False
-    step = QTY_STEP_APPROX
-    qty = round(raw_qty / step) * step
-    if qty < step:   # analog "qty < min_qty" -- pakai 1 step sbg proxy min_qty generik
-        return 0, True, False
-    order_value = qty * entry_p
-    if order_value < MIN_ORDER_USD:
-        if order_value >= ORDER_BUMP_FLOOR:
-            qty = round((MIN_ORDER_USD / entry_p) / step) * step
-            if qty * entry_p < MIN_ORDER_USD:
-                qty += step
-            return qty, False, True
-        else:
-            return 0, True, False
-    return qty, False, False
-
-# MAX_CONCURRENT: default TANPA BATAS (seperti sebelumnya). Isi angka di Railway
-# Variables (mis. MAX_CONCURRENT=10) kalau mau membatasi slot global lagi.
-# 0 / kosong / 'unlimited' = tanpa batas. Dengan constraint MARGIN di atas, batas alami
-# akan tetap muncul dari margin habis, bukan cuma dari MAX_CONCURRENT.
-_mc_raw = os.environ.get('MAX_CONCURRENT', '0').strip().lower()
-MAX_CONCURRENT = float('inf') if _mc_raw in ('', '0', 'unlimited', 'inf') else int(_mc_raw)
-
-ALLOW_HEDGE      = os.environ.get('ALLOW_HEDGE', 'true').lower() == 'true'  # Long & Short boleh bareng per koin
-
-# FILTER berbasis indikator saat cross. DEFAULT AKTIF: ATR ratio >= 1.07 (candle penyebab
-# cross harus minimal sebesar volatilitas normalnya) -- dari hasil analisis, ini indikator
-# dgn spread win-rate paling konsisten & kuat. Override / matikan (isi 0) lewat Railway
-# Variables. Tiap indikator sekarang punya MIN dan MAX (0 = sisi itu nonaktif) supaya bisa
-# bikin filter "range" (misal cuma ambil yg di tengah, bukan cuma "makin besar makin bagus"),
-# karena hasil riset menunjukkan pola bucket Rendah/Sedang/Tinggi TIDAK selalu monoton.
-FILTER_MIN_ATR_RATIO   = float(os.environ.get('FILTER_MIN_ATR_RATIO', '1.07'))   # 0 = nonaktif
-FILTER_MAX_ATR_RATIO   = float(os.environ.get('FILTER_MAX_ATR_RATIO', '0'))      # 0 = nonaktif
-FILTER_MIN_VOL_RATIO   = float(os.environ.get('FILTER_MIN_VOL_RATIO', '0'))      # 0 = nonaktif
-FILTER_MAX_VOL_RATIO   = float(os.environ.get('FILTER_MAX_VOL_RATIO', '0'))      # 0 = nonaktif
-FILTER_MIN_EMA_GAP_PCT = float(os.environ.get('FILTER_MIN_EMA_GAP_PCT', '0'))    # 0 = nonaktif
-FILTER_MAX_EMA_GAP_PCT = float(os.environ.get('FILTER_MAX_EMA_GAP_PCT', '0'))    # 0 = nonaktif
-FILTER_MIN_DIST_PCT    = float(os.environ.get('FILTER_MIN_DIST_PCT', '0'))       # 0 = nonaktif
-FILTER_MAX_DIST_PCT    = float(os.environ.get('FILTER_MAX_DIST_PCT', '0'))       # 0 = nonaktif
-
-# RSI/MACD/SAR: sentinel nonaktif = string kosong (BUKAN 0), karena MACD histogram &
-# jarak-ke-SAR bisa bernilai negatif secara wajar (0 tetap nilai valid utk keduanya).
-def _env_float_opt(name):
-    raw = os.environ.get(name, '').strip()
-    return float(raw) if raw != '' else None
-
-FILTER_MIN_RSI          = _env_float_opt('FILTER_MIN_RSI')            # None = nonaktif
-FILTER_MAX_RSI          = _env_float_opt('FILTER_MAX_RSI')            # None = nonaktif
-FILTER_MIN_MACD_HIST    = _env_float_opt('FILTER_MIN_MACD_HIST_PCT')  # None = nonaktif
-FILTER_MAX_MACD_HIST    = _env_float_opt('FILTER_MAX_MACD_HIST_PCT')  # None = nonaktif
-FILTER_MIN_SAR_DIST_PCT = _env_float_opt('FILTER_MIN_SAR_DIST_PCT')   # None = nonaktif
-FILTER_MAX_SAR_DIST_PCT = _env_float_opt('FILTER_MAX_SAR_DIST_PCT')   # None = nonaktif
-
-
-# CACHE data candle H1 ke disk supaya tidak perlu fetch ulang dari Bybit tiap kali variable
-# strategi diubah. Arahkan CACHE_DIR ke mount point Railway Volume (mis. /data/cache) biar
-# persisten lintas redeploy. Tanpa Volume, cache tetap jalan tapi hilang tiap redeploy.
 CACHE_DIR = os.environ.get('CACHE_DIR', './data_cache')
 os.makedirs(CACHE_DIR, exist_ok=True)
 
@@ -180,63 +91,47 @@ SYMBOLS = [
     '1000PEPEUSDT', 'TIAUSDT', 'GALAUSDT', 'APEUSDT', 'FLOWUSDT',
 ]
 
+
+def _apply_min_order_size(raw_qty, entry_p):
+    if not SIMULATE_MIN_ORDER:
+        return raw_qty, False, False
+    step = QTY_STEP_APPROX
+    qty = round(raw_qty / step) * step
+    if qty < step:
+        return 0, True, False
+    order_value = qty * entry_p
+    if order_value < MIN_ORDER_USD:
+        if order_value >= ORDER_BUMP_FLOOR:
+            qty = round((MIN_ORDER_USD / entry_p) / step) * step
+            if qty * entry_p < MIN_ORDER_USD:
+                qty += step
+            return qty, False, True
+        else:
+            return 0, True, False
+    return qty, False, False
+
+
 def _date_to_ms(date_str):
     dt = datetime.strptime(date_str, '%Y-%m-%d').replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
 
 _START_MS = _date_to_ms(BACKTEST_START_DATE)
-_END_MS   = _date_to_ms(BACKTEST_END_DATE) + 86400 * 1000 - 1   # sampai akhir hari BACKTEST_END_DATE
+_END_MS   = _date_to_ms(BACKTEST_END_DATE) + 86400 * 1000 - 1
 
 # ============================================================
-# GLOBAL STATE (dibaca oleh HTTP handler, ditulis oleh background thread)
+# GLOBAL STATE
 # ============================================================
 _lock       = threading.Lock()
 _log        = []
-_phase      = 'running'     # running | done | error
-_results    = []            # list per-coin dict
-_all_trades = []            # semua trade, semua coin (utk CSV & agregat)
-_combined_result = {         # ringkasan hasil simulasi gabungan (1 balance, 1 pool slot)
+_phase      = 'running'
+_results    = []
+_kind_results = []
+_all_trades = []
+_combined_result = {
     'n_trades': 0, 'n_win': 0, 'n_loss': 0, 'wr': 0, 'total_pnl': 0, 'roi': 0,
     'total_r': 0, 'avg_r': 0, 'final_balance': INITIAL_BALANCE,
-    'blocked_by_slot': 0, 'blocked_by_margin': 0, 'blocked_by_filter': 0,
+    'blocked_by_slot': 0, 'blocked_by_margin': 0, 'blocked_by_min_order': 0,
 }
-_indicator_result = {}      # hasil analisis indikator saat cross (win vs loss)
-_rsi_gate_result = {}       # hasil analisis khusus RSI gate (per-nilai + bucket, terpisah Long/Short)
-_session_day_result = {}    # hasil analisis sesi trading (WIB) & hari (Senin-Minggu)
-_monthly_result = {}        # hasil analisis profit % & $ per bulan kalender (WIB)
-_no_filter_result = None    # ringkasan simulasi PEMBANDING tanpa filter (None jika tidak ada filter aktif)
-
-
-def _any_filter_active():
-    return (
-        FILTER_MIN_ATR_RATIO > 0 or FILTER_MAX_ATR_RATIO > 0 or
-        FILTER_MIN_VOL_RATIO > 0 or FILTER_MAX_VOL_RATIO > 0 or
-        FILTER_MIN_EMA_GAP_PCT > 0 or FILTER_MAX_EMA_GAP_PCT > 0 or
-        FILTER_MIN_DIST_PCT > 0 or FILTER_MAX_DIST_PCT > 0 or
-        FILTER_MIN_RSI is not None or FILTER_MAX_RSI is not None or
-        FILTER_MIN_MACD_HIST is not None or FILTER_MAX_MACD_HIST is not None or
-        FILTER_MIN_SAR_DIST_PCT is not None or FILTER_MAX_SAR_DIST_PCT is not None
-    )
-
-
-def _active_filter_summary():
-    """List string ringkas filter yg sedang aktif, utk ditampilkan di dashboard."""
-    parts = []
-    if FILTER_MIN_ATR_RATIO > 0: parts.append(f"ATR ratio ≥ {FILTER_MIN_ATR_RATIO:.2f}x")
-    if FILTER_MAX_ATR_RATIO > 0: parts.append(f"ATR ratio ≤ {FILTER_MAX_ATR_RATIO:.2f}x")
-    if FILTER_MIN_VOL_RATIO > 0: parts.append(f"Vol ratio ≥ {FILTER_MIN_VOL_RATIO:.2f}x")
-    if FILTER_MAX_VOL_RATIO > 0: parts.append(f"Vol ratio ≤ {FILTER_MAX_VOL_RATIO:.2f}x")
-    if FILTER_MIN_EMA_GAP_PCT > 0: parts.append(f"EMA gap ≥ {FILTER_MIN_EMA_GAP_PCT:.3f}%")
-    if FILTER_MAX_EMA_GAP_PCT > 0: parts.append(f"EMA gap ≤ {FILTER_MAX_EMA_GAP_PCT:.3f}%")
-    if FILTER_MIN_DIST_PCT > 0: parts.append(f"Jarak SL ≥ {FILTER_MIN_DIST_PCT:.3f}%")
-    if FILTER_MAX_DIST_PCT > 0: parts.append(f"Jarak SL ≤ {FILTER_MAX_DIST_PCT:.3f}%")
-    if FILTER_MIN_RSI is not None: parts.append(f"RSI ≥ {FILTER_MIN_RSI:.1f}")
-    if FILTER_MAX_RSI is not None: parts.append(f"RSI ≤ {FILTER_MAX_RSI:.1f}")
-    if FILTER_MIN_MACD_HIST is not None: parts.append(f"MACD hist ≥ {FILTER_MIN_MACD_HIST:+.3f}%")
-    if FILTER_MAX_MACD_HIST is not None: parts.append(f"MACD hist ≤ {FILTER_MAX_MACD_HIST:+.3f}%")
-    if FILTER_MIN_SAR_DIST_PCT is not None: parts.append(f"Jarak SAR ≥ {FILTER_MIN_SAR_DIST_PCT:+.2f}%")
-    if FILTER_MAX_SAR_DIST_PCT is not None: parts.append(f"Jarak SAR ≤ {FILTER_MAX_SAR_DIST_PCT:+.2f}%")
-    return parts
 
 
 def _ts():
@@ -250,145 +145,297 @@ def _log_msg(msg: str):
 
 
 # ============================================================
-# FETCH DATA H1 DARI BYBIT (dgn CACHE ke disk supaya tak fetch ulang tiap kali)
+# FETCH DATA DARI BYBIT (dgn CACHE ke disk)
 # ============================================================
 
-def _cache_path(symbol: str) -> str:
-    # nama file menyertakan rentang tanggal -> otomatis fetch ulang kalau rentang berubah
-    return os.path.join(CACHE_DIR, f"{symbol}_{BACKTEST_START_DATE}_{BACKTEST_END_DATE}.csv")
+def _cache_path(symbol: str, tf: str) -> str:
+    return os.path.join(CACHE_DIR, f"{symbol}_{tf}_{BACKTEST_START_DATE}_{BACKTEST_END_DATE}.csv")
 
 
-def _load_cache(symbol: str):
-    path = _cache_path(symbol)
+def _load_cache(symbol: str, tf: str):
+    path = _cache_path(symbol, tf)
     if os.path.exists(path):
         try:
             df = pd.read_csv(path)
             if not df.empty and {'ts', 'open', 'high', 'low', 'close', 'vol'}.issubset(df.columns):
                 return df
         except Exception as e:
-            _log_msg(f"   ⚠ {symbol}: cache korup ({e}), fetch ulang dari Bybit.")
+            _log_msg(f"   ⚠ {symbol} {tf}: cache korup ({e}), fetch ulang dari Bybit.")
     return None
 
 
-def _save_cache(symbol: str, df: pd.DataFrame):
+def _save_cache(symbol: str, tf: str, df: pd.DataFrame):
     try:
-        df.to_csv(_cache_path(symbol), index=False)
+        df.to_csv(_cache_path(symbol, tf), index=False)
     except Exception as e:
-        _log_msg(f"   ⚠ {symbol}: gagal simpan cache — {e}")
+        _log_msg(f"   ⚠ {symbol} {tf}: gagal simpan cache — {e}")
+
+
+def fetch_bybit(symbol: str, interval, tf: str) -> pd.DataFrame:
+    """interval: 60 utk H1, 5 utk M5 (parameter get_kline Bybit)."""
+    cached = _load_cache(symbol, tf)
+    if cached is not None:
+        _log_msg(f"   💾 {symbol} {tf}: pakai cache ({len(cached):,} candle) — skip fetch Bybit.")
+        return cached
+
+    session = HTTP(testnet=False)
+    rows, cur_end, n_call = [], _END_MS, 0
+    while True:
+        for attempt in range(4):
+            try:
+                res = session.get_kline(symbol=symbol, category='linear', interval=interval,
+                                        limit=1000, start=_START_MS, end=cur_end)
+                data = res['result']['list']
+                break
+            except Exception as e:
+                wait = 2 ** attempt
+                _log_msg(f"   ⚠ {symbol} {tf} API error (attempt {attempt+1}): {e} — retry {wait}s")
+                time.sleep(wait)
+        else:
+            _log_msg(f"   ❌ {symbol} {tf}: gagal fetch setelah 4 percobaan.")
+            break
+        if not data:
+            break
+        for kl in data:
+            rows.append({'ts': int(kl[0]), 'open': float(kl[1]), 'high': float(kl[2]),
+                         'low': float(kl[3]), 'close': float(kl[4]), 'vol': float(kl[5])})
+        n_call += 1
+        oldest_ts = int(data[-1][0])
+        if oldest_ts <= _START_MS:
+            break
+        cur_end = oldest_ts - 1
+        time.sleep(0.15)
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows).drop_duplicates(subset='ts').sort_values('ts').reset_index(drop=True)
+    _save_cache(symbol, tf, df)
+    return df
 
 
 def fetch_bybit_h1(symbol: str) -> pd.DataFrame:
-    cached = _load_cache(symbol)
-    if cached is not None:
-        _log_msg(f"   💾 {symbol}: pakai cache ({len(cached):,} candle, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}) — skip fetch Bybit.")
-        return cached
-
-    session = HTTP(testnet=False)
-    rows, cur_end, n_call = [], _END_MS, 0
-    while True:
-        for attempt in range(4):
-            try:
-                res = session.get_kline(symbol=symbol, category='linear', interval=60,
-                                        limit=1000, start=_START_MS, end=cur_end)
-                data = res['result']['list']
-                break
-            except Exception as e:
-                wait = 2 ** attempt
-                _log_msg(f"   ⚠ {symbol} API error (attempt {attempt+1}): {e} — retry {wait}s")
-                time.sleep(wait)
-        else:
-            _log_msg(f"   ❌ {symbol}: gagal fetch setelah 4 percobaan.")
-            break
-        if not data:
-            break
-        for kl in data:
-            rows.append({'ts': int(kl[0]), 'open': float(kl[1]), 'high': float(kl[2]),
-                         'low': float(kl[3]), 'close': float(kl[4]), 'vol': float(kl[5])})
-        n_call += 1
-        oldest_ts = int(data[-1][0])
-        if oldest_ts <= _START_MS:
-            break
-        cur_end = oldest_ts - 1
-        time.sleep(0.15)
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows).drop_duplicates(subset='ts').sort_values('ts').reset_index(drop=True)
-    _save_cache(symbol, df)
-    return df
-
-
-def _cache_path_m5(symbol: str) -> str:
-    return os.path.join(CACHE_DIR, f"{symbol}_M5_{BACKTEST_START_DATE}_{BACKTEST_END_DATE}.csv")
-
-
-def _load_cache_m5(symbol: str):
-    path = _cache_path_m5(symbol)
-    if os.path.exists(path):
-        try:
-            df = pd.read_csv(path)
-            if not df.empty and {'ts', 'open', 'high', 'low', 'close', 'vol'}.issubset(df.columns):
-                return df
-        except Exception as e:
-            _log_msg(f"   ⚠ {symbol} M5: cache korup ({e}), fetch ulang dari Bybit.")
-    return None
-
-
-def _save_cache_m5(symbol: str, df: pd.DataFrame):
-    try:
-        df.to_csv(_cache_path_m5(symbol), index=False)
-    except Exception as e:
-        _log_msg(f"   ⚠ {symbol} M5: gagal simpan cache — {e}")
+    return fetch_bybit(symbol, 60, 'H1')
 
 
 def fetch_bybit_m5(symbol: str) -> pd.DataFrame:
-    """Identik dgn fetch_bybit_h1 tapi interval=5 (M5) & cache file terpisah (_M5_ di nama
-    file) -- disimpan di CACHE_DIR yg sama (Railway Volume), tidak bentrok dgn cache H1."""
-    cached = _load_cache_m5(symbol)
-    if cached is not None:
-        _log_msg(f"   💾 {symbol} M5: pakai cache ({len(cached):,} candle) — skip fetch Bybit.")
-        return cached
-
-    session = HTTP(testnet=False)
-    rows, cur_end, n_call = [], _END_MS, 0
-    while True:
-        for attempt in range(4):
-            try:
-                res = session.get_kline(symbol=symbol, category='linear', interval=5,
-                                        limit=1000, start=_START_MS, end=cur_end)
-                data = res['result']['list']
-                break
-            except Exception as e:
-                wait = 2 ** attempt
-                _log_msg(f"   ⚠ {symbol} M5 API error (attempt {attempt+1}): {e} — retry {wait}s")
-                time.sleep(wait)
-        else:
-            _log_msg(f"   ❌ {symbol} M5: gagal fetch setelah 4 percobaan.")
-            break
-        if not data:
-            break
-        for kl in data:
-            rows.append({'ts': int(kl[0]), 'open': float(kl[1]), 'high': float(kl[2]),
-                         'low': float(kl[3]), 'close': float(kl[4]), 'vol': float(kl[5])})
-        n_call += 1
-        oldest_ts = int(data[-1][0])
-        if oldest_ts <= _START_MS:
-            break
-        cur_end = oldest_ts - 1
-        time.sleep(0.15)
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows).drop_duplicates(subset='ts').sort_values('ts').reset_index(drop=True)
-    _save_cache_m5(symbol, df)
-    return df
+    return fetch_bybit(symbol, 5, 'M5')
 
 
 # ============================================================
-# DETEKSI SUPPORT / RESISTANCE (identik dgn bot_ema_flip.py)
+# DETEKSI LEVEL SUPPORT / RESISTANCE (H1)
+# ============================================================
+
+def find_levels(df):
+    """Deteksi level S/R dasar dari candle H1 (basis body candle, sama pola lama).
+    Return list dict: {'type': 'support'/'resistance', 'level': harga, 'c1', 'c2', 'c3'}."""
+    o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
+    n = len(df)
+    levels = []
+    for i in range(0, n - 2):
+        if c[i] < o[i] and c[i + 1] > o[i + 1]:          # bearish lalu bullish
+            S = c[i]
+            if l[i + 2] > S + 1e-9:                       # c3 tidak menembus body
+                levels.append({'type': 'support', 'level': S, 'c1': i, 'c2': i + 1, 'c3': i + 2})
+        if c[i] > o[i] and c[i + 1] < o[i + 1]:          # bullish lalu bearish
+            R = c[i]
+            if h[i + 2] < R - 1e-9:
+                levels.append({'type': 'resistance', 'level': R, 'c1': i, 'c2': i + 1, 'c3': i + 2})
+    return levels
+
+
+# ============================================================
+# DETEKSI SBR & RBS (Support/Resistance Break & Retest)
+# ============================================================
+# SBR = Support jadi Resistance (arah entry: Short)
+# RBS = Resistance jadi Support (arah entry: Long)
+#
+# Untuk tiap level (mulai scan dari candle c3), cari SEKALI kejadian pertama:
+#   TEST   -> minimal 1 candle wick menyentuh level tapi close masih aman
+#   BREAK  -> candle pertama SETELAH test yang close-nya menembus level
+#   KONFIRM-> candle TEPAT SETELAH break, wick-nya TIDAK balik menyentuh level
+#
+# Catatan urutan: TEST harus terjadi SEBELUM BREAK (candle test dan candle
+# break boleh saja candle yang sama SELAMA candle itu masih "test" dulu di
+# baca -- tapi karena test butuh close aman & break butuh close tembus, satu
+# candle tidak bisa jadi TEST dan BREAK sekaligus, jadi otomatis break selalu
+# candle yang berbeda dan setelah test pertama).
+
+def detect_sbr_rbs_events(df):
+    """Return list dict SBR/RBS aktif:
+    {'kind': 'SBR'/'RBS', 'type': support/resistance, 'level': harga,
+     'direction': Short/Long, 'break_i', 'confirm_i', 'confirm_ts', 'c1', 'c2'}
+    """
+    ts = df['ts'].values
+    h = df['high'].values; l = df['low'].values; c = df['close'].values
+    n = len(df)
+    levels = find_levels(df)
+    events = []
+
+    for lv in levels:
+        level = lv['level']
+        ty = lv['type']
+        start = lv['c3']  # mulai scan dari candle c3 (candle pertama setelah level terbentuk)
+
+        tested = False
+        break_i = None
+        # cari TEST dulu, lalu BREAK setelah test
+        i = start
+        while i < n:
+            if ty == 'support':
+                # TEST: wick bawah menyentuh level, close masih di atas (aman)
+                if not tested:
+                    if l[i] <= level + 1e-9 and c[i] > level + 1e-9:
+                        tested = True
+                    i += 1
+                    continue
+                # sudah tested -> cari BREAK (close menembus ke bawah)
+                if c[i] < level - 1e-9:
+                    break_i = i
+                    break
+                i += 1
+            else:  # resistance
+                if not tested:
+                    if h[i] >= level - 1e-9 and c[i] < level - 1e-9:
+                        tested = True
+                    i += 1
+                    continue
+                if c[i] > level + 1e-9:
+                    break_i = i
+                    break
+                i += 1
+
+        if break_i is None or break_i + 1 >= n:
+            continue  # tidak ada break, atau break di candle terakhir (tak ada candle konfirmasi)
+
+        confirm_i = break_i + 1
+        if ty == 'support':
+            # break ke bawah -> retest gagal berarti wick ATAS tidak balik naik ke level
+            confirmed = h[confirm_i] < level - 1e-9
+        else:
+            # break ke atas -> retest gagal berarti wick BAWAH tidak balik turun ke level
+            confirmed = l[confirm_i] > level + 1e-9
+
+        if not confirmed:
+            continue
+
+        kind = 'SBR' if ty == 'support' else 'RBS'
+        direction = 'Short' if ty == 'support' else 'Long'
+        events.append({
+            'kind': kind, 'type': ty, 'level': level, 'direction': direction,
+            'break_i': break_i, 'confirm_i': confirm_i,
+            'confirm_ts': int(ts[confirm_i]),
+            'c1': lv['c1'], 'c2': lv['c2'],
+        })
+
+    events.sort(key=lambda e: e['confirm_ts'])
+    return events
+
+
+# ============================================================
+# DETEKSI QMS & QMR (Quasimodo Support / Resistance)
+# ============================================================
+# QMS = level SUPPORT di-break ke bawah (BREAK-1), lalu candle BERIKUTNYA
+#       balik break ke ATAS di level yang SAMA (BREAK-2), lalu candle
+#       setelahnya (KONFIRMASI) low-nya TIDAK menyentuh level lagi.
+#       Entry: LONG di level (support awal yang jadi acuan).
+# QMR = kebalikannya: level RESISTANCE di-break ke atas (BREAK-1), lalu
+#       candle berikutnya balik break ke BAWAH (BREAK-2), konfirmasi
+#       high-nya TIDAK menyentuh level lagi. Entry: SHORT.
+#
+# TEST tetap wajib sebelum BREAK-1 (sama seperti SBR/RBS): minimal 1 candle
+# wick menyentuh level dengan close masih aman, sebelum break pertama terjadi.
+
+def detect_qm_events(df):
+    """Return list dict QMS/QMR aktif:
+    {'kind': 'QMS'/'QMR', 'type': support/resistance, 'level': harga,
+     'direction': Long/Short, 'break1_i', 'break2_i', 'confirm_i', 'confirm_ts',
+     'c1', 'c2'}
+    """
+    ts = df['ts'].values
+    h = df['high'].values; l = df['low'].values; c = df['close'].values
+    n = len(df)
+    levels = find_levels(df)
+    events = []
+
+    for lv in levels:
+        level = lv['level']
+        ty = lv['type']
+        start = lv['c3']
+
+        tested = False
+        break1_i = None
+        i = start
+        while i < n:
+            if ty == 'support':
+                if not tested:
+                    if l[i] <= level + 1e-9 and c[i] > level + 1e-9:
+                        tested = True
+                    i += 1
+                    continue
+                if c[i] < level - 1e-9:   # BREAK-1 ke bawah
+                    break1_i = i
+                    break
+                i += 1
+            else:  # resistance
+                if not tested:
+                    if h[i] >= level - 1e-9 and c[i] < level - 1e-9:
+                        tested = True
+                    i += 1
+                    continue
+                if c[i] > level + 1e-9:   # BREAK-1 ke atas
+                    break1_i = i
+                    break
+                i += 1
+
+        if break1_i is None or break1_i + 1 >= n:
+            continue
+
+        break2_i = break1_i + 1
+        if ty == 'support':
+            # BREAK-2: candle tepat setelah break1 balik close di ATAS level
+            break2_ok = c[break2_i] > level + 1e-9
+        else:
+            # BREAK-2: candle tepat setelah break1 balik close di BAWAH level
+            break2_ok = c[break2_i] < level - 1e-9
+
+        if not break2_ok or break2_i + 1 >= n:
+            continue
+
+        confirm_i = break2_i + 1
+        if ty == 'support':
+            # QMS -> entry Long: konfirmasi = low candle ini TIDAK menyentuh level
+            confirmed = l[confirm_i] > level + 1e-9
+        else:
+            # QMR -> entry Short: konfirmasi = high candle ini TIDAK menyentuh level
+            confirmed = h[confirm_i] < level - 1e-9
+
+        if not confirmed:
+            continue
+
+        kind = 'QMS' if ty == 'support' else 'QMR'
+        direction = 'Long' if ty == 'support' else 'Short'
+        events.append({
+            'kind': kind, 'type': ty, 'level': level, 'direction': direction,
+            'break1_i': break1_i, 'break2_i': break2_i, 'confirm_i': confirm_i,
+            'confirm_ts': int(ts[confirm_i]),
+            'c1': lv['c1'], 'c2': lv['c2'],
+        })
+
+    events.sort(key=lambda e: e['confirm_ts'])
+    return events
+
+
+def detect_all_events(df):
+    """Gabungan SBR + RBS + QMS + QMR, urut by confirm_ts."""
+    events = detect_sbr_rbs_events(df) + detect_qm_events(df)
+    events.sort(key=lambda e: e['confirm_ts'])
+    return events
+
+
+# ============================================================
+# STRUKTUR M5 UTK LOOKUP CEPAT
 # ============================================================
 
 def prepare_m5(df_m5):
-    """Precompute array numpy dari candle M5 utk lookup cepat via searchsorted (bukan
-    filter pandas per-panggilan, krn M5 dipanggil berulang kali per posisi/limit aktif)."""
     if df_m5 is None or df_m5.empty:
         return None
     df_m5 = df_m5.sort_values('ts').reset_index(drop=True)
@@ -399,2008 +446,454 @@ def prepare_m5(df_m5):
     }
 
 
-def _m5_slice_idx(m5, start_ts_ms, end_ts_ms):
-    """Return (start_idx, end_idx) exclusive-end utk candle M5 dgn start_ts_ms <= ts < end_ts_ms.
-    m5=None (data M5 tidak tersedia utk symbol ini) -> return (0, 0), caller fallback ke H1."""
-    if m5 is None:
-        return 0, 0
-    lo = np.searchsorted(m5['TS'], start_ts_ms, side='left')
-    hi = np.searchsorted(m5['TS'], end_ts_ms, side='left')
-    return int(lo), int(hi)
-
-
-def find_sr_events(df):
-    """Versi O(n) — logika & hasil identik dgn versi lama (O(n^2)), hanya cara
-    cek 'broken' yang diubah dari re-scan mundur tiap event jadi single-pass maju.
-
-    Trik: setiap level di stack disimpan bersama 'broken_at' = index candle pertama
-    (j > c3 level itu) di mana harga menembus sl-nya. Nilai ini dihitung SEKALI saat
-    level baru masuk stack (scan maju dari c3+1 sampai ketemu candle yg break, atau
-    sampai akhir data), bukan diulang-ulang untuk tiap event baru yang muncul di
-    depannya. Saat butuh cek "level ini masih hidup di candle X?", tinggal bandingkan
-    broken_at > X -- O(1). Total kerja scan tetap O(n) sepanjang seluruh dataset
-    (tiap tumpukan sequence candle dilewati sekali per level, bukan berulang).
-    """
-    o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
-    ts = df['ts'].values
-    n = len(df)
-    raw = []
-    for i in range(0, n - 2):
-        if c[i] < o[i] and c[i + 1] > o[i + 1]:
-            S = c[i]
-            if l[i + 2] > S + 1e-9:
-                raw.append({'type': 'support', 'level': S, 'sl': min(l[i], l[i + 1]),
-                            'c1': i, 'c2': i + 1, 'c3': i + 2, 'c1_ts': int(ts[i])})
-        if c[i] > o[i] and c[i + 1] < o[i + 1]:
-            R = c[i]
-            if h[i + 2] < R - 1e-9:
-                raw.append({'type': 'resistance', 'level': R, 'sl': max(h[i], h[i + 1]),
-                            'c1': i, 'c2': i + 1, 'c3': i + 2, 'c1_ts': int(ts[i])})
-    raw.sort(key=lambda e: e['c3'])
-
-    # Precompute, per tipe, kapan tiap kemungkinan level "sl" pertama kali ditembus
-    # kalau dipasang mulai dari index tertentu. Karena sl bisa beda2 per event, kita
-    # tetap hitung broken_at per-level individual, tapi HANYA SEKALI per level (saat
-    # level itu masuk stack) dgn scan maju yg berhenti begitu ketemu breach pertama --
-    # bukan diulang utk tiap event baru yg overlap sepertinya versi lama.
-    def _broken_at(ty, start_idx, sl_val):
-        if ty == 'support':
-            for j in range(start_idx, n):
-                if c[j] < sl_val - 1e-12:
-                    return j
-        else:
-            for j in range(start_idx, n):
-                if c[j] > sl_val + 1e-12:
-                    return j
-        return n  # tidak pernah break dalam data
-
-    stack = {'support': [], 'resistance': []}
-    events = []
-    for e in raw:
-        ty = e['type']; cutoff = e['c1']
-        # buang level yg sudah broken sebelum/at cutoff (O(1) per level krn broken_at
-        # sudah dihitung duluan)
-        stack[ty] = [ref for ref in stack[ty] if ref['broken_at'] > cutoff]
-        prev = stack[ty][-1]['level'] if stack[ty] else None
-        wick_extreme = e['sl']; S = e['level']
-        if prev is None:
-            e['valid'] = False
-        elif ty == 'support':
-            e['valid'] = (wick_extreme <= prev + 1e-12) and (prev <= S + 1e-12)
-        else:
-            e['valid'] = (wick_extreme >= prev - 1e-12) and (prev >= S - 1e-12)
-        events.append(e)
-        broken_at = _broken_at(ty, e['c3'] + 1, wick_extreme)
-        stack[ty].append({'level': S, 'sl': wick_extreme, 'c3': e['c3'], 'broken_at': broken_at})
-    return events
-
-
 # ============================================================
-# PERSIAPAN PER-KOIN (precompute EMA + support/resistance events + indikator)
+# PERSIAPAN PER-KOIN
 # ============================================================
-
-VOL_MA_PERIOD  = int(os.environ.get('VOL_MA_PERIOD', '20'))   # rata-rata volume utk hitung rasio
-ATR_PERIOD     = int(os.environ.get('ATR_PERIOD', '14'))
-EMA_TREND      = int(os.environ.get('EMA_TREND', '50'))       # EMA konteks tren (filter arah besar)
-
-def _calc_atr(H, L, C, period):
-    prev_close = np.roll(C, 1)
-    prev_close[0] = C[0]
-    tr = np.maximum(H - L, np.maximum(np.abs(H - prev_close), np.abs(L - prev_close)))
-    return pd.Series(tr).rolling(period, min_periods=1).mean().values
-
-
-# ============================================================
-# INDIKATOR TAMBAHAN: RSI, MACD, PARABOLIC SAR
-# (implementasi manual numpy/pandas, tanpa dependency TA-Lib)
-# ============================================================
-
-RSI_PERIOD       = int(os.environ.get('RSI_PERIOD', '14'))
-MACD_FAST        = int(os.environ.get('MACD_FAST', '12'))
-MACD_SLOW        = int(os.environ.get('MACD_SLOW', '26'))
-MACD_SIGNAL      = int(os.environ.get('MACD_SIGNAL', '9'))
-SAR_STEP         = float(os.environ.get('SAR_STEP', '0.02'))
-SAR_MAX_STEP     = float(os.environ.get('SAR_MAX_STEP', '0.2'))
-
-# ── GATE RSI TUNGGAL saat EMA cross (BUKAN filter statistik ambang batas -- ini kondisi
-# STRUKTURAL yg dicek TEPAT di candle penyebab cross, sama level dgn syarat cross itu sendiri) ──
-# RSI4 (periode pendek, reaktif thd harga). NONAKTIF secara default -- dipakai dulu utk
-# eksplorasi via tabel Analisis Indikator (RSI per-nilai + bucket Rendah/Sedang/Tinggi),
-# baru diaktifkan setelah tahu rentang RSI4 yg benar2 menguntungkan dari hasil analisis itu.
-# Golden cross (bias Long)  valid HANYA jika RSI_GATE_MIN_LONG  <= RSI4 <= RSI_GATE_MAX_LONG
-# Death cross  (bias Short) valid HANYA jika RSI_GATE_MIN_SHORT <= RSI4 <= RSI_GATE_MAX_SHORT
-# Di luar rentang = diblokir (sinyal dilewati, tidak entry).
-RSI_GATE_ENABLED    = os.environ.get('RSI_GATE_ENABLED', '0').strip() not in ('0', 'false', 'False', '')
-RSI_GATE_PERIOD     = int(os.environ.get('RSI_GATE_PERIOD', '4'))
-RSI_GATE_MIN_LONG   = float(os.environ.get('RSI_GATE_MIN_LONG', '0'))
-RSI_GATE_MAX_LONG   = float(os.environ.get('RSI_GATE_MAX_LONG', '70'))
-RSI_GATE_MIN_SHORT  = float(os.environ.get('RSI_GATE_MIN_SHORT', '40'))
-RSI_GATE_MAX_SHORT  = float(os.environ.get('RSI_GATE_MAX_SHORT', '100'))
-
-# ── GATE SWING 3-CANDLE (BUKAN filter statistik -- kondisi STRUKTURAL, dicek di candle
-# TEPAT SEBELUM candle penyebab cross). Tujuannya: pastikan candle sebelum cross itu betulan
-# swing point (titik balik lokal), bukan cuma pergerakan lanjutan tren sebelumnya.
-# Death cross (candle cross biasanya bearish) -> candle 1-sebelum-cross harus SWING HIGH:
-#   high[i-1] > high[i-2] (kiri) DAN high[i-1] > high[i] (kanan, candle cross itu sendiri).
-# Golden cross -> candle 1-sebelum-cross harus SWING LOW:
-#   low[i-1] < low[i-2] (kiri) DAN low[i-1] < low[i] (kanan).
-SWING_GATE_ENABLED = os.environ.get('SWING_GATE_ENABLED', '0').strip() not in ('0', 'false', 'False', '')
-
-# ── GATE ARAH CANDLE CROSS (BUKAN filter statistik -- kondisi STRUKTURAL). Candle yang
-# menyebabkan EMA cross harus SEARAH dengan arah cross itu sendiri, bukan cuma kebetulan
-# EMA-nya cross sementara harga candle itu sendiri malah berlawanan arah.
-# Golden cross (bias Long) -> candle cross HARUS bullish: open < close.
-# Death cross (bias Short)  -> candle cross HARUS bearish: open > close.
-CANDLE_DIRECTION_GATE_ENABLED = os.environ.get('CANDLE_DIRECTION_GATE_ENABLED', '0').strip() not in ('0', 'false', 'False', '')
-
-
-def _passes_candle_direction_filter(O, C, i, direction):
-    """Gate ARAH CANDLE CROSS (bukan filter statistik -- kondisi STRUKTURAL). Candle cross (i)
-    harus searah dgn arah cross: direction='Long' (golden cross) butuh candle BULLISH
-    (open[i] < close[i]); direction='Short' (death cross) butuh candle BEARISH
-    (open[i] > close[i]). True kalau gate nonaktif."""
-    if not CANDLE_DIRECTION_GATE_ENABLED:
-        return True
-    if direction == 'Long':
-        return O[i] < C[i]
-    else:
-        return O[i] > C[i]
-
-# ── FLIP MIN R: posisi yang SUDAH FILLED hanya ditutup oleh cross berlawanan (flip) kalau
-# CLOSE candle yang menyebabkan cross berlawanan itu (bukan candle setelahnya) sudah
-# >= FLIP_MIN_R dari entry (dihitung dari entry & jarak SL posisi itu). Contoh: entry $1.6,
-# SL $1.3 (dist=$0.3, FLIP_MIN_R=1.0) -> close candle cross harus > $1.9 baru boleh
-# membatalkan posisi Long itu. Kalau msh dibawah ambang ini (termasuk floating loss), posisi
-# DIBIARKAN jalan terus, cuma keluar lewat TRAIL/SL normal. Limit PENDING (belum filled)
-# TIDAK terpengaruh -- tetap dibatalkan seperti biasa oleh cross berlawanan, apapun nilainya.
-FLIP_MIN_R = float(os.environ.get('FLIP_MIN_R', '1.0'))
-
-# ── KONFIRMASI EMA4 H1 (SEKALI CEK) + TRIGGER M5 SWING (menggantikan limit-di-wick lama) ──
-# Setelah cross H1 lolos RSI gate/swing/candle-direction/filter (persis alur lama), TIDAK
-# langsung pasang limit. Konfirmasi EMA4 HANYA DICEK SEKALI, di candle H1 TEPAT SETELAH cross
-# (j = i+1, bukan berkali-kali):
-#   - BATAL kalau BODY candle j "menembus" EMA4 -- utk golden cross: open[j] > EMA4[j] >
-#     close[j] (open di atas EMA, close di bawah EMA, EMA ada di tengah body). Utk death
-#     cross: open[j] < EMA4[j] < close[j]. Ini beda dari "wick nyentuh" -- body break berarti
-#     EMA4 dilibas penuh, sinyal awal dianggap gagal (counter: blocked_by_ema4_break).
-#   - LOLOS (konfirmasi OK) kalau WICK candle j menyentuh EMA4 TAPI close masih searah bias:
-#     golden cross -> low[j] <= EMA4[j] dan close[j] > EMA4[j]. Death cross -> high[j] >=
-#     EMA4[j] dan close[j] < EMA4[j].
-#   - Kalau belum body-break dan belum lolos -> tetap tunggu, cek lagi di candle H1
-#     berikutnya (bisa berkali-kali), sampai salah satu dari 2 kondisi di atas terjadi atau
-#     muncul FLIP cross H1 berlawanan (batalkan monitoring, sama seperti flip protection biasa).
-# Begitu lolos konfirmasi di candle j, MULAI monitoring M5 dari candle H1 BERIKUTNYA (j+1),
-# dimulai 5 menit setelah candle itu buka -- cari SWING POINT M5 pertama valid (searah bias).
-# Begitu swing ditemukan, LIMIT ORDER LANGSUNG dipasang PERSIS di level swing itu sendiri
-# (tanpa tahap tunggu-tersentuh atau EMA-cross lagi) -- lalu tunggu candle M5 berikutnya yg
-# WICK-nya menyentuh level itu utk FILL (entry persis di harga limit = level swing). SL =
-# SL_PCT% dari harga entry (bukan lagi dari wick H1 lama).
-EMA_CONFIRM_MODE = os.environ.get('EMA_CONFIRM_MODE', '1').strip() not in ('0', 'false', 'False', '')
-
-# ── TRIGGER M5 BERBASIS SWING (menggantikan cross EMA4/EMA10 M5 sepenuhnya) ──
-# Begitu konfirmasi EMA4 H1 lolos & monitoring M5 dimulai (dari candle H1 berikutnya), sistem
-# TIDAK lagi mencari cross EMA M5. Sebagai gantinya:
-#   1) Cari SWING POINT M5 pertama yg valid, searah bias: utk Long -> swing LOW (low candle M5
-#      di index k adalah yg TERENDAH dibanding SWING_M5_RIGHT candle M5 SETELAHNYA -- artinya
-#      low[k] <= low[k+1..k+R]). Utk Short -> swing HIGH (high[k] >= high[k+1..k+R]). Krn butuh
-#      R candle setelahnya utk konfirmasi, swing baru "diketahui valid" R candle M5 (= R*5 menit)
-#      setelah candle swing itu sendiri (confirm mundur, wajar lag).
-#   2) Swing PERTAMA yg valid ditemukan jadi LEVEL PATOKAN TETAP -- tidak berubah lagi meski ada
-#      swing baru yg lebih ekstrem setelahnya (sampai tersentuh atau flip H1 membatalkan).
-#   3) Tunggu candle M5 berikutnya yg WICK menyentuh level itu (Long: low candle <= level;
-#      Short: high candle >= level) -> MARKET ORDER langsung di close candle M5 itu.
-SWING_M5_RIGHT = int(os.environ.get('SWING_M5_RIGHT', '5'))
-
-# ── Rentang FOKUS utk tabel Analisis Khusus RSI Gate (TERPISAH dari gate aktual di atas --
-# ini cuma menyempitkan rentang yg dianalisis & dibagi 3 bucket, tidak mempengaruhi entry
-# sama sekali walau RSI_GATE_ENABLED=1). Nilai diluar rentang fokus tetap dihitung ke
-# n_total & per_value (spy total tetap akurat), tapi TIDAK masuk ke salah satu bucket.
-# Bucket dibagi RATA OTOMATIS jadi 3 dari rentang fokus ini (span/3, integer boundary).
-RSI_ANALYSIS_MIN_LONG  = float(os.environ.get('RSI_ANALYSIS_MIN_LONG', '41'))
-RSI_ANALYSIS_MAX_LONG  = float(os.environ.get('RSI_ANALYSIS_MAX_LONG', '80'))
-RSI_ANALYSIS_MIN_SHORT = float(os.environ.get('RSI_ANALYSIS_MIN_SHORT', '12'))
-RSI_ANALYSIS_MAX_SHORT = float(os.environ.get('RSI_ANALYSIS_MAX_SHORT', '50'))
-
-# Definisi sesi trading (WIB / UTC+7). Batas jam INKLUSIF di kedua ujung sesuai spesifikasi:
-# Asia 07:00-13:59, London 14:00-18:59, New York 19:00-23:59, Tengah Malam 00:00-04:59,
-# Sydney 05:00-06:59. Urutan list menentukan urutan tampil di dashboard.
-_SESSION_DEFS = [
-    ('Sydney',       5,  6),
-    ('Asia',         7,  13),
-    ('London',       14, 18),
-    ('New York',     19, 23),
-    ('Tengah Malam', 0,  4),
-]
-_WIB = timezone(timedelta(hours=7))
-_DAY_NAMES_ID = ['Senin', 'Selasa', 'Rabu', 'Kamis', "Jumat", 'Sabtu', 'Minggu']
-
-
-def _session_for_hour(hour_wib):
-    for name, start_h, end_h in _SESSION_DEFS:
-        if start_h <= hour_wib <= end_h:
-            return name
-    return None   # tidak akan pernah kejadian krn 5 sesi di atas menutupi 24 jam penuh
-
-
-# ── BLOKIR SESI: sesi yg trading-nya DIHENTIKAN sama sekali -- entry yg SEHARUSNYA fill di
-# sesi ini justru DIBATALKAN (bukan cuma dianalisis pasca-hoc), sama seperti "berhenti trading"
-# di jam tsb. Evaluasi persis di titik FILL (candle yg sama dgn entry_ts), bukan di titik
-# limit dipasang -- konsisten dgn definisi sesi "berdasar waktu filled" yg sudah dipakai di
-# tabel Analisis Sesi. Isi comma-separated (nama sesi persis spt di _SESSION_DEFS), kosongkan
-# utk nonaktifkan semua blokir sesi. Hasil riset dashboard: Sydney & London WR-nya termasuk
-# yang lebih rendah dibanding sesi lain.
-SESSION_BLOCK_LIST = [s.strip() for s in os.environ.get('SESSION_BLOCK_LIST', '').split(',') if s.strip()]
-
-
-def _session_blocked(entry_ts_ms):
-    """True kalau candle di entry_ts_ms (ms epoch UTC) jatuh di salah satu sesi yg diblokir."""
-    if not SESSION_BLOCK_LIST:
-        return False
-    dt_wib = datetime.fromtimestamp(entry_ts_ms / 1000, tz=_WIB)
-    sname = _session_for_hour(dt_wib.hour)
-    return sname in SESSION_BLOCK_LIST
-
-
-# ── NO-TRADE SESSION (full halt): BEDA dari SESSION_BLOCK_LIST di atas (yg cuma mencegah FILL
-# baru, posisi yg sudah filled sebelum sesi itu tetap jalan). Ini jauh lebih ketat -- begitu
-# candle jatuh di salah satu sesi dalam daftar ini: 1) SEMUA limit pending utk symbol itu
-# DIBATALKAN, 2) SEMUA posisi filled utk symbol itu DITUTUX PAKSA (harga close candle saat
-# itu), 3) TIDAK ADA entry/setup baru yg dieksekusi -- sampai sesi tsb selesai. Dievaluasi
-# ULANG tiap candle, jadi begitu sesi berakhir, trading otomatis normal lagi candle berikutnya
-# tanpa perlu logika resume khusus. Default: London (sesuai temuan WR London di tabel Analisis
-# Sesi). Kosongkan utk nonaktifkan.
-NO_TRADE_SESSIONS = [s.strip() for s in os.environ.get('NO_TRADE_SESSIONS', '').split(',') if s.strip()]
-
-
-def _in_no_trade_session(ts_ms):
-    """True kalau candle di ts_ms (ms epoch UTC) jatuh di salah satu sesi no-trade (full halt)."""
-    if not NO_TRADE_SESSIONS:
-        return False
-    dt_wib = datetime.fromtimestamp(ts_ms / 1000, tz=_WIB)
-    sname = _session_for_hour(dt_wib.hour)
-    return sname in NO_TRADE_SESSIONS
-
-
-def _calc_rsi(C, period):
-    """RSI standar (Wilder smoothing via EWM alpha=1/period).
-    Rumus 100*avg_gain/(avg_gain+avg_loss) dipakai langsung (bukan 100-100/(1+RS))
-    supaya kasus tepi avg_gain=avg_loss=0 (harga flat berturut-turut) otomatis
-    jadi NaN alih-alih perlu di-patch manual -- identik dgn definisi RSI standar."""
-    close = pd.Series(C)
-    delta = close.diff(1)
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
-    rsi = 100 * avg_gain / (avg_gain + avg_loss)
-    return rsi.values
-
-
-def _calc_macd(C, fast, slow, signal):
-    """MACD line, signal line, histogram."""
-    ema_fast = pd.Series(C).ewm(span=fast, adjust=False).mean().values
-    ema_slow = pd.Series(C).ewm(span=slow, adjust=False).mean().values
-    macd_line = ema_fast - ema_slow
-    signal_line = pd.Series(macd_line).ewm(span=signal, adjust=False).mean().values
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-
-def _calc_psar(H, L, C, step=0.02, max_step=0.2):
-    """Parabolic SAR (Wilder), urutan langkah mengikuti implementasi standar:
-    1) proyeksi sar[i] dari sar[i-1], 2) tentukan reversal berdasarkan proyeksi itu,
-    3) update EP/AF, 4) clamp sar[i] ke high/low candle SEBELUMNYA (i-1) saja,
-    5) kalau reversal, timpa sar[i] = ep lama & reset AF/EP.
-    Return (sar, is_falling_bool_array) -- falling=True berarti SAR di ATAS harga (downtrend)."""
-    n = len(C)
-    sar = np.zeros(n)
-    falling = np.zeros(n, dtype=bool)
-    if n == 0:
-        return sar, falling
-    falling[0] = H[0] < H[0]  # placeholder, ditentukan dari 2 candle pertama di bawah
-    # tentukan arah awal dari candle 0->1 (naik/turun net) -- konsisten dgn referensi:
-    is_falling = L[0] > L[1] if n > 1 else False if n > 0 else False
-    # (fallback sederhana bila n==1 tak relevan krn warmup jauh lebih besar dari 1)
-    ep = L[0] if is_falling else H[0]
-    af = step
-    sar[0] = C[0] if len(C) else (H[0] if is_falling else L[0])
-    falling[0] = is_falling
-    for i in range(1, n):
-        proj = sar[i - 1] + af * (ep - sar[i - 1])
-        if is_falling:
-            reverse = H[i] > proj
-            if L[i] < ep:
-                ep = L[i]
-                af = min(af + step, max_step)
-            proj = max(H[i - 1], proj)
-        else:
-            reverse = L[i] < proj
-            if H[i] > ep:
-                ep = H[i]
-                af = min(af + step, max_step)
-            proj = min(L[i - 1], proj)
-        if reverse:
-            proj = ep
-            af = step
-            is_falling = not is_falling
-            ep = L[i] if is_falling else H[i]
-        sar[i] = proj
-        falling[i] = is_falling
-    return sar, ~falling  # kembalikan sbg "is_uptrend" (kebalikan dari falling) spy sesuai nama lama
-
-
-# ============================================================
-# INDIKATOR SAAT CROSS (utk analisis pola menang/kalah)
-# ============================================================
-
-def _capture_indicators(c, i):
-    """Ambil snapshot indikator persis di candle i (candle penyebab EMA cross)."""
-    close_i = c['C'][i]
-    vol_ma  = c['vol_ma'][i]
-    atr_i   = c['atr'][i]
-    rng     = c['H'][i] - c['L'][i]
-    rsi_i   = c['rsi'][i]
-    macd_i  = c['macd_hist'][i]
-    sar_i   = c['sar'][i]
-    sar_up  = c['sar_up'][i]
-    rsi_gate_i = c['rsi_gate'][i]
-    return {
-        'vol_ratio': (c['V'][i] / vol_ma) if vol_ma > 0 else None,          # volume vs rata2 20 candle
-        'atr_ratio': (rng / atr_i) if atr_i > 0 else None,                  # besar candle vs volatilitas normal
-        'ema_gap_pct': (abs(c['ema_fast'][i] - c['ema_slow'][i]) / close_i * 100) if close_i else None,
-        'trend_pct': ((close_i - c['ema_trend'][i]) / c['ema_trend'][i] * 100) if c['ema_trend'][i] else None,
-        'dist_pct': None,   # diisi setelah dist final diketahui (lihat di bawah)
-        'rsi': (float(rsi_i) if not np.isnan(rsi_i) else None),             # RSI14 saat cross
-        'macd_hist_pct': ((macd_i / close_i * 100) if close_i else None),   # histogram MACD, dinormalisasi ke % harga
-        'sar_dist_pct': ((close_i - sar_i) / close_i * 100) if close_i else None,  # jarak close ke PSAR (%), + = di atas SAR (uptrend PSAR)
-        f'rsi{RSI_GATE_PERIOD}': (float(rsi_gate_i) if not np.isnan(rsi_gate_i) else None),  # RSI gate (periode pendek)
-    }
-
-
-def _passes_rsi_gate(c, i, direction):
-    """Gate RSI TUNGGAL saat EMA cross (bukan filter statistik -- kondisi STRUKTURAL).
-    Rentang penuh [MIN, MAX] terpisah utk Long & Short -- diluar rentang = diblokir.
-    direction: 'Long' butuh RSI_GATE_MIN_LONG <= RSI <= RSI_GATE_MAX_LONG; 'Short' butuh
-    RSI_GATE_MIN_SHORT <= RSI <= RSI_GATE_MAX_SHORT, persis di candle cross yg sama.
-    True kalau gate nonaktif ATAU nilai RSI belum tersedia (masih warmup) -- fail-open
-    spy tidak diam-diam menolak semua trade di awal data krn NaN."""
-    if not RSI_GATE_ENABLED:
-        return True
-    v = c['rsi_gate'][i]
-    if np.isnan(v):
-        return True
-    if direction == 'Long':
-        return RSI_GATE_MIN_LONG <= v <= RSI_GATE_MAX_LONG
-    else:
-        return RSI_GATE_MIN_SHORT <= v <= RSI_GATE_MAX_SHORT
-
-
-def _passes_swing_filter(H, L, O, C, i, direction):
-    """Gate SWING 3-CANDLE (bukan filter statistik -- kondisi STRUKTURAL). Dicek di candle
-    i-1 (1 candle SEBELUM candle cross i) -- harus swing point asli, bukan cuma pergerakan
-    lanjutan: kiri (i-2) tidak boleh lebih ekstrem, kanan (i, candle cross) tidak boleh lebih
-    ekstrem juga. direction='Short' (death cross) -> swing HIGH: high[i-1] harus PALING TINGGI
-    di antara [i-2,i-1,i]. direction='Long' (golden cross) -> swing LOW: low[i-1] harus PALING
-    RENDAH di antara [i-2,i-1,i]. True kalau gate nonaktif ATAU candle i-2 belum ada (index<2,
-    fail-open spy tidak diam2 menolak semua trade di awal data)."""
-    if not SWING_GATE_ENABLED:
-        return True
-    if i < 2:
-        return True
-    if direction == 'Short':
-        return H[i-1] > H[i-2] and H[i-1] > H[i]
-    else:
-        return L[i-1] < L[i-2] and L[i-1] < L[i]
-
-
-def _find_first_valid_swing_m5(m5_L, m5_H, start_idx, max_idx, direction):
-    """Cari SWING POINT M5 PERTAMA yg valid, mulai scan dari `start_idx`, dibatasi tidak
-    melebihi `max_idx` (exclusive -- representasi "candle M5 yg sudah terjadi sampai
-    sekarang", mencegah look-ahead). direction='Long' -> cari swing LOW: index k valid kalau
-    low[k] adalah TERENDAH dibanding SWING_M5_RIGHT candle setelahnya (low[k] <= low[k+1..k+R]).
-    direction='Short' -> swing HIGH: high[k] >= high[k+1..k+R].
-    Return (swing_idx, swing_level) kalau ketemu, atau (None, None) kalau belum ada yg valid
-    dlm rentang data yg tersedia (masih harus nunggu lbh banyak candle M5 muncul)."""
-    R = SWING_M5_RIGHT
-    k = start_idx
-    while k + R < max_idx:   # butuh R candle SETELAH k yg sudah "terjadi" (< max_idx)
-        if direction == 'Long':
-            level = m5_L[k]
-            if np.all(m5_L[k+1:k+1+R] >= level):
-                return k, level
-        else:
-            level = m5_H[k]
-            if np.all(m5_H[k+1:k+1+R] <= level):
-                return k, level
-        k += 1
-    return None, None
-
-
-def _ema4_body_break(O, C, ema_fast, j, direction):
-    """True kalau BODY candle j menembus EMA4 sepenuhnya (open di satu sisi, close di sisi
-    lain, EMA4 di tengah) -- sinyal dianggap gagal total. direction='Long' (golden cross)
-    -> open[j] > EMA4[j] > close[j]. direction='Short' (death cross) -> open[j] < EMA4[j] <
-    close[j]."""
-    e = ema_fast[j]
-    if direction == 'Long':
-        return O[j] > e > C[j]
-    else:
-        return O[j] < e < C[j]
-
-
-def _ema4_wick_confirm(H, L, C, ema_fast, j, direction):
-    """True kalau WICK candle j menyentuh EMA4 tapi close masih searah bias (konfirmasi OK,
-    body TIDAK menembus). direction='Long' (golden cross) -> low[j] <= EMA4[j] dan
-    close[j] > EMA4[j]. direction='Short' (death cross) -> high[j] >= EMA4[j] dan
-    close[j] < EMA4[j]."""
-    e = ema_fast[j]
-    if direction == 'Long':
-        return L[j] <= e and C[j] > e
-    else:
-        return H[j] >= e and C[j] < e
-
 
 def prepare_coin(symbol, df):
-    """Precompute semua yang dibutuhkan simulasi + indikator (utk analisis win/loss) utk 1 koin.
-    None kalau data kurang."""
-    n = len(df)
-    warmup = max(EMA_SLOW, EMA_TREND, VOL_MA_PERIOD, ATR_PERIOD, RSI_PERIOD, MACD_SLOW,
-                 RSI_GATE_PERIOD) + 10
-    if n < warmup + 10:
-        return None
-    O = df['open'].values; H = df['high'].values; L = df['low'].values; C = df['close'].values
-    V = df['vol'].values if 'vol' in df.columns else np.zeros(n)
-    TS = df['ts'].values
-    ema_fast = df['close'].ewm(span=EMA_FAST, adjust=False).mean().values
-    ema_slow = df['close'].ewm(span=EMA_SLOW, adjust=False).mean().values
-    ema_trend = df['close'].ewm(span=EMA_TREND, adjust=False).mean().values
-    vol_ma = pd.Series(V).rolling(VOL_MA_PERIOD, min_periods=1).mean().values
-    atr = _calc_atr(H, L, C, ATR_PERIOD)
-    rsi = _calc_rsi(C, RSI_PERIOD)
-    rsi_gate = _calc_rsi(C, RSI_GATE_PERIOD)   # RSI4 default -- utk gate cross, TERPISAH dari RSI_PERIOD analisis
-    _, _, macd_hist = _calc_macd(C, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
-    sar, sar_up = _calc_psar(H, L, C, SAR_STEP, SAR_MAX_STEP)
-    events = find_sr_events(df)
-    events_by_c3 = {}
-    for e in events:
-        events_by_c3.setdefault(e['c3'], []).append(e)
+    df = df.sort_values('ts').reset_index(drop=True)
+    events = detect_all_events(df)
     return {
-        'symbol': symbol, 'O': O, 'H': H, 'L': L, 'C': C, 'V': V, 'TS': TS,
-        'ema_fast': ema_fast, 'ema_slow': ema_slow, 'ema_trend': ema_trend,
-        'rsi_gate': rsi_gate,
-        'vol_ma': vol_ma, 'atr': atr, 'rsi': rsi, 'macd_hist': macd_hist,
-        'sar': sar, 'sar_up': sar_up, 'events_by_c3': events_by_c3,
-        'n': n, 'warmup': warmup,
-        'ts_to_idx': {int(TS[i]): i for i in range(n)},
+        'symbol': symbol,
+        'TS': df['ts'].values.astype(np.int64),
+        'events': events,   # list SBR, urut by confirm_ts
+        'n': len(df),
     }
 
 
 # ============================================================
-# SIMULASI GABUNGAN — SEMUA KOIN BERBARENGAN, 1 BALANCE (COMPOUNDING),
-# 1 POOL MAX_CONCURRENT (persis seperti bot live: satu akun, slot terbatas
-# dipakai bersama oleh semua koin, bukan simulasi per-koin terisolasi)
+# SIMULASI GABUNGAN (semua koin, 1 balance, 1 pool slot)
 # ============================================================
+#
+# Alur per koin, per level SBR aktif (mulai dipantau setelah confirm_ts):
+#   Level punya status: 'waiting' (belum ada limit terpasang) atau
+#   'armed' (limit sudah terpasang, menunggu fill / batal).
+#   Dipantau candle M5 demi candle M5 SETELAH confirm_ts:
+#     - waiting: kalau jarak harga (close M5) ke level <= APPROACH_PCT -> ARM
+#       (pasang limit persis di level).
+#     - armed: kalau wick M5 menyentuh level -> FILL (entry = level).
+#              kalau jarak harga menjauh > APPROACH_PCT lagi (belum fill)
+#              -> DISARM (limit dicabut, balik ke 'waiting', level tetap hidup).
+#   Begitu FILLED, level MATI (tidak dipantau lagi baik menang/kalah).
 
-def run_combined_backtest(coins: dict, filters_enabled: bool = True, m5_data: dict = None) -> dict:
-    """coins: {symbol: prepared_dict dari prepare_coin()}
-    filters_enabled=False -> semua FILTER_* diabaikan (dipakai utk simulasi pembanding
-    'tanpa filter' pada bagian Dampak Filter Aktif).
-    m5_data: {symbol: prepare_m5(df_m5)} atau None -- kalau tersedia & M5_PRECISION_MODE
-    aktif, fill/SL/trailing utk symbol itu dicek per-candle-M5 (bukan per-H1) begitu limit
-    dipasang, sampai posisi keluar. EMA cross, gate, S/R, flip protection TETAP di H1."""
-    if m5_data is None:
-        m5_data = {}
-    # ── timeline global: semua timestamp dari semua koin, urut kronologis ──
-    all_ts = set()
-    for c in coins.values():
-        all_ts.update(int(t) for t in c['TS'][c['warmup']: c['n'] - 1])
-    timeline = sorted(all_ts)
-
+def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
     balance = INITIAL_BALANCE
-    armed             = {}   # f"{symbol}|Short"/"Long" -> {'c1_ts'}
-    pending           = {}   # f"{symbol}|Long"/"Short" -> {...} (LEGACY, dipakai kalau EMA_CONFIRM_MODE=0)
-    waiting_confirm   = {}   # f"{symbol}|Long"/"Short" -> {'cross_i', 'ind'} -- menunggu konfirmasi EMA4 H1
-    armed_m5          = {}   # f"{symbol}|Long"/"Short" -> {'ind','from_i','swing_idx','swing_level','scan_from'}
-    active_positions  = {}   # f"{symbol}|Long"/"Short" -> {...}
-    blocked_by_ema4_break = 0  # counter: batal total krn body candle menembus EMA4 saat menunggu konfirmasi
-    blocked_by_ema4_neutral = 0  # counter: batal krn candle setelah cross netral (tdk sentuh wick, tdk body-break)
-    trades            = []
-    blocked_by_slot   = 0    # counter: berapa kali sinyal valid terpaksa dilewati krn slot penuh
-    blocked_by_margin = 0    # counter: dilewati krn margin (leverage) sudah habis -- constraint ASLI Bybit
-    blocked_by_filter = 0    # counter: dilewati krn tidak lolos filter indikator
-    blocked_by_rsi_gate = 0  # counter: dilewati krn gate RSI12 vs RSI24 tidak searah dgn cross
-    blocked_by_session = 0   # counter: fill dibatalkan krn waktu fill jatuh di sesi yg diblokir
-    blocked_by_min_order = 0   # counter: fill dibatalkan krn order_value < ORDER_BUMP_FLOOR (Bybit min order)
-    bumped_by_min_order = 0    # counter: qty DIPAKSA NAIK krn order_value < MIN_ORDER_USD -- risk aktual > target
-    blocked_by_swing = 0       # counter: dilewati krn candle sblm cross bukan swing point asli
-    blocked_by_candle_direction = 0  # counter: dilewati krn candle cross tidak searah dgn cross-nya
-    flip_held_below_1r = 0     # counter: cross berlawanan MUNCUL tp posisi TIDAK ditutup krn msh <1R
-    blocked_by_no_trade_session = 0   # counter: pending dibatalkan krn masuk sesi no-trade (full halt)
-    closed_by_no_trade_session = 0    # counter: posisi filled ditutup paksa krn masuk sesi no-trade
+    active_positions = {}     # key(symbol,direction+level) -> {...}
+    trades = []
+    blocked_by_slot = 0
+    blocked_by_margin = 0
+    blocked_by_min_order = 0
 
-    def _akey(symbol, direction):
-        return f"{symbol}|{direction}" if ALLOW_HEDGE else symbol
-
-    def _m5_window_for(symbol, i, TS_h1):
-        """Return array M5 (TS,O,H,L,C) utk rentang [TS_h1[i], TS_h1[i+1]) symbol ini, atau
-        None kalau M5_PRECISION_MODE nonaktif / data M5 tidak tersedia utk symbol ini."""
-        if not M5_PRECISION_MODE:
-            return None
-        m5 = m5_data.get(symbol)
-        if m5 is None:
-            return None
-        lo, hi = _m5_slice_idx(m5, int(TS_h1[i]), int(TS_h1[i + 1]))
-        if hi <= lo:
-            return None   # tidak ada candle M5 di rentang ini (gap data) -> fallback H1
-        return {'TS': m5['TS'][lo:hi], 'O': m5['O'][lo:hi], 'H': m5['H'][lo:hi],
-                'L': m5['L'][lo:hi], 'C': m5['C'][lo:hi]}
+    def _akey(symbol, direction, level, kind):
+        return f"{symbol}|{direction}|{kind}|{level:.10f}"
 
     def _slots_used():
-        # pending (legacy limit-di-wick) DAN armed_m5 (sudah lolos konfirmasi EMA4, tinggal
-        # tunggu cross M5 utk market order) dihitung sbg slot terpakai -- keduanya representasi
-        # "sinyal yg sudah lolos semua gate, tinggal nunggu trigger eksekusi". waiting_confirm
-        # BELUM dihitung -- msh tahap konfirmasi H1, belum tentu lolos.
-        return len(active_positions) + len(pending) + len(armed_m5)
+        return len(active_positions)
 
     def _current_margin_used():
-        """Total margin yg sedang dipakai SEMUA posisi terbuka (notional/leverage) --
-        persis seperti akun Bybit riil, ini yg membatasi berapa banyak posisi bisa
-        dibuka bersamaan, BUKAN sekadar persentase risiko."""
         return sum((p['entry'] * p['qty']) / LEVERAGE for p in active_positions.values())
 
-    def _passes_filters(ind, enabled=True):
-        if not enabled:
-            return True
-        v = ind.get('atr_ratio')
-        if FILTER_MIN_ATR_RATIO > 0 and (v is None or v < FILTER_MIN_ATR_RATIO):
-            return False
-        if FILTER_MAX_ATR_RATIO > 0 and (v is None or v > FILTER_MAX_ATR_RATIO):
-            return False
-        v = ind.get('vol_ratio')
-        if FILTER_MIN_VOL_RATIO > 0 and (v is None or v < FILTER_MIN_VOL_RATIO):
-            return False
-        if FILTER_MAX_VOL_RATIO > 0 and (v is None or v > FILTER_MAX_VOL_RATIO):
-            return False
-        v = ind.get('ema_gap_pct')
-        if FILTER_MIN_EMA_GAP_PCT > 0 and (v is None or v < FILTER_MIN_EMA_GAP_PCT):
-            return False
-        if FILTER_MAX_EMA_GAP_PCT > 0 and (v is None or v > FILTER_MAX_EMA_GAP_PCT):
-            return False
-        v = ind.get('dist_pct_est')
-        if FILTER_MIN_DIST_PCT > 0 and (v is None or v < FILTER_MIN_DIST_PCT):
-            return False
-        if FILTER_MAX_DIST_PCT > 0 and (v is None or v > FILTER_MAX_DIST_PCT):
-            return False
-        v = ind.get('rsi')
-        if FILTER_MIN_RSI is not None and (v is None or v < FILTER_MIN_RSI):
-            return False
-        if FILTER_MAX_RSI is not None and (v is None or v > FILTER_MAX_RSI):
-            return False
-        v = ind.get('macd_hist_pct')
-        if FILTER_MIN_MACD_HIST is not None and (v is None or v < FILTER_MIN_MACD_HIST):
-            return False
-        if FILTER_MAX_MACD_HIST is not None and (v is None or v > FILTER_MAX_MACD_HIST):
-            return False
-        v = ind.get('sar_dist_pct')
-        if FILTER_MIN_SAR_DIST_PCT is not None and (v is None or v < FILTER_MIN_SAR_DIST_PCT):
-            return False
-        if FILTER_MAX_SAR_DIST_PCT is not None and (v is None or v > FILTER_MAX_SAR_DIST_PCT):
-            return False
-        return True
+    # ── timeline global M5: gabungan semua timestamp M5 semua koin, urut kronologis ──
+    all_ts = set()
+    for symbol, m5 in m5_data.items():
+        if m5 is not None:
+            all_ts.update(int(t) for t in m5['TS'])
+    timeline = sorted(all_ts)
 
-    def close_trade(symbol, direction, exit_price, reason, exit_ts):
+    # index cepat: ts -> row index, per simbol (O(1) lookup, bukan np.where linear tiap kali)
+    ts_to_idx = {}
+    for symbol, m5 in m5_data.items():
+        if m5 is not None:
+            ts_to_idx[symbol] = {int(t): i for i, t in enumerate(m5['TS'])}
+
+    # daftar posisi aktif per simbol (utk hindari scan semua active_positions tiap tick)
+    positions_by_symbol = {}   # symbol -> set(keys)
+
+    # state per level per koin, DIURUTKAN by confirm_ts supaya bisa "aktifkan" scr progresif
+    # tanpa scan ulang semua level tiap tick (pointer per simbol: level yg blm confirm_ts
+    # dilewati, sekali lewat confirm_ts baru masuk daftar 'live' simbol itu).
+    level_state = {}   # (symbol, idx_event) -> {'status', 'used'}
+    for symbol, cp in coins.items():
+        for idx, ev in enumerate(cp['events']):
+            level_state[(symbol, idx)] = {'status': 'waiting', 'used': False}
+    live_levels_by_symbol = {symbol: [] for symbol in coins}   # levels sudah lewat confirm_ts
+    pending_activation = {}    # symbol -> list of (confirm_ts, idx) belum diaktifkan, urut asc
+    for symbol, cp in coins.items():
+        pending_activation[symbol] = sorted(
+            [(ev['confirm_ts'], idx) for idx, ev in enumerate(cp['events'])])
+
+    def open_trade(symbol, ev, entry_price, entry_ts):
         nonlocal balance
-        key = _akey(symbol, direction)
-        pos = active_positions[key]
-        entry, dist, qty = pos['entry'], pos['dist'], pos['qty']
+        direction = ev['direction']
+        if direction == 'Short':
+            sl = entry_price * (1 + SL_PCT)
+        else:
+            sl = entry_price * (1 - SL_PCT)
+        dist = abs(entry_price - sl)
+        if TP_R > 0:
+            tp = entry_price - TP_R * dist if direction == 'Short' else entry_price + TP_R * dist
+        else:
+            tp = None
+
+        risk_amount = balance * RISK_PCT
+        raw_qty = risk_amount / dist if dist > 0 else 0
+        qty, skipped, bumped = _apply_min_order_size(raw_qty, entry_price)
+        if skipped or qty <= 0:
+            return None, 'min_order'
+
+        notional = entry_price * qty
+        margin_needed = notional / LEVERAGE
+        if (_current_margin_used() + margin_needed) > balance * MARGIN_USAGE_CAP:
+            return None, 'margin'
+
+        if _slots_used() >= MAX_CONCURRENT:
+            return None, 'slot'
+
+        key = _akey(symbol, direction, ev['level'], ev['kind'])
+        active_positions[key] = {
+            'symbol': symbol, 'direction': direction, 'entry': entry_price, 'sl': sl,
+            'tp': tp, 'dist': dist, 'qty': qty, 'entry_ts': entry_ts, 'level': ev['level'],
+            'kind': ev['kind'],
+        }
+        positions_by_symbol.setdefault(symbol, set()).add(key)
+        return key, None
+
+    def close_trade(key, exit_price, reason, exit_ts):
+        nonlocal balance
+        pos = active_positions.pop(key)
+        positions_by_symbol.get(pos['symbol'], set()).discard(key)
+        entry, dist, qty, direction = pos['entry'], pos['dist'], pos['qty'], pos['direction']
         pnl_gross = (exit_price - entry) * qty if direction == 'Long' else (entry - exit_price) * qty
         fee = entry * qty * FEE_ENTRY_PCT + exit_price * qty * FEE_EXIT_PCT
         pnl_net = pnl_gross - fee
         balance += pnl_net
-        # r_mult (dan karenanya status Win/Loss di WR% seluruh dashboard) dihitung dari PNL_NET
-        # (SETELAH fee), bukan pnl_gross. Kalau tidak, trade yg harganya untung tipis tapi abis
-        # fee jadi rugi (persis keluhan "kadang rugi kecil gara2 fee") akan SALAH tercatat sbg
-        # "Win" -- WR% jadi menyesatkan drpd P&L aktual yg masuk ke balance.
-        r_mult = pnl_net / (dist * qty) if dist * qty else 0
-        trade = {
-            'symbol': symbol, 'direction': direction, 'entry': entry, 'sl': pos['sl'],
+        r_mult = pnl_net / (dist * qty) if dist * qty > 0 else 0
+        trades.append({
+            'symbol': pos['symbol'], 'direction': direction, 'entry': entry, 'sl': pos['sl'],
             'exit': exit_price, 'reason': reason, 'r_mult': r_mult, 'pnl_usd': pnl_net,
             'entry_ts': pos['entry_ts'], 'exit_ts': exit_ts, 'balance_after': balance,
-        }
-        trade.update(pos.get('ind') or {})
-        trades.append(trade)
-        del active_positions[key]
+            'level': pos['level'], 'kind': pos['kind'],
+        })
 
-    def _check_sl_trailing_one_candle(symbol, direction, key, hh, ll, candle_ts):
-        """Cek SL/TP/breakeven-guard/trailing utk 1 posisi di 1 candle (M5 atau H1 fallback).
-        Urutan cek dlm 1 candle: SL dulu (worst-case/konservatif -- kalau candle extreme bisa
-        kena SL & TP sekaligus, SL yg dianggap kena duluan), baru TP (limit order sungguhan --
-        fill PERSIS di harga TP kalau wick menyentuhnya). Return True kalau posisi closed di
-        candle ini (caller harus stop iterasi utk key ini)."""
-        pos = active_positions.get(key)
-        if pos is None:
-            return False
-        if direction == 'Long':
-            if ll <= pos['stop']:
-                reason = 'TRAIL' if pos['trail_active'] else 'SL'
-                close_trade(symbol, 'Long', pos['stop'], reason, candle_ts)
-                return True
-            if TP_R > 0 and hh >= pos['entry'] + TP_R * pos['dist']:
-                close_trade(symbol, 'Long', pos['entry'] + TP_R * pos['dist'], 'TP', candle_ts)
-                return True
-            pos['peak'] = max(pos['peak'], hh)
-            if (BE_GUARD_TRIGGER_R > 0 and not pos['breakeven_done']
-                    and pos['peak'] >= pos['entry'] + BE_GUARD_TRIGGER_R * pos['dist']):
-                pos['stop'] = pos['entry'] + BE_GUARD_LOCK_R * pos['dist']
-                pos['breakeven_done'] = True
-            if not pos['trail_active'] and pos['peak'] >= pos['act_price']:
-                pos['trail_active'] = True
-            if pos['trail_active']:
-                pos['stop'] = max(pos['stop'], pos['peak'] - TRAIL_STOP * pos['dist'])
-        else:
-            if hh >= pos['stop']:
-                reason = 'TRAIL' if pos['trail_active'] else 'SL'
-                close_trade(symbol, 'Short', pos['stop'], reason, candle_ts)
-                return True
-            if TP_R > 0 and ll <= pos['entry'] - TP_R * pos['dist']:
-                close_trade(symbol, 'Short', pos['entry'] - TP_R * pos['dist'], 'TP', candle_ts)
-                return True
-            pos['peak'] = min(pos['peak'], ll)
-            if (BE_GUARD_TRIGGER_R > 0 and not pos['breakeven_done']
-                    and pos['peak'] <= pos['entry'] - BE_GUARD_TRIGGER_R * pos['dist']):
-                pos['stop'] = pos['entry'] - BE_GUARD_LOCK_R * pos['dist']
-                pos['breakeven_done'] = True
-            if not pos['trail_active'] and pos['peak'] <= pos['act_price']:
-                pos['trail_active'] = True
-            if pos['trail_active']:
-                pos['stop'] = min(pos['stop'], pos['peak'] + TRAIL_STOP * pos['dist'])
-        return False
-
-    n_ts = len(timeline)
-    for step, ts in enumerate(timeline):
-        if step % 500 == 0:
-            _log_msg(f"   ⏱️  Simulasi gabungan: {step}/{n_ts} timestamp | "
-                      f"balance ${balance:.2f} | slot {_slots_used()}/{MAX_CONCURRENT} | trade {len(trades)}")
-
-        for symbol, c in coins.items():
-            idx = c['ts_to_idx'].get(ts)
-            if idx is None or idx < c['warmup'] or idx >= c['n'] - 1:
-                continue   # koin ini tidak punya candle di jam ini, atau di luar rentang valid
-            i = idx
-            O, H, L, C_, TS = c['O'], c['H'], c['L'], c['C'], c['TS']
-            ema_fast, ema_slow = c['ema_fast'], c['ema_slow']
-
-            death_cross  = ema_fast[i-1] >= ema_slow[i-1] and ema_fast[i] < ema_slow[i]
-            golden_cross = ema_fast[i-1] <= ema_slow[i-1] and ema_fast[i] > ema_slow[i]
-
-            key_long  = _akey(symbol, 'Long')
-            key_short = _akey(symbol, 'Short')
-
-            # ── 0) NO-TRADE SESSION (full halt) — cek PALING AWAL, sebelum flip/entry apapun.
-            #    Kalau candle SAAT INI jatuh di sesi no-trade: batalkan semua pending, tutup
-            #    semua posisi filled (harga close candle ini), lalu SKIP total sisa logika utk
-            #    symbol ini di candle ini (flip, SL/trailing normal, entry baru) -- persis
-            #    "berhenti trading total" sampai sesi berakhir. ──
-            if _in_no_trade_session(int(TS[i])):
-                if key_long in pending:
-                    del pending[key_long]
-                    blocked_by_no_trade_session += 1
-                if key_short in pending:
-                    del pending[key_short]
-                    blocked_by_no_trade_session += 1
-                if key_long in active_positions:
-                    close_trade(symbol, 'Long', C_[i], 'NO_TRADE_SESSION', int(TS[i]))
-                    closed_by_no_trade_session += 1
-                if key_short in active_positions:
-                    close_trade(symbol, 'Short', C_[i], 'NO_TRADE_SESSION', int(TS[i]))
-                    closed_by_no_trade_session += 1
+    for now_ts in timeline:
+        # 1) proses SL/exit posisi aktif dulu (hanya simbol yg punya posisi aktif)
+        for symbol in list(positions_by_symbol.keys()):
+            keys = positions_by_symbol.get(symbol)
+            if not keys:
                 continue
+            idx_map = ts_to_idx.get(symbol)
+            if idx_map is None or now_ts not in idx_map:
+                continue
+            j = idx_map[now_ts]
+            m5 = m5_data[symbol]
+            hi, lo = m5['H'][j], m5['L'][j]
+            for key in list(keys):
+                pos = active_positions[key]
+                direction = pos['direction']
+                sl_hit = (hi >= pos['sl'] - 1e-12) if direction == 'Short' else (lo <= pos['sl'] + 1e-12)
+                tp_hit = False
+                if pos['tp'] is not None:
+                    tp_hit = (lo <= pos['tp'] + 1e-12) if direction == 'Short' else (hi >= pos['tp'] - 1e-12)
+                # SL diprioritaskan kalau keduanya kena di candle yg sama (worst-case)
+                if sl_hit:
+                    close_trade(key, pos['sl'], 'SL', now_ts)
+                elif tp_hit:
+                    close_trade(key, pos['tp'], 'TP', now_ts)
 
-            death_cross  = ema_fast[i-1] >= ema_slow[i-1] and ema_fast[i] < ema_slow[i]
-            golden_cross = ema_fast[i-1] <= ema_slow[i-1] and ema_fast[i] > ema_slow[i]
+        # 2) aktifkan level yg baru lewat confirm_ts (pindah dari pending ke live), per simbol
+        for symbol, plist in pending_activation.items():
+            while plist and plist[0][0] < now_ts:
+                _, idx = plist.pop(0)
+                live_levels_by_symbol[symbol].append(idx)
 
-            # ── 1) FLIP PROTECTION murni EMA cross (TANPA syarat RSI) — cross berlawanan
-            #    LANGSUNG membatalkan waiting_confirm/armed_m5/pending (tidak ada urusan
-            #    profit, blm ada entry). Untuk posisi FILLED: HANYA ditutup kalau CLOSE candle
-            #    yang menyebabkan cross berlawanan (C_[i], candle cross itu sendiri -- BUKAN
-            #    candle setelahnya) SUDAH >= FLIP_MIN_R dari entry (dihitung dari entry & dist
-            #    posisi itu). Kalau msh < FLIP_MIN_R (termasuk floating loss), posisi DIBIARKAN
-            #    jalan terus -- cuma keluar lewat TRAIL/SL/breakeven-guard normal di bagian (2).
-            #    Eksekusi close tetap di O[i+1] (konsisten dgn model eksekusi entry/exit lain
-            #    di backtest ini), tapi KEPUTUSANnya berdasarkan close candle cross.
-            #    Selain flip berlawanan, cross H1 SEARAH yang BARU juga tetap me-RESET proses
-            #    waiting_confirm/armed_m5 arah yg sama yg belum selesai (mulai lagi dari cross
-            #    baru itu) -- ini TIDAK terkait flip, jadi tetap dipertahankan. ──
-            if golden_cross:
-                waiting_confirm.pop(key_long, None)
-                armed_m5.pop(key_long, None)
-                pending.pop(key_long, None)    # legacy mode: reset arah SEARAH (golden->Long)
-            if death_cross:
-                waiting_confirm.pop(key_short, None)
-                armed_m5.pop(key_short, None)
-                pending.pop(key_short, None)   # legacy mode: reset arah SEARAH (death->Short)
-            if death_cross:
-                pending.pop(key_long, None)
-                waiting_confirm.pop(key_long, None)
-                armed_m5.pop(key_long, None)
-                pos_long = active_positions.get(key_long)
-                if pos_long is not None and pos_long['dist'] > 0:
-                    current_r = (C_[i] - pos_long['entry']) / pos_long['dist']
-                    if current_r >= FLIP_MIN_R - 1e-9:
-                        close_trade(symbol, 'Long', O[i+1], 'FLIP', int(TS[i+1]))
-                    else:
-                        flip_held_below_1r += 1
-            if golden_cross:
-                pending.pop(key_short, None)
-                waiting_confirm.pop(key_short, None)
-                armed_m5.pop(key_short, None)
-                pos_short = active_positions.get(key_short)
-                if pos_short is not None and pos_short['dist'] > 0:
-                    current_r = (pos_short['entry'] - C_[i]) / pos_short['dist']
-                    if current_r >= FLIP_MIN_R - 1e-9:
-                        close_trade(symbol, 'Short', O[i+1], 'FLIP', int(TS[i+1]))
-                    else:
-                        flip_held_below_1r += 1
+        # 3) proses level SBR live: waiting->armed->fill, hanya simbol yg punya candle M5 di now_ts
+        for symbol, cp in coins.items():
+            live_idxs = live_levels_by_symbol.get(symbol)
+            if not live_idxs:
+                continue
+            idx_map = ts_to_idx.get(symbol)
+            if idx_map is None or now_ts not in idx_map:
+                continue
+            j = idx_map[now_ts]
+            m5 = m5_data[symbol]
+            close_p, hi, lo = m5['C'][j], m5['H'][j], m5['L'][j]
 
-            # ── 2+3) SL/TRAILING + FILL PENDING — presisi M5 kalau tersedia, fallback H1 ──
-            m5w = _m5_window_for(symbol, i, TS)
-            if m5w is not None:
-                # ── MODE M5: iterasi tiap candle 5-menit dlm rentang candle H1 ini, urutan
-                # kejadian (SL/trail kena, lalu fill pending) dicek per-M5 candle -- presisi
-                # jauh lebih tinggi drpd asumsi "semua kejadian dalam 1 jam itu bersamaan". ──
-                n_m5 = len(m5w['TS'])
-                for mi in range(n_m5):
-                    hh, ll = m5w['H'][mi], m5w['L'][mi]
-                    m5_ts = int(m5w['TS'][mi])
-                    # -- 2) SL/trailing (posisi yg SUDAH filled) --
-                    for direction, key in (('Short', key_short), ('Long', key_long)):
-                        _check_sl_trailing_one_candle(symbol, direction, key, hh, ll, m5_ts)
-                    # -- 3) fill pending (limit blm filled) --
-                    for direction, key in (('Short', key_short), ('Long', key_long)):
-                        p = pending.get(key)
-                        if p is not None and key not in active_positions:
-                            filled = (hh >= p['entry']) if direction == 'Short' else (ll <= p['entry'])
-                            if filled and _session_blocked(m5_ts):
-                                blocked_by_session += 1
-                                del pending[key]
-                                continue
-                            if filled:
-                                dist = p['dist']
-                                min_dist = p['entry'] * MIN_DIST_PCT
-                                if dist < min_dist:
-                                    dist = min_dist
-                                risk_usd = balance * RISK_PCT
-                                raw_qty = risk_usd / dist if dist > 0 else 0
-                                qty, skipped_min_order, bumped_min_order = _apply_min_order_size(raw_qty, p['entry'])
-                                if skipped_min_order:
-                                    blocked_by_min_order += 1
-                                    del pending[key]
-                                    continue
-                                if bumped_min_order:
-                                    bumped_by_min_order += 1
-                                margin_needed = (p['entry'] * qty) / LEVERAGE
-                                if _current_margin_used() + margin_needed > balance * MARGIN_USAGE_CAP:
-                                    blocked_by_margin += 1
-                                    del pending[key]
-                                    continue
-                                act_price = (p['entry'] + TRAIL_ACT_R * dist) if direction == 'Long' \
-                                            else (p['entry'] - TRAIL_ACT_R * dist)
-                                ind = dict(p.get('ind') or {})
-                                ind['dist_pct'] = (dist / p['entry'] * 100) if p['entry'] else None
-                                active_positions[key] = {
-                                    'entry': p['entry'], 'sl': p['sl'], 'dist': dist, 'stop': p['sl'],
-                                    'trail_active': False, 'peak': p['entry'], 'act_price': act_price,
-                                    'breakeven_done': False,
-                                    'qty': qty, 'entry_ts': m5_ts, 'ind': ind,
-                                }
-                                del pending[key]
-            else:
-                # ── FALLBACK MODE H1 (data M5 tdk tersedia utk symbol ini, atau mode nonaktif) ──
-                # -- 2) SL / trailing normal --
-                for direction, key in (('Short', key_short), ('Long', key_long)):
-                    h, l = H[i], L[i]
-                    _check_sl_trailing_one_candle(symbol, direction, key, h, l, int(TS[i]))
-
-                # -- 3) cek fill pending (limit di wick), TUNDUK ke MARGIN (leverage) --
-                for direction, key in (('Short', key_short), ('Long', key_long)):
-                    p = pending.get(key)
-                    if p is not None and key not in active_positions:
-                        filled = (H[i] >= p['entry']) if direction == 'Short' else (L[i] <= p['entry'])
-                        if filled and _session_blocked(int(TS[i])):
-                            # Waktu FILL jatuh di sesi yg diblokir (SESSION_BLOCK_LIST) -> batalkan
-                            # limit, jangan buka posisi. Bukan cuma "skip candle ini": limit yg
-                            # sama tidak akan dicoba fill lagi di candle berikutnya krn sudah
-                            # dihapus dari pending (persis kayak "berhenti trading" di sesi ini).
-                            blocked_by_session += 1
-                            del pending[key]
-                            continue
-                        if filled:
-                            dist = p['dist']
-                            min_dist = p['entry'] * MIN_DIST_PCT
-                            if dist < min_dist:
-                                dist = min_dist
-                            risk_usd = balance * RISK_PCT   # <-- COMPOUNDING: 1% dari balance TERKINI (shared)
-                            raw_qty = risk_usd / dist if dist > 0 else 0
-                            qty, skipped_min_order, bumped_min_order = _apply_min_order_size(raw_qty, p['entry'])
-                            if skipped_min_order:
-                                blocked_by_min_order += 1
-                                del pending[key]
-                                continue
-                            if bumped_min_order:
-                                bumped_by_min_order += 1
-
-                            # MARGIN CHECK (persis Bybit asli): notional = qty*entry, margin = notional/leverage.
-                            # Kalau margin yg sudah dipakai + margin posisi baru ini > batas (mis. 90% balance),
-                            # order DITOLAK exchange -- risk 1% tidak berarti "99 kesempatan lagi", karena
-                            # margin-nya sendiri yg akan habis duluan jauh sebelum itu.
-                            margin_needed = (p['entry'] * qty) / LEVERAGE
-                            if _current_margin_used() + margin_needed > balance * MARGIN_USAGE_CAP:
-                                blocked_by_margin += 1
-                                del pending[key]
-                                continue
-
-                            act_price = (p['entry'] + TRAIL_ACT_R * dist) if direction == 'Long' \
-                                        else (p['entry'] - TRAIL_ACT_R * dist)
-                            ind = dict(p.get('ind') or {})
-                            ind['dist_pct'] = (dist / p['entry'] * 100) if p['entry'] else None
-                            active_positions[key] = {
-                                'entry': p['entry'], 'sl': p['sl'], 'dist': dist, 'stop': p['sl'],
-                                'trail_active': False, 'peak': p['entry'], 'act_price': act_price,
-                                    'breakeven_done': False,
-                                'qty': qty, 'entry_ts': int(TS[i]), 'ind': ind,
-                            }
-                            del pending[key]
-
-            # ── 4) daftarkan support/resistance valid baru -> armed (bias arah, tetap hidup) ──
-            for e in c['events_by_c3'].get(i, []):
-                if not e['valid']:
+            still_live = []
+            for idx in live_idxs:
+                ev = cp['events'][idx]
+                st = level_state[(symbol, idx)]
+                if st['used']:
+                    continue   # level mati, buang dari daftar live
+                level = ev['level']
+                key_pos = _akey(symbol, ev['direction'], level, ev['kind'])
+                if key_pos in active_positions:
+                    still_live.append(idx)
                     continue
-                if e['type'] == 'support':
-                    armed[key_short] = {'c1_ts': e['c1_ts']}
-                else:
-                    armed[key_long] = {'c1_ts': e['c1_ts']}
 
-            if not EMA_CONFIRM_MODE:
-                # ── 5-LEGACY) cross SEARAH -> pasang/ganti limit di wick, TUNDUK ke RSI GATE,
-                # MAX_CONCURRENT & FILTER (perilaku LAMA, dipakai kalau EMA_CONFIRM_MODE=0). ──
-                if death_cross and key_short in armed and key_short not in active_positions:
-                    wick = H[i] - ENTRY_LEVEL_PCT * (H[i] - L[i])
-                    old_dist = wick * SL_PCT
-                    if old_dist > 0:
-                        if not _passes_rsi_gate(c, i, 'Short'):
-                            blocked_by_rsi_gate += 1
-                        elif not _passes_swing_filter(H, L, O, C_, i, 'Short'):
-                            blocked_by_swing += 1
-                        elif not _passes_candle_direction_filter(O, C_, i, 'Short'):
-                            blocked_by_candle_direction += 1
+                dist_pct = abs(close_p - level) / level
+
+                if st['status'] == 'waiting':
+                    if dist_pct <= APPROACH_PCT:
+                        st['status'] = 'armed'
+                elif st['status'] == 'armed':
+                    touched = (lo <= level <= hi)
+                    if touched:
+                        opened_key, block_reason = open_trade(symbol, ev, level, now_ts)
+                        if opened_key is not None:
+                            st['used'] = True
                         else:
-                            ind = _capture_indicators(c, i)
-                            ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
-                            if not _passes_filters(ind, filters_enabled):
-                                blocked_by_filter += 1
-                            elif key_short not in pending and _slots_used() >= MAX_CONCURRENT:
+                            if block_reason == 'slot':
                                 blocked_by_slot += 1
-                            else:
-                                pending[key_short] = {
-                                    'entry': wick, 'sl': wick + old_dist, 'dist': old_dist, 'ind': ind,
-                                }
+                            elif block_reason == 'margin':
+                                blocked_by_margin += 1
+                            elif block_reason == 'min_order':
+                                blocked_by_min_order += 1
+                            # tetap 'armed' -- coba lagi candle M5 berikutnya kalau msh dlm radius
+                    elif dist_pct > APPROACH_PCT:
+                        st['status'] = 'waiting'   # menjauh lagi, cabut limit, level tetap hidup
+                still_live.append(idx)
+            live_levels_by_symbol[symbol] = still_live
 
-                if golden_cross and key_long in armed and key_long not in active_positions:
-                    wick = L[i] + ENTRY_LEVEL_PCT * (H[i] - L[i])
-                    old_dist = wick * SL_PCT
-                    if old_dist > 0:
-                        if not _passes_rsi_gate(c, i, 'Long'):
-                            blocked_by_rsi_gate += 1
-                        elif not _passes_swing_filter(H, L, O, C_, i, 'Long'):
-                            blocked_by_swing += 1
-                        elif not _passes_candle_direction_filter(O, C_, i, 'Long'):
-                            blocked_by_candle_direction += 1
-                        else:
-                            ind = _capture_indicators(c, i)
-                            ind['dist_pct_est'] = (old_dist / wick * 100) if wick else None
-                            if not _passes_filters(ind, filters_enabled):
-                                blocked_by_filter += 1
-                            elif key_long not in pending and _slots_used() >= MAX_CONCURRENT:
-                                blocked_by_slot += 1
-                            else:
-                                pending[key_long] = {
-                                    'entry': wick, 'sl': wick - old_dist, 'dist': old_dist, 'ind': ind,
-                                }
-            else:
-                # ── 5) cross SEARAH -> lolos RSI GATE/swing/candle-direction/FILTER (persis
-                # gate lama), tapi BELUM pasang limit -- masuk 'waiting_confirm' dulu, menunggu
-                # candle H1 berikutnya sentuh wick EMA4 + close searah (lihat bagian 5b). ──
-                if death_cross and key_short in armed and key_short not in active_positions \
-                        and key_short not in waiting_confirm and key_short not in armed_m5:
-                    if not _passes_rsi_gate(c, i, 'Short'):
-                        blocked_by_rsi_gate += 1
-                    elif not _passes_swing_filter(H, L, O, C_, i, 'Short'):
-                        blocked_by_swing += 1
-                    elif not _passes_candle_direction_filter(O, C_, i, 'Short'):
-                        blocked_by_candle_direction += 1
-                    else:
-                        ind = _capture_indicators(c, i)
-                        if not _passes_filters(ind, filters_enabled):
-                            blocked_by_filter += 1
-                        else:
-                            waiting_confirm[key_short] = {'cross_i': i, 'ind': ind}
-
-                if golden_cross and key_long in armed and key_long not in active_positions \
-                        and key_long not in waiting_confirm and key_long not in armed_m5:
-                    if not _passes_rsi_gate(c, i, 'Long'):
-                        blocked_by_rsi_gate += 1
-                    elif not _passes_swing_filter(H, L, O, C_, i, 'Long'):
-                        blocked_by_swing += 1
-                    elif not _passes_candle_direction_filter(O, C_, i, 'Long'):
-                        blocked_by_candle_direction += 1
-                    else:
-                        ind = _capture_indicators(c, i)
-                        if not _passes_filters(ind, filters_enabled):
-                            blocked_by_filter += 1
-                        else:
-                            waiting_confirm[key_long] = {'cross_i': i, 'ind': ind}
-
-                # ── 5b) KONFIRMASI EMA4 H1 -- dicek di candle INI (i) utk sinyal yg sedang
-                # 'waiting_confirm' dari cross SEBELUMNYA (cross_i < i). Body-break -> batal
-                # total. Wick-touch + close searah -> lolos, mulai armed_m5 dari candle
-                # BERIKUTNYA (i+1). Belum keduanya -> tetap menunggu, cek lagi candle depan. ──
-                for direction, key in (('Short', key_short), ('Long', key_long)):
-                    wc = waiting_confirm.get(key)
-                    if wc is None or wc['cross_i'] >= i:
-                        continue   # belum ada sinyal menunggu, atau ini candle cross itu sendiri
-                    if _ema4_body_break(O, C_, ema_fast, i, direction):
-                        blocked_by_ema4_break += 1
-                        del waiting_confirm[key]
-                    elif _ema4_wick_confirm(H, L, C_, ema_fast, i, direction):
-                        armed_m5[key] = {'ind': wc['ind'], 'from_i': i,
-                                          'swing_idx': None, 'swing_level': None,
-                                          'scan_from': None, 'limit_price': None,
-                                          'limit_scan_from': None}
-                        del waiting_confirm[key]
-                    # else: belum body-break maupun wick-confirm -> tetap waiting_confirm,
-                    # dicek lagi di candle H1 berikutnya (loop natural krn tidak dihapus).
-
-                # ── 5c) MONITORING M5 -- 2 TAHAP BERURUTAN, dikerjakan di ARRAY M5 ABSOLUT
-                # (bukan window per-H1) krn swing butuh melongok candle M5 lintas batas jam.
-                # `max_idx` dibatasi TS[i+1] (akhir candle H1 SAAT INI) -- batas "candle M5 yg
-                # sudah benar-benar terjadi sejauh simulasi berjalan ke jam ini", mencegah
-                # look-ahead. Tahap per key (state persisten di dict armed_m5[key]):
-                #   a) swing_level None -> cari SWING POINT M5 pertama valid searah bias (low/
-                #      high candle tsb tdk terlampaui oleh SWING_M5_RIGHT candle setelahnya).
-                #      Ketemu -> LANGSUNG jadi limit_price (limit dipasang PERSIS di level
-                #      swing itu sendiri, tanpa tahap tunggu-tersentuh atau EMA-cross lagi).
-                #   b) limit_price ada -> tunggu candle M5 SETELAH swing_idx yg WICK-nya
-                #      menyentuh limit_price (Long: low <= limit; Short: high >= limit) ->
-                #      ENTRY (fill) persis di harga limit itu sendiri.
-                # Fallback tanpa data M5 sama sekali: proxy pakai close candle H1 ini (spt
-                # sebelumnya), krn swing structural butuh data M5 & tidak bisa direplikasi
-                # dari H1 semata.
-                for direction, key in (('Short', key_short), ('Long', key_long)):
-                    am = armed_m5.get(key)
-                    if am is None or am['from_i'] >= i or key in active_positions:
-                        continue
-                    m5 = m5_data.get(symbol)
-                    entry_price = None
-                    entry_ts_final = None
-                    if M5_PRECISION_MODE and m5 is not None and len(m5['TS']) > 0:
-                        max_idx = int(np.searchsorted(m5['TS'], int(TS[i + 1]), side='left'))
-                        m5_L, m5_H, m5_C, m5_TS = m5['L'], m5['H'], m5['C'], m5['TS']
-
-                        if am['limit_price'] is None:
-                            # tahap a) belum ada swing/limit patokan.
-                            if am['scan_from'] is None:
-                                # Monitoring M5 dimulai +5 menit setelah candle H1 berikutnya
-                                # buka -- candle M5 pertama dlm jam itu dilewati.
-                                monitor_start_ts = int(TS[am['from_i'] + 1]) + 5 * 60_000
-                                start_idx = int(np.searchsorted(m5_TS, monitor_start_ts, side='left'))
-                            else:
-                                start_idx = am['scan_from']
-                            s_idx, s_level = _find_first_valid_swing_m5(m5_L, m5_H, start_idx, max_idx, direction)
-                            if s_idx is not None:
-                                am['swing_idx'] = s_idx
-                                am['swing_level'] = s_level
-                                am['limit_price'] = s_level   # limit LANGSUNG di level swing
-                                am['limit_scan_from'] = s_idx + 1   # scan fill mulai stlh swing_idx
-                            else:
-                                am['scan_from'] = max(start_idx, max_idx - SWING_M5_RIGHT - 1, start_idx)
-
-                        if am['limit_price'] is not None:
-                            # tahap b) limit sudah dipasang di level swing -- tunggu candle M5
-                            # SETELAHNYA yg WICK-nya menyentuh harga limit -> fill PERSIS di
-                            # harga limit itu.
-                            level = am['limit_price']
-                            k = am['limit_scan_from']
-                            while k < max_idx:
-                                touched = (m5_L[k] <= level) if direction == 'Long' else (m5_H[k] >= level)
-                                if touched:
-                                    entry_price = level   # fill di harga LIMIT, bukan close candle
-                                    entry_ts_final = int(m5_TS[k])
-                                    break
-                                k += 1
-                            am['limit_scan_from'] = max(k, am['limit_scan_from'])
-                    if entry_price is None:
-                        if m5 is None or not M5_PRECISION_MODE:
-                            # FALLBACK tanpa data M5 sama sekali: proxy pakai close candle H1
-                            # INI, hanya kalau candle H1 ini sendiri jg cross searah bias (cara
-                            # kasar, mencegah sinyal macet selamanya kalau data M5 tdk tersedia).
-                            if direction == 'Long' and golden_cross:
-                                entry_price = C_[i]; entry_ts_final = int(TS[i])
-                            elif direction == 'Short' and death_cross:
-                                entry_price = C_[i]; entry_ts_final = int(TS[i])
-                        if entry_price is None:
-                            continue   # msh menunggu (salah satu dari tahap a/b/c/d blm lolos)
-
-                    dist = entry_price * SL_PCT
-                    min_dist = entry_price * MIN_DIST_PCT
-                    if dist < min_dist:
-                        dist = min_dist
-                    if dist <= 0:
-                        continue
-                    risk_usd = balance * RISK_PCT
-                    raw_qty = risk_usd / dist
-                    qty, skipped_min_order, bumped_min_order = _apply_min_order_size(raw_qty, entry_price)
-                    if skipped_min_order:
-                        blocked_by_min_order += 1
-                        del armed_m5[key]
-                        continue
-                    if bumped_min_order:
-                        bumped_by_min_order += 1
-                    # slot ini sendiri sudah dihitung di armed_m5 (lihat _slots_used) -- kurangi
-                    # 1 dari perbandingan spy tidak memblok dirinya sendiri, konsisten dgn pola
-                    # "key not in pending" pada alur limit lama.
-                    if _slots_used() - 1 >= MAX_CONCURRENT:
-                        blocked_by_slot += 1
-                        del armed_m5[key]
-                        continue
-                    margin_needed = (entry_price * qty) / LEVERAGE
-                    if _current_margin_used() + margin_needed > balance * MARGIN_USAGE_CAP:
-                        blocked_by_margin += 1
-                        del armed_m5[key]
-                        continue
-                    sl_price = entry_price + dist if direction == 'Short' else entry_price - dist
-                    act_price = (entry_price + TRAIL_ACT_R * dist) if direction == 'Long' \
-                                else (entry_price - TRAIL_ACT_R * dist)
-                    ind = dict(am.get('ind') or {})
-                    ind['dist_pct_est'] = (dist / entry_price * 100) if entry_price else None
-                    ind['dist_pct'] = ind['dist_pct_est']
-                    active_positions[key] = {
-                        'entry': entry_price, 'sl': sl_price, 'dist': dist, 'stop': sl_price,
-                        'trail_active': False, 'peak': entry_price, 'act_price': act_price,
-                                    'breakeven_done': False,
-                        'qty': qty, 'entry_ts': entry_ts_final, 'ind': ind,
-                    }
-                    del armed_m5[key]
-                    # ── CATCH-UP: posisi baru ini entry di TENGAH window H1 (candle M5 index
-                    # `entry_k`), tapi loop SL/trailing utama (bagian 2, di atas) sudah lewat
-                    # candle2 M5 window ini SEBELUM posisi ini ada. Tanpa catch-up, posisi baru
-                    # baru mulai "dijaga" SL/trailing/breakeven-guard di JAM BERIKUTNYA -- celah
-                    # sampai 1 jam. Proses sisa candle M5 (dari SETELAH entry_k sampai max_idx)
-                    # SEKARANG, di window H1 yg sama, spy presisi konsisten dgn posisi lain. ──
-                    if M5_PRECISION_MODE and m5 is not None and len(m5['TS']) > 0:
-                        entry_k = int(np.searchsorted(m5['TS'], entry_ts_final, side='left'))
-                        for kk in range(entry_k + 1, max_idx):
-                            if key not in active_positions:
-                                break   # sudah closed oleh candle M5 sebelumnya dlm catch-up ini
-                            _check_sl_trailing_one_candle(symbol, direction, key,
-                                                           m5['H'][kk], m5['L'][kk], int(m5['TS'][kk]))
-
-    wins = [t for t in trades if t['r_mult'] > 0]
+    n_trades = len(trades)
+    n_win = sum(1 for t in trades if t['pnl_usd'] > 0)
+    n_loss = n_trades - n_win
+    wr = (n_win / n_trades * 100) if n_trades else 0
     total_pnl = sum(t['pnl_usd'] for t in trades)
+    total_r = sum(t['r_mult'] for t in trades)
+    avg_r = total_r / n_trades if n_trades else 0
+    roi = (balance - INITIAL_BALANCE) / INITIAL_BALANCE * 100
+
     return {
-        'trades': trades, 'final_balance': balance,
+        'trades': trades, 'n_trades': n_trades, 'n_win': n_win, 'n_loss': n_loss,
+        'wr': wr, 'total_pnl': total_pnl, 'total_r': total_r, 'avg_r': avg_r,
+        'final_balance': balance, 'roi': roi,
         'blocked_by_slot': blocked_by_slot, 'blocked_by_margin': blocked_by_margin,
-        'blocked_by_filter': blocked_by_filter, 'blocked_by_rsi_gate': blocked_by_rsi_gate,
-        'blocked_by_session': blocked_by_session,
-        'blocked_by_min_order': blocked_by_min_order, 'bumped_by_min_order': bumped_by_min_order,
-        'blocked_by_swing': blocked_by_swing,
-        'blocked_by_candle_direction': blocked_by_candle_direction,
-        'blocked_by_no_trade_session': blocked_by_no_trade_session,
-        'closed_by_no_trade_session': closed_by_no_trade_session,
-        'blocked_by_ema4_break': blocked_by_ema4_break,
-        'blocked_by_ema4_neutral': blocked_by_ema4_neutral,
-        'flip_held_below_1r': flip_held_below_1r,
-        'n_trades': len(trades), 'n_win': len(wins), 'n_loss': len(trades) - len(wins),
-        'wr': (len(wins) / len(trades) * 100) if trades else 0,
-        'total_pnl': total_pnl,
-        'roi': (total_pnl / INITIAL_BALANCE * 100) if INITIAL_BALANCE else 0,
-        'total_r': sum(t['r_mult'] for t in trades),
-        'avg_r': (sum(t['r_mult'] for t in trades) / len(trades)) if trades else 0,
+        'blocked_by_min_order': blocked_by_min_order,
     }
 
+
+# ============================================================
+# BREAKDOWN PER SIMBOL
+# ============================================================
 
 def per_symbol_breakdown(trades):
-    """Ringkas per-koin dari trade list gabungan (utk tabel per-coin di dashboard)."""
-    by_sym = {}
+    by_symbol = {}
     for t in trades:
-        by_sym.setdefault(t['symbol'], []).append(t)
-    out = []
-    for sym, ts_ in by_sym.items():
-        wins = [t for t in ts_ if t['r_mult'] > 0]
-        pnl  = sum(t['pnl_usd'] for t in ts_)
-        out.append({
-            'symbol': sym, 'status': 'ok', 'n_trades': len(ts_), 'n_win': len(wins),
-            'n_loss': len(ts_) - len(wins), 'wr': (len(wins) / len(ts_) * 100) if ts_ else 0,
-            'total_pnl': pnl, 'roi': None,
-            'avg_r': (sum(t['r_mult'] for t in ts_) / len(ts_)) if ts_ else 0,
-        })
-    return out
-
-
-# ============================================================
-# ANALISIS INDIKATOR SAAT CROSS — pola apa yg cenderung menang/kalah
-# ============================================================
-
-INDICATOR_INFO = {
-    'vol_ratio':      {'label': 'Volume saat cross (vs rata² 20 candle)', 'fmt': '{:.2f}x'},
-    'atr_ratio':      {'label': 'Ukuran candle cross (vs ATR14)',         'fmt': '{:.2f}x'},
-    'ema_gap_pct':    {'label': 'Jarak EMA4-EMA10 saat cross',            'fmt': '{:.3f}%'},
-    'trend_pct':      {'label': 'Posisi close vs EMA50 (tren besar)',     'fmt': '{:+.2f}%'},
-    'dist_pct':       {'label': 'Jarak SL dari entry',                    'fmt': '{:.3f}%'},
-    'rsi':            {'label': f'RSI{RSI_PERIOD} saat cross',            'fmt': '{:.1f}'},
-    'macd_hist_pct':  {'label': f'MACD histogram ({MACD_FAST}/{MACD_SLOW}/{MACD_SIGNAL}, %harga)', 'fmt': '{:+.3f}%'},
-    'sar_dist_pct':   {'label': 'Jarak close ke Parabolic SAR (%)',       'fmt': '{:+.2f}%'},
-}
-
-def indicator_analysis(trades):
-    """Utk tiap indikator: avg saat WIN vs LOSS, WR & win/loss count utk SEMUA trade (agregat),
-    + win rate & win/loss count per bucket PARTISI Rendah/Sedang/Tinggi.
-
-    PENTING - definisi bucket (PARTISI berbasis RENTANG NILAI, bukan kumulatif):
-      Semua nilai indikator (tersimpan tiap trade PERSIS saat candle cross terjadi) diambil,
-      lalu rentang [MIN, MAX] dibagi 3 bagian SAMA BESAR secara nilai (bukan sama jumlah
-      trade). Tiap trade masuk TEPAT SATU kelompok sesuai nilainya -- Rendah, Sedang, Tinggi
-      TIDAK overlap (beda dgn versi kumulatif sebelumnya di mana Sedang mencakup Rendah).
-      Tujuannya: lihat 3 populasi trade yg benar2 terpisah -- apa WR di rentang nilai rendah,
-      berapa yg di rentang sedang, berapa yg di rentang tinggi."""
-    out = {}
-    for key, info in INDICATOR_INFO.items():
-        pairs = [(t[key], t['r_mult'] > 0) for t in trades if t.get(key) is not None]
-        if len(pairs) < 6:
-            continue
-        win_vals  = [v for v, w in pairs if w]
-        loss_vals = [v for v, w in pairs if not w]
-        vmin = min(v for v, _ in pairs)
-        vmax = max(v for v, _ in pairs)
-        span = vmax - vmin
-        if span <= 0:
-            t1 = t2 = vmin
-        else:
-            t1 = vmin + span / 3
-            t2 = vmin + 2 * span / 3
-
-        buckets = {'Rendah': [], 'Sedang': [], 'Tinggi': []}
-        for v, w in pairs:
-            if v <= t1:
-                buckets['Rendah'].append(w)
-            elif v <= t2:
-                buckets['Sedang'].append(w)
-            else:
-                buckets['Tinggi'].append(w)
-
-        def _bucket_stats(ws):
-            return {
-                'wr': (sum(ws) / len(ws) * 100) if ws else None,
-                'n': len(ws),
-                'n_win': sum(1 for w in ws if w),
-                'n_loss': sum(1 for w in ws if not w),
-            }
-
-        buckets_stats = {name: _bucket_stats(ws) for name, ws in buckets.items()}
-        n_win_all = len(win_vals)
-        n_loss_all = len(loss_vals)
-        out[key] = {
-            'label': info['label'], 'fmt': info['fmt'],
-            'avg_win': (sum(win_vals) / len(win_vals)) if win_vals else None,
-            'avg_loss': (sum(loss_vals) / len(loss_vals)) if loss_vals else None,
-            'n': len(pairs), 't1': t1, 't2': t2,
-            'n_win_all': n_win_all, 'n_loss_all': n_loss_all,
-            'wr_all': (n_win_all / len(pairs) * 100) if pairs else None,
-            'buckets': buckets_stats,
-        }
-    return out
-
-
-def rsi_gate_analysis(trades):
-    """Analisis KHUSUS utk RSI gate (RSI{RSI_GATE_PERIOD}), TERPISAH Long vs Short:
-    - per_value: utk tiap nilai RSI BULAT (0-100), jumlah win/loss/WR -- supaya kelihatan
-      angka RSI spesifik mana yang paling sering menang, bukan cuma rentang besar.
-    - buckets: 3 kelompok dibagi RATA OTOMATIS dari rentang FOKUS
-      (RSI_ANALYSIS_MIN_LONG..MAX_LONG utk Long, RSI_ANALYSIS_MIN_SHORT..MAX_SHORT utk
-      Short) -- span/3, batas bulat. Trade DILUAR rentang fokus tetap dihitung ke n_total
-      & per_value, tapi tidak masuk bucket manapun (supaya bucket cuma merepresentasikan
-      rentang yg sedang difokuskan, bukan ikut numpuk di tepi).
-    - best_value: nilai RSI bulat dgn jumlah MENANG absolut terbanyak per arah (bukan cuma
-      WR% tertinggi -- supaya tidak kejebak angka dgn n kecil tapi WR 100%)."""
-    rsi_key = f'rsi{RSI_GATE_PERIOD}'
-    focus_range = {
-        'Long':  (RSI_ANALYSIS_MIN_LONG, RSI_ANALYSIS_MAX_LONG),
-        'Short': (RSI_ANALYSIS_MIN_SHORT, RSI_ANALYSIS_MAX_SHORT),
-    }
-    out = {}
-    for direction in ('Long', 'Short'):
-        pairs = [(t[rsi_key], t['r_mult'] > 0) for t in trades
-                 if t.get(rsi_key) is not None and t.get('direction') == direction]
-
-        fmin, fmax = focus_range[direction]
-        fmin_i, fmax_i = int(round(fmin)), int(round(fmax))
-        span = max(fmax_i - fmin_i, 1)
-        b1 = fmin_i + span // 3               # batas Rendah/Sedang
-        b2 = fmin_i + (2 * span) // 3          # batas Sedang/Tinggi
-        bucket_names = {
-            'Rendah': f'Rendah ({fmin_i}-{b1})',
-            'Sedang': f'Sedang ({b1+1}-{b2})',
-            'Tinggi': f'Tinggi ({b2+1}-{fmax_i})',
-        }
-        buckets = {name: {'n': 0, 'n_win': 0, 'n_loss': 0} for name in bucket_names.values()}
-
-        per_value = {}   # nilai RSI bulat (0-100) -> {n, n_win, n_loss, wr}
-        for v, w in pairs:
-            iv = int(round(v))
-            iv = max(0, min(100, iv))   # clamp jaga2 kalau RSI numerik meleset dikit dari [0,100]
-            slot = per_value.setdefault(iv, {'n': 0, 'n_win': 0, 'n_loss': 0})
-            slot['n'] += 1
-            slot['n_win'] += 1 if w else 0
-            slot['n_loss'] += 0 if w else 1
-            if fmin_i <= iv <= fmax_i:   # hanya masuk bucket kalau di dalam rentang fokus
-                bname = bucket_names['Rendah'] if iv <= b1 else (bucket_names['Sedang'] if iv <= b2 else bucket_names['Tinggi'])
-                buckets[bname]['n'] += 1
-                buckets[bname]['n_win'] += 1 if w else 0
-                buckets[bname]['n_loss'] += 0 if w else 1
-        for slot in per_value.values():
-            slot['wr'] = (slot['n_win'] / slot['n'] * 100) if slot['n'] else None
-        for b in buckets.values():
-            b['wr'] = (b['n_win'] / b['n'] * 100) if b['n'] else None
-        best_value = None
-        if per_value:
-            best_value = max(per_value.items(), key=lambda kv: kv[1]['n_win'])[0]
-        n_in_focus = sum(b['n'] for b in buckets.values())
-        out[direction] = {
-            'n_total': len(pairs),
-            'n_in_focus': n_in_focus,     # jumlah trade yg masuk rentang fokus (<= n_total)
-            'focus_range': (fmin_i, fmax_i),
-            'per_value': per_value,      # {0: {...}, 1: {...}, ..., 100: {...}}
-            'buckets': buckets,
-            'best_value': best_value,    # nilai RSI bulat dgn n_win TERBANYAK (bukan cuma WR tertinggi)
-        }
-    return out
-
-
-def session_day_analysis(trades):
-    """Analisis SESI TRADING (WIB, berdasar jam candle SAAT FILLED / entry_ts -- bukan saat
-    sinyal cross muncul, sesuai definisi: cross jam 13:00 tapi filled jam 14:00 -> masuk
-    sesi London) dan HARI (Senin-Minggu, dari entry_ts yg sama). Tiap kelompok: total trade,
-    menang, kalah, WR%."""
-    sessions = {name: {'n': 0, 'n_win': 0, 'n_loss': 0} for name, _, _ in _SESSION_DEFS}
-    days = {name: {'n': 0, 'n_win': 0, 'n_loss': 0} for name in _DAY_NAMES_ID}
-    for t in trades:
-        ts = t.get('entry_ts')
-        if ts is None:
-            continue
-        dt_wib = datetime.fromtimestamp(ts / 1000, tz=_WIB)
-        win = t['r_mult'] > 0
-        sname = _session_for_hour(dt_wib.hour)
-        if sname is not None:
-            s = sessions[sname]
-            s['n'] += 1
-            s['n_win'] += 1 if win else 0
-            s['n_loss'] += 0 if win else 1
-        dname = _DAY_NAMES_ID[dt_wib.weekday()]   # Monday=0 -> 'Senin'
-        d = days[dname]
+        s = t['symbol']
+        d = by_symbol.setdefault(s, {'n': 0, 'win': 0, 'total_r': 0.0, 'total_pnl': 0.0})
         d['n'] += 1
-        d['n_win'] += 1 if win else 0
-        d['n_loss'] += 0 if win else 1
-    for s in sessions.values():
-        s['wr'] = (s['n_win'] / s['n'] * 100) if s['n'] else None
-    for d in days.values():
-        d['wr'] = (d['n_win'] / d['n'] * 100) if d['n'] else None
-    return {'sessions': sessions, 'days': days}
+        if t['pnl_usd'] > 0:
+            d['win'] += 1
+        d['total_r'] += t['r_mult']
+        d['total_pnl'] += t['pnl_usd']
+    rows = []
+    for s, d in by_symbol.items():
+        wr = d['win'] / d['n'] * 100 if d['n'] else 0
+        rows.append({'symbol': s, 'n': d['n'], 'win': d['win'], 'wr': wr,
+                     'total_r': d['total_r'], 'total_pnl': d['total_pnl']})
+    rows.sort(key=lambda r: -r['total_r'])
+    return rows
 
 
-def monthly_analysis(trades):
-    """Analisis PROFIT PER BULAN KALENDER (WIB, berdasar waktu EXIT/exit_ts -- profit baru
-    terealisasi saat trade close). Persen tiap bulan dihitung terhadap balance di AWAL bulan
-    itu (bukan terhadap modal awal keseluruhan), supaya efek compounding per bulan kelihatan
-    benar -- persis cara laporan bulanan trading pada umumnya menghitung return bulanan.
-    Trade diurutkan dulu berdasar exit_ts (sequential) supaya balance berjalan akurat."""
-    if not trades:
-        return {'months': [], 'avg_pct': None, 'avg_usd': None}
-    trades_sorted = sorted(trades, key=lambda t: t['exit_ts'])
-
-    # kelompokkan index trade per (tahun, bulan) WIB berdasar exit_ts, jaga urutan bulan
-    # kemunculan pertama (bukan diurutkan ulang -- data sudah sequential by exit_ts)
-    month_keys = []          # urutan (year, month) sesuai kemunculan pertama
-    month_trades = {}        # (year, month) -> list of trade dict
-    for t in trades_sorted:
-        dt = datetime.fromtimestamp(t['exit_ts'] / 1000, tz=_WIB)
-        key = (dt.year, dt.month)
-        if key not in month_trades:
-            month_trades[key] = []
-            month_keys.append(key)
-        month_trades[key].append(t)
-
-    months = []
-    balance_start_of_month = INITIAL_BALANCE
-    for key in month_keys:
-        ts_list = month_trades[key]
-        profit_usd = sum(t['pnl_usd'] for t in ts_list)
-        n_trade = len(ts_list)
-        n_win = sum(1 for t in ts_list if t['r_mult'] > 0)
-        bal_start = balance_start_of_month
-        bal_end = bal_start + profit_usd
-        pct = (profit_usd / bal_start * 100) if bal_start != 0 else None
-        year, month = key
-        months.append({
-            'year': year, 'month': month,
-            'n_trade': n_trade, 'n_win': n_win, 'n_loss': n_trade - n_win,
-            'profit_usd': profit_usd, 'pct': pct,
-            'balance_start': bal_start, 'balance_end': bal_end,
-        })
-        balance_start_of_month = bal_end   # bulan berikutnya mulai dari balance akhir bulan ini
-
-    pct_values = [m['pct'] for m in months if m['pct'] is not None]
-    avg_pct = (sum(pct_values) / len(pct_values)) if pct_values else None
-    avg_usd = (sum(m['profit_usd'] for m in months) / len(months)) if months else None
-    return {'months': months, 'avg_pct': avg_pct, 'avg_usd': avg_usd}
+def per_kind_breakdown(trades):
+    """Breakdown performa per JENIS level: SBR / RBS / QMS / QMR."""
+    by_kind = {}
+    for t in trades:
+        k = t.get('kind', '?')
+        d = by_kind.setdefault(k, {'n': 0, 'win': 0, 'total_r': 0.0, 'total_pnl': 0.0})
+        d['n'] += 1
+        if t['pnl_usd'] > 0:
+            d['win'] += 1
+        d['total_r'] += t['r_mult']
+        d['total_pnl'] += t['pnl_usd']
+    rows = []
+    for k, d in by_kind.items():
+        wr = d['win'] / d['n'] * 100 if d['n'] else 0
+        rows.append({'kind': k, 'n': d['n'], 'win': d['win'], 'wr': wr,
+                     'total_r': d['total_r'], 'total_pnl': d['total_pnl']})
+    order = {'SBR': 0, 'RBS': 1, 'QMS': 2, 'QMR': 3}
+    rows.sort(key=lambda r: order.get(r['kind'], 99))
+    return rows
 
 
 # ============================================================
-# BACKGROUND RUNNER
+# BACKGROUND WORKER
+# ============================================================
+
+def _run():
+    global _phase, _results, _kind_results, _all_trades, _combined_result
+    try:
+        _log_msg(f"🚀 Mulai backtest SBR/RBS/QMS/QMR — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
+        _log_msg(f"   SL={SL_PCT*100:.2f}%  TP=1:{TP_R:.1f}R  APPROACH_PCT={APPROACH_PCT*100:.1f}%")
+
+        coins = {}
+        m5_data = {}
+        for symbol in SYMBOLS:
+            _log_msg(f"📊 {symbol}: fetch H1...")
+            df_h1 = fetch_bybit_h1(symbol)
+            if df_h1.empty:
+                _log_msg(f"   ⚠ {symbol}: data H1 kosong, skip.")
+                continue
+            _log_msg(f"📊 {symbol}: fetch M5...")
+            df_m5 = fetch_bybit_m5(symbol)
+            cp = prepare_coin(symbol, df_h1)
+            coins[symbol] = cp
+            m5_data[symbol] = prepare_m5(df_m5)
+            n_by_kind = {}
+            for ev in cp['events']:
+                n_by_kind[ev['kind']] = n_by_kind.get(ev['kind'], 0) + 1
+            kind_str = ', '.join(f"{k}:{v}" for k, v in sorted(n_by_kind.items()))
+            _log_msg(f"   ✅ {symbol}: {cp['n']} candle H1, {len(cp['events'])} level terdeteksi ({kind_str}).")
+
+        _log_msg(f"🧮 Menjalankan simulasi gabungan ({len(coins)} koin)...")
+        result = run_combined_backtest(coins, m5_data)
+
+        with _lock:
+            _all_trades[:] = result['trades']
+            _combined_result.update({
+                'n_trades': result['n_trades'], 'n_win': result['n_win'], 'n_loss': result['n_loss'],
+                'wr': result['wr'], 'total_pnl': result['total_pnl'], 'roi': result['roi'],
+                'total_r': result['total_r'], 'avg_r': result['avg_r'],
+                'final_balance': result['final_balance'],
+                'blocked_by_slot': result['blocked_by_slot'],
+                'blocked_by_margin': result['blocked_by_margin'],
+                'blocked_by_min_order': result['blocked_by_min_order'],
+            })
+            _results[:] = per_symbol_breakdown(result['trades'])
+            _kind_results[:] = per_kind_breakdown(result['trades'])
+            _phase = 'done'
+
+        _log_msg(f"✅ SELESAI. {result['n_trades']} trade, WR {result['wr']:.1f}%, "
+                  f"Total R {result['total_r']:.2f}, Balance akhir ${result['final_balance']:.2f} "
+                  f"(ROI {result['roi']:+.1f}%)")
+    except Exception as e:
+        import traceback
+        _log_msg(f"❌ ERROR: {e}")
+        _log_msg(traceback.format_exc())
+        with _lock:
+            _phase = 'error'
+
+
+# ============================================================
+# DASHBOARD HTML
 # ============================================================
 
 def _fmt_max_concurrent():
-    return "TANPA BATAS" if MAX_CONCURRENT == float('inf') else str(int(MAX_CONCURRENT))
+    return 'Tanpa batas' if MAX_CONCURRENT == float('inf') else str(MAX_CONCURRENT)
 
-
-def _run():
-    global _phase, _combined_result, _indicator_result
-    _log_msg(f"🚀 Mulai backtest GABUNGAN {len(SYMBOLS)} coin | H1 | {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
-    _log_msg(f"   EMA {EMA_FAST}/{EMA_SLOW} | Trail 1:{TRAIL_ACT_R:.0f} | Risk {RISK_PCT*100:.0f}%/trade "
-              f"(compounding, 1 balance bersama) | MAX_CONCURRENT {_fmt_max_concurrent()} slot (global, semua koin) | "
-              f"Modal awal ${INITIAL_BALANCE:.0f}")
-    if M5_PRECISION_MODE:
-        _log_msg("   🔬 M5 Precision Mode: AKTIF — fill/SL/trailing dicek per-candle-5-menit "
-                  "(EMA cross & sinyal tetap 100% di H1).")
-
-    coins = {}
-    m5_data = {}
-    for sym in SYMBOLS:
-        try:
-            _log_msg(f"📥 {sym}: mengambil data H1 dari Bybit...")
-            df = fetch_bybit_h1(sym)
-            if df.empty:
-                _log_msg(f"   ⚠ {sym}: data kosong, skip.")
-                continue
-            prepared = prepare_coin(sym, df)
-            if prepared is None:
-                _log_msg(f"   ⚠ {sym}: data kurang ({len(df)} candle), skip.")
-                continue
-            coins[sym] = prepared
-            _log_msg(f"   {len(df):,} candle H1 diperoleh & siap.")
-
-            if M5_PRECISION_MODE:
-                try:
-                    df_m5 = fetch_bybit_m5(sym)
-                    if not df_m5.empty:
-                        m5_data[sym] = prepare_m5(df_m5)
-                        _log_msg(f"   🔬 {sym}: {len(df_m5):,} candle M5 diperoleh & siap (mode presisi).")
-                    else:
-                        _log_msg(f"   ⚠ {sym}: data M5 kosong — fallback ke H1 utk symbol ini.")
-                except Exception as e:
-                    _log_msg(f"   ⚠ {sym}: gagal fetch M5 ({e}) — fallback ke H1 utk symbol ini.")
-        except Exception as e:
-            _log_msg(f"   ❌ {sym}: error fetch — {e}")
-
-    if not coins:
-        _log_msg("❌ Tidak ada data koin sama sekali, backtest dibatalkan.")
-        with _lock:
-            _phase = 'error'
-        return
-
-    _log_msg(f"✅ {len(coins)}/{len(SYMBOLS)} koin siap. Menjalankan SIMULASI GABUNGAN "
-              f"(semua koin berbarengan sesuai waktu, 1 balance, {_fmt_max_concurrent()} slot global)...")
-
-    result = run_combined_backtest(coins, m5_data=m5_data)
-    ind_analysis = indicator_analysis(result['trades'])
-    rsi_gate_res = rsi_gate_analysis(result['trades'])
-    session_day_res = session_day_analysis(result['trades'])
-    monthly_res = monthly_analysis(result['trades'])
-
-    no_filter_summary = None
-    if _any_filter_active():
-        _log_msg("🔁 Filter aktif terdeteksi — menjalankan simulasi PEMBANDING tanpa filter "
-                  "utk mengukur dampaknya (n trade, WR, PnL)...")
-        result_nf = run_combined_backtest(coins, filters_enabled=False, m5_data=m5_data)
-        no_filter_summary = {
-            'n_trades': result_nf['n_trades'], 'wr': result_nf['wr'],
-            'total_pnl': result_nf['total_pnl'], 'roi': result_nf['roi'],
-            'total_r': result_nf['total_r'], 'avg_r': result_nf['avg_r'],
-            'final_balance': result_nf['final_balance'],
-        }
-        _log_msg(f"   Tanpa filter: {result_nf['n_trades']} trade | WR {result_nf['wr']:.1f}% | "
-                  f"PnL ${result_nf['total_pnl']:+.2f} | Total R {result_nf['total_r']:+.2f}")
-
-    with _lock:
-        _combined_result.update(result)
-        _all_trades.extend(result['trades'])
-        _results.extend(per_symbol_breakdown(result['trades']))
-        _indicator_result.update(ind_analysis)
-        _rsi_gate_result.update(rsi_gate_res)
-        _session_day_result.update(session_day_res)
-        _monthly_result.update(monthly_res)
-        global _no_filter_result
-        _no_filter_result = no_filter_summary
-        _phase = 'done'
-
-    _log_msg(f"🏁 Selesai! {result['n_trades']} trade | WR {result['wr']:.1f}% | "
-              f"PnL ${result['total_pnl']:+.2f} | ROI {result['roi']:+.1f}% | "
-              f"Balance akhir ${result['final_balance']:.2f} | "
-              f"blocked: {result['blocked_by_slot']} (slot), {result['blocked_by_margin']} (margin), "
-              f"{result['blocked_by_filter']} (filter indikator), "
-              f"{result['blocked_by_rsi_gate']} (RSI{RSI_GATE_PERIOD} gate), "
-              f"{result.get('blocked_by_ema4_break', 0)} (EMA4 body-break)")
-
-
-# ============================================================
-# HTML RENDERING
-# ============================================================
-
-_CSS = '''
-<style>
-  body{background:#0d1117;color:#c9d1d9;font-family:-apple-system,Segoe UI,Roboto,sans-serif;
-       margin:0;padding:16px 20px 60px}
-  h1{font-size:20px;margin:0 0 6px}
-  h2{font-size:15px;margin:22px 0 8px;color:#58a6ff}
-  p{font-size:13px;line-height:1.6}
-  table{border-collapse:collapse;width:100%;font-size:12px}
-  th,td{padding:6px 10px;border-bottom:1px solid #21262d;text-align:right}
-  th:first-child,td:first-child{text-align:left}
-  th{color:#8b949e;font-weight:600;background:#161b22;position:sticky;top:0}
-  tr:hover{background:#161b22}
-  .g{color:#3fb950}
-  .r{color:#f85149}
-  .y{color:#d29922}
-  .chip{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;font-weight:600}
-  .chip.running{background:#1f6feb33;color:#58a6ff}
-  .chip.done{background:#23863633;color:#3fb950}
-  .chip.error{background:#f8514933;color:#f85149}
-  .tbl-wrap{overflow-x:auto;border:1px solid #21262d;border-radius:6px}
-  .log{background:#010409;border:1px solid #21262d;border-radius:6px;padding:10px 14px;
-       font-family:'Courier New',monospace;font-size:11px;max-height:360px;overflow-y:auto;
-       white-space:pre-wrap}
-  .note{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:10px 14px;
-        font-size:12px;color:#8b949e;margin-top:10px}
-  a{color:#58a6ff}
-  .dlbtn{display:inline-block;margin:2px;padding:4px 10px;background:#21262d;border-radius:5px;
-         font-size:11px;text-decoration:none;color:#c9d1d9}
-  .dlbtn:hover{background:#30363d}
-</style>
-'''
 
 def _render_html() -> bytes:
     with _lock:
-        phase   = _phase
-        res_cp  = list(_results)
-        log_cp  = list(_log)
-        trades_cp = list(_all_trades)
+        phase = _phase
         cr = dict(_combined_result)
-        ind_cp = dict(_indicator_result)
-        rsi_gate_cp = dict(_rsi_gate_result)
-        session_day_cp = dict(_session_day_result)
-        monthly_cp = dict(_monthly_result)
-        nf_cp = dict(_no_filter_result) if _no_filter_result else None
+        results_cp = list(_results)
+        kind_cp = list(_kind_results)
+        log_cp = list(_log[-300:])
 
-    refresh = '<meta http-equiv="refresh" content="5">' if phase == 'running' else ''
-    chip_cls = {'running': 'running', 'done': 'done', 'error': 'error'}.get(phase, 'running')
-    chip_txt = {'running': '⏳ Sedang berjalan...', 'done': '✅ Selesai', 'error': '❌ Error'}.get(phase, phase)
+    log_html = '\n'.join(l for l in log_cp)
 
-    n_done, n_total = len(res_cp), len(SYMBOLS)
+    if phase == 'running':
+        status_html = '<div class="status running">⏳ Sedang berjalan...</div>'
+    elif phase == 'error':
+        status_html = '<div class="status error">❌ Terjadi error — lihat log di bawah.</div>'
+    else:
+        status_html = '<div class="status done">✅ Selesai</div>'
 
-    # ── ringkasan gabungan: dari SIMULASI GABUNGAN (1 balance, 1 pool slot), bukan jumlah per-coin ──
-    total_trades = cr.get('n_trades', 0)
-    total_win    = cr.get('n_win', 0)
-    total_pnl    = cr.get('total_pnl', 0)
-    wr_overall   = cr.get('wr', 0)
-    avg_r        = cr.get('avg_r', 0)
-    roi_overall  = cr.get('roi', 0)
-    final_bal    = cr.get('final_balance', INITIAL_BALANCE)
+    rows_html = ''
+    for r in results_cp:
+        cls = 'pos' if r['total_r'] >= 0 else 'neg'
+        rows_html += f'''<tr>
+            <td>{r['symbol']}</td><td>{r['n']}</td><td>{r['win']}</td>
+            <td>{r['wr']:.1f}%</td><td class="{cls}">{r['total_r']:+.2f}</td>
+            <td class="{cls}">${r['total_pnl']:+.2f}</td></tr>'''
 
-    gross_win  = sum(t['pnl_usd'] for t in trades_cp if t['pnl_usd'] > 0)
-    gross_loss = abs(sum(t['pnl_usd'] for t in trades_cp if t['pnl_usd'] < 0))
-    pf = (gross_win / gross_loss) if gross_loss > 0 else float('inf')
-
-    blocked_slot   = cr.get('blocked_by_slot', 0)
-    blocked_margin = cr.get('blocked_by_margin', 0)
-    blocked_filter = cr.get('blocked_by_filter', 0)
-    blocked_rsi_gate = cr.get('blocked_by_rsi_gate', 0)
-    blocked_session = cr.get('blocked_by_session', 0)
-    blocked_min_order = cr.get('blocked_by_min_order', 0)
-    bumped_min_order = cr.get('bumped_by_min_order', 0)
-    blocked_swing = cr.get('blocked_by_swing', 0)
-    blocked_candle_dir = cr.get('blocked_by_candle_direction', 0)
-    blocked_nts = cr.get('blocked_by_no_trade_session', 0)
-    closed_nts = cr.get('closed_by_no_trade_session', 0)
-    blocked_ema4_break = cr.get('blocked_by_ema4_break', 0)
-    blocked_ema4_neutral = cr.get('blocked_by_ema4_neutral', 0)
-    flip_held = cr.get('flip_held_below_1r', 0)
-
-    summary_html = f'''
-    <h2>Ringkasan Gabungan — 1 balance, 1 pool slot (COMPOUNDING) ({n_done}/{n_total} coin dimuat)</h2>
-    <table>
-      <tr><th>Total Trade</th><th>Win</th><th>Loss</th><th>WR%</th><th>Total PnL</th>
-          <th>ROI%</th><th>Balance Akhir</th><th>Avg R/trade</th><th>Profit Factor</th>
-          <th>Blokir: Slot</th><th>Blokir: Margin</th><th>Blokir: Filter</th><th>Blokir: RSI Gate</th>
-          <th>Blokir: Sesi</th><th>Blokir: Min Order</th><th>Qty Dipaksa Naik</th><th>Blokir: Swing</th>
-          <th>Blokir: Arah Candle</th>
-          <th>Blokir: EMA4 Body-Break</th>
-          <th>Blokir: EMA4 Netral</th>
-          <th>Flip Ditahan (&lt;1R)</th><th>No-Trade: Pending Batal</th><th>No-Trade: Posisi Ditutup</th></tr>
-      <tr>
-        <td>{total_trades}</td>
-        <td class="g">{total_win}</td>
-        <td class="r">{total_trades-total_win}</td>
-        <td class="{'g' if wr_overall>=40 else ('y' if wr_overall>=25 else 'r')}">{wr_overall:.1f}%</td>
-        <td class="{'g' if total_pnl>=0 else 'r'}">${total_pnl:+,.2f}</td>
-        <td class="{'g' if roi_overall>=0 else 'r'}">{roi_overall:+,.1f}%</td>
-        <td>${final_bal:,.2f}</td>
-        <td class="{'g' if avg_r>=0 else 'r'}">{avg_r:+.3f}</td>
-        <td>{pf:.2f}</td>
-        <td class="y">{blocked_slot}</td>
-        <td class="y">{blocked_margin}</td>
-        <td class="y">{blocked_filter}</td>
-        <td class="y">{blocked_rsi_gate}</td>
-        <td class="y">{blocked_session}</td>
-        <td class="y">{blocked_min_order}</td>
-        <td class="y">{bumped_min_order}</td>
-        <td class="y">{blocked_swing}</td>
-        <td class="y">{blocked_candle_dir}</td>
-        <td class="y">{blocked_ema4_break}</td>
-        <td class="y">{blocked_ema4_neutral}</td>
-        <td class="y">{flip_held}</td>
-        <td class="y">{blocked_nts}</td>
-        <td class="y">{closed_nts}</td>
-      </tr>
-    </table>
-    <p style="font-size:12px;color:#8b949e">🕯️ Gate Arah Candle Cross: <b>{'AKTIF' if CANDLE_DIRECTION_GATE_ENABLED else 'NONAKTIF'}</b>
-    — candle yang menyebabkan EMA cross harus SEARAH dengan arah cross-nya: Golden cross butuh candle
-    <b>bullish</b> (open &lt; close), Death cross butuh candle <b>bearish</b> (open &gt; close). Sinyal
-    yang candle cross-nya berlawanan arah diblokir (kolom "Blokir: Arah Candle"). Atur via env var
-    <code>CANDLE_DIRECTION_GATE_ENABLED</code>.</p>
-    <p style="font-size:12px;color:#8b949e">🚫 No-Trade Session (full halt): <b>{
-        ', '.join(NO_TRADE_SESSIONS) or 'tidak ada (nonaktif)'}</b> — begitu candle masuk sesi ini,
-    SEMUA limit pending dibatalkan, SEMUA posisi filled ditutup paksa (reason "NO_TRADE_SESSION"),
-    dan TIDAK ADA entry/setup baru sampai sesi berakhir. Beda dari <code>SESSION_BLOCK_LIST</code>
-    (yang cuma mencegah fill baru, posisi lama tetap jalan) — ini menghentikan trading total.
-    Atur via env var <code>NO_TRADE_SESSIONS</code> (comma-separated, kosongkan utk nonaktifkan).</p>
-    <p style="font-size:12px;color:#8b949e">Flip protection: posisi filled HANYA ditutup oleh cross
-    berlawanan kalau <b>CLOSE candle yang menyebabkan cross</b> itu sudah <b>≥ {FLIP_MIN_R:.1f}R</b> dari
-    entry (dihitung dari entry & jarak SL posisi itu — misal entry $1.6, SL $1.3, dist=$0.3, maka
-    close candle cross harus di atas $1.9 baru boleh membatalkan Long). Dibawah ambang ini (kolom
-    "Flip Ditahan") posisi dibiarkan jalan, cuma keluar lewat TRAIL/SL normal. Limit pending TETAP
-    dibatalkan seperti biasa, tidak terpengaruh ambang ini. Atur via env var <code>FLIP_MIN_R</code>.
-    Selain flip berlawanan, cross H1 SEARAH yang BARU tetap me-reset proses <code>waiting_confirm</code>
-    /monitoring-M5 arah yg sama yg belum selesai (mulai lagi dari cross baru).</p>
-    <p style="font-size:12px;color:#8b949e">Leverage: <b>{LEVERAGE:.0f}x</b> | Margin usage cap: maksimal
-    <b>{MARGIN_USAGE_CAP*100:.0f}%</b> dari balance boleh dipakai sbg margin bersamaan (dari SEMUA posisi
-    terbuka -- persis constraint margin Bybit asli, bukan cuma persentase risiko). Fee: entry
-    <b>{FEE_ENTRY_PCT*100:.3f}%</b>, exit <b>{FEE_EXIT_PCT*100:.3f}%</b> ({FEE_EXIT_PCT/FEE_ENTRY_PCT:.0f}x fee entry) —
-    atur via env var <code>FEE_ENTRY_PCT</code>/<code>FEE_EXIT_PCT</code>.
-    ⚠️ <b>WR% & status Menang/Kalah di SELURUH dashboard ini dihitung SETELAH fee</b> (net) — trade
-    yang harganya untung tipis tapi habis kena fee entry+exit jadi rugi akan tercatat sbg <b>Kalah</b>,
-    bukan Menang.
-    <br>💰 Simulasi Min Order Size (approksimasi Bybit, {'AKTIF' if SIMULATE_MIN_ORDER else 'NONAKTIF'}):
-    order &lt; <b>${ORDER_BUMP_FLOOR:.0f}</b> di-SKIP (kolom "Blokir: Min Order"), order &lt; <b>${MIN_ORDER_USD:.0f}</b>
-    (tapi &ge;${ORDER_BUMP_FLOOR:.0f}) DIPAKSA NAIK ke ${MIN_ORDER_USD:.0f} (kolom "Qty Dipaksa Naik" — risk
-    trade itu jadi LEBIH BESAR dari target {RISK_PCT*100:.0f}%). Makin kecil modal awal, makin sering ini
-    terjadi — atur via env var <code>SIMULATE_MIN_ORDER</code>, <code>MIN_ORDER_USD</code>, <code>ORDER_BUMP_FLOOR</code>.
-    Filter aktif: {
-        ', '.join(_active_filter_summary()) or 'tidak ada (semua nonaktif)'}
-    <br>Gate RSI{RSI_GATE_PERIOD} saat cross: <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b>
-    (Golden cross/Long butuh RSI{RSI_GATE_PERIOD} di rentang [{RSI_GATE_MIN_LONG:.0f}, {RSI_GATE_MAX_LONG:.0f}],
-    Death cross/Short butuh RSI{RSI_GATE_PERIOD} di rentang [{RSI_GATE_MIN_SHORT:.0f}, {RSI_GATE_MAX_SHORT:.0f}]
-    — diluar rentang diblokir. Atur via env var <code>RSI_GATE_ENABLED</code>, <code>RSI_GATE_PERIOD</code>,
-    <code>RSI_GATE_MIN_LONG</code>/<code>RSI_GATE_MAX_LONG</code>, <code>RSI_GATE_MIN_SHORT</code>/<code>RSI_GATE_MAX_SHORT</code>)
-    <br>Sesi trading yang DIBLOKIR (fill dibatalkan jika jatuh di jam ini, WIB): <b>{
-        ', '.join(SESSION_BLOCK_LIST) or 'tidak ada (semua sesi aktif)'}</b> —
-    atur via env var <code>SESSION_BLOCK_LIST</code> (comma-separated, mis. <code>Sydney,London</code>;
-    kosongkan utk nonaktifkan semua blokir sesi).
-    <br>🔍 Gate Swing 3-Candle: <b>{'AKTIF' if SWING_GATE_ENABLED else 'NONAKTIF'}</b> — candle 1-sebelum-cross
-    harus jadi swing point asli (Death cross: high[i-1] paling tinggi drpd kiri & kanannya; Golden cross:
-    low[i-1] paling rendah drpd kiri & kanannya), bukan cuma pergerakan lanjutan tren. Atur via env var
-    <code>SWING_GATE_ENABLED</code>.</p>
-    '''
-
-    # ── Dampak Filter Aktif: bandingkan DENGAN filter (hasil di atas) vs simulasi
-    #    PEMBANDING tanpa filter, dijalankan sekali di awal saat filter terdeteksi aktif ──
-    filter_impact_html = ''
-    if nf_cp is not None:
-        active_filters = _active_filter_summary()
-        filt_chips = ''.join(f'<span class="chip" style="background:#1f6feb33;color:#58a6ff;margin:2px">{f}</span> '
-                              for f in active_filters)
-        n_delta = total_trades - nf_cp['n_trades']
-        n_delta_pct = (n_delta / nf_cp['n_trades'] * 100) if nf_cp['n_trades'] else 0
-        wr_delta = wr_overall - nf_cp['wr']
-        pnl_delta = total_pnl - nf_cp['total_pnl']
-        totalr_cur = cr.get('total_r', 0)
-        totalr_delta = totalr_cur - nf_cp['total_r']
-
-        def _dc(v):  # kelas warna utk delta (hijau kalau naik, merah kalau turun)
-            return 'g' if v > 0 else ('r' if v < 0 else 'y')
-
-        filter_impact_html = f'''
-        <h2>⚖️ Dampak Filter Aktif — Dengan Filter vs Tanpa Filter</h2>
-        <p class="note">Filter yang sedang aktif: {filt_chips or '(tidak ada)'}</p>
-        <div class="tbl-wrap">
-        <table>
-          <tr><th></th><th>N Trade</th><th>WR%</th><th>Total PnL</th><th>Total R</th><th>Balance Akhir</th></tr>
-          <tr>
-            <td>🔒 DENGAN filter (hasil aktif)</td>
-            <td>{total_trades}</td>
-            <td class="{'g' if wr_overall>=40 else ('y' if wr_overall>=25 else 'r')}">{wr_overall:.1f}%</td>
-            <td class="{'g' if total_pnl>=0 else 'r'}">${total_pnl:+,.2f}</td>
-            <td class="{'g' if totalr_cur>=0 else 'r'}">{totalr_cur:+.2f}</td>
-            <td>${final_bal:,.2f}</td>
-          </tr>
-          <tr>
-            <td>🔓 TANPA filter (simulasi pembanding)</td>
-            <td>{nf_cp['n_trades']}</td>
-            <td>{nf_cp['wr']:.1f}%</td>
-            <td>${nf_cp['total_pnl']:+,.2f}</td>
-            <td>{nf_cp['total_r']:+.2f}</td>
-            <td>${nf_cp['final_balance']:,.2f}</td>
-          </tr>
-          <tr style="border-top:2px solid #30363d">
-            <td><b>Selisih (Filter − Tanpa Filter)</b></td>
-            <td class="{_dc(n_delta)}">{n_delta:+d} trade ({n_delta_pct:+.1f}%)</td>
-            <td class="{_dc(wr_delta)}">{wr_delta:+.1f}pp</td>
-            <td class="{_dc(pnl_delta)}">${pnl_delta:+,.2f}</td>
-            <td class="{_dc(totalr_delta)}">{totalr_delta:+.2f}</td>
-            <td class="{_dc(final_bal - nf_cp['final_balance'])}">${final_bal - nf_cp['final_balance']:+,.2f}</td>
-          </tr>
-        </table>
-        </div>
-        <div class="note">
-          💡 Baris "Selisih" menjawab: apakah filter ini <b>sepadan</b>? Kalau N Trade berkurang drastis
-          tapi WR/Total R/PnL cuma naik tipis (atau malah turun), filter itu kemungkinan MEMBUANG
-          peluang tanpa manfaat yang cukup. Filter yang baik: N Trade berkurang wajar, tapi Total R
-          & PnL naik lebih dari proporsional (karena membuang trade-trade yang kalah lebih banyak
-          daripada yang menang).
-          <br>⚙️ Atur ambang batas via Railway Variables: <code>FILTER_MIN_ATR_RATIO</code>,
-          <code>FILTER_MAX_ATR_RATIO</code>, <code>FILTER_MIN_VOL_RATIO</code>, <code>FILTER_MAX_VOL_RATIO</code>,
-          <code>FILTER_MIN_EMA_GAP_PCT</code>, <code>FILTER_MAX_EMA_GAP_PCT</code>,
-          <code>FILTER_MIN_DIST_PCT</code>, <code>FILTER_MAX_DIST_PCT</code>,
-          <code>FILTER_MIN_RSI</code>, <code>FILTER_MAX_RSI</code>,
-          <code>FILTER_MIN_MACD_HIST_PCT</code>, <code>FILTER_MAX_MACD_HIST_PCT</code>,
-          <code>FILTER_MIN_SAR_DIST_PCT</code>, <code>FILTER_MAX_SAR_DIST_PCT</code>
-          (isi salah satu sisi saja utk filter satu-arah, isi MIN+MAX utk filter "range"/tengah,
-          kosongkan/hapus utk nonaktifkan sisi itu). Lihat nilai ambang batas per-indikator
-          di tabel "Analisis Indikator" di bawah sebagai referensi angka.
-          <br>Simulasi pembanding ini dijalankan otomatis SEKALI di awal saat filter terdeteksi aktif —
-          jalankan ulang backtest (restart service) setelah mengubah env var utk lihat dampak barunya.
-        </div>
-        '''
-
-    # ── tabel per coin (kontribusi PnL masing-masing dari balance BERSAMA di atas) ──
-    rows = ''
-    for r in sorted(res_cp, key=lambda x: -(x.get('total_pnl', -1e18) if x.get('status')=='ok' else -1e18)):
-        if r.get('status') != 'ok':
-            rows += (f'<tr><td>{r["symbol"]}</td><td colspan="6" class="y">'
-                      f'{r.get("reason","skip")}</td></tr>\n')
-            continue
-        pnl_c = 'g' if r['total_pnl'] >= 0 else 'r'
-        wr_c  = 'g' if r['wr'] >= 40 else ('y' if r['wr'] >= 25 else 'r')
-        rows += (
-            f'<tr><td><b>{r["symbol"]}</b></td>'
-            f'<td>{r["n_trades"]}</td>'
-            f'<td class="g">{r["n_win"]}</td>'
-            f'<td class="r">{r["n_loss"]}</td>'
-            f'<td class="{wr_c}">{r["wr"]:.1f}%</td>'
-            f'<td class="{pnl_c}">${r["total_pnl"]:+.2f}</td>'
-            f'<td>{r["avg_r"]:+.3f}</td></tr>\n'
-        )
-    coin_table = f'''
-    <table>
-      <tr><th>Coin</th><th>Trade</th><th>Win</th><th>Loss</th><th>WR%</th>
-          <th>Kontribusi PnL$</th><th>Avg R</th></tr>
-      {rows or '<tr><td colspan="7" class="y">Menunggu hasil...</td></tr>'}
-    </table>
-    '''
-
-    log_html = '\n'.join(log_cp[-400:])
-
-    # ── tabel analisis indikator (win vs loss) ──
-    ind_rows = ''
-    for key, d in ind_cp.items():
-        fmt = d['fmt']
-        avg_win_s  = fmt.format(d['avg_win']) if d['avg_win'] is not None else '-'
-        avg_loss_s = fmt.format(d['avg_loss']) if d['avg_loss'] is not None else '-'
-        t1_s = fmt.format(d['t1'])
-        t2_s = fmt.format(d['t2'])
-        b = d['buckets']
-
-        def _bucket_cell(name):
-            info = b[name]
-            if info['wr'] is None:
-                return f'<td class="y">-</td><td style="color:#8b949e">0 (0M/0K)</td>'
-            cls = 'g' if info['wr'] >= 45 else ('y' if info['wr'] >= 30 else 'r')
-            return (f'<td class="{cls}">{info["wr"]:.1f}%</td>'
-                    f'<td style="color:#8b949e">{info["n"]} '
-                    f'(<span class="g">{info["n_win"]}M</span>/<span class="r">{info["n_loss"]}K</span>)</td>')
-
-        ind_rows += (
-            f'<tr><td>{d["label"]}</td>'
-            f'<td class="g">{avg_win_s}</td>'
-            f'<td class="r">{avg_loss_s}</td>'
-            f'{_bucket_cell("Rendah")}'
-            f'{_bucket_cell("Sedang")}'
-            f'{_bucket_cell("Tinggi")}'
-            f'<td style="color:#8b949e">≤{t1_s} / ≤{t2_s}</td>'
-            f'</tr>\n'
-        )
-    ind_table = f'''
-    <table>
-      <tr><th rowspan="2">Indikator (saat candle cross)</th><th rowspan="2">Avg saat WIN</th><th rowspan="2">Avg saat LOSS</th>
-          <th colspan="2">Rendah</th><th colspan="2">Sedang</th><th colspan="2">Tinggi</th>
-          <th rowspan="2">Batas Rendah/Sedang/Tinggi</th></tr>
-      <tr><th>WR%</th><th>N (Menang/Kalah)</th>
-          <th>WR%</th><th>N (Menang/Kalah)</th><th>WR%</th><th>N (Menang/Kalah)</th></tr>
-      {ind_rows or '<tr><td colspan="10" class="y">Belum ada data (minimal 6 trade per indikator).</td></tr>'}
-    </table>
-    ''' if ind_cp else '<p class="note">Belum ada data indikator.</p>'
-
-    # ── tabel khusus RSI GATE: per-nilai RSI bulat (diurutkan by n_win terbanyak) + bucket tetap ──
-    def _rsi_gate_side_html(direction):
-        d = rsi_gate_cp.get(direction)
-        if not d or d['n_total'] == 0:
-            return f'<p class="note">Belum ada trade {direction} dgn data RSI{RSI_GATE_PERIOD}.</p>'
-        # per-nilai: urutkan by jumlah MENANG absolut terbanyak dulu, lalu tampilkan top 15
-        rows_sorted = sorted(d['per_value'].items(), key=lambda kv: kv[1]['n_win'], reverse=True)
-        per_val_rows = ''
-        for rsi_val, info in rows_sorted[:15]:
-            wr = info['wr']
-            cls = 'g' if (wr or 0) >= 50 else ('y' if (wr or 0) >= 30 else 'r')
-            star = ' ⭐' if rsi_val == d['best_value'] else ''
-            in_focus = d['focus_range'][0] <= rsi_val <= d['focus_range'][1]
-            dim = '' if in_focus else ' style="color:#6e7681"'   # nilai diluar fokus ditampilkan redup
-            per_val_rows += (f'<tr{dim}><td>{rsi_val}{star}</td><td>{info["n"]}</td>'
-                              f'<td class="g">{info["n_win"]}</td><td class="r">{info["n_loss"]}</td>'
-                              f'<td class="{cls}">{wr:.1f}%</td></tr>\n')
-        # bucket names sekarang DINAMIS (mengikuti rentang fokus) -- iterasi dict.items()
-        # langsung supaya urutan insert (Rendah, Sedang, Tinggi) terjaga
-        bucket_rows = ''
-        for bname, bi in d['buckets'].items():
-            wr = bi['wr']
-            cls = 'y' if wr is None else ('g' if wr >= 50 else ('y' if wr >= 30 else 'r'))
-            wr_s = f'{wr:.1f}%' if wr is not None else '-'
-            bucket_rows += (f'<tr><td>{bname}</td><td>{bi["n"]}</td>'
-                             f'<td class="g">{bi["n_win"]}</td><td class="r">{bi["n_loss"]}</td>'
-                             f'<td class="{cls}">{wr_s}</td></tr>\n')
-        best_s = f"RSI{RSI_GATE_PERIOD} = {d['best_value']}" if d['best_value'] is not None else '-'
-        fmin, fmax = d['focus_range']
-        return f'''
-        <p style="font-size:13px;color:#8b949e">Total {direction}: <b>{d["n_total"]}</b> trade |
-        Rentang fokus: <b>{fmin}-{fmax}</b> ({d["n_in_focus"]} trade masuk fokus) |
-        Nilai RSI{RSI_GATE_PERIOD} dgn MENANG absolut terbanyak: <b class="g">{best_s}</b> (⭐ di tabel bawah)</p>
-        <table>
-          <tr><th>RSI{RSI_GATE_PERIOD}</th><th>N</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
-          {per_val_rows or '<tr><td colspan="5" class="y">-</td></tr>'}
-        </table>
-        <p style="font-size:12px;color:#8b949e;margin-top:8px">Top 15 nilai RSI{RSI_GATE_PERIOD} diurutkan by jumlah MENANG
-        terbanyak (bukan cuma WR% tertinggi, spy tidak kejebak n kecil). Nilai redup = diluar rentang fokus saat ini.</p>
-        <table style="margin-top:6px">
-          <tr><th>Kategori (rentang fokus {fmin}-{fmax}, dibagi rata otomatis)</th><th>N</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
-          {bucket_rows}
-        </table>
-        '''
-
-    rsi_gate_html = f'''
-    <h2>Analisis Khusus RSI{RSI_GATE_PERIOD} Gate — Long vs Short (Nonaktif = mode eksplorasi)</h2>
-    <p class="note">💡 RSI{RSI_GATE_PERIOD} saat ini <b>{'AKTIF' if RSI_GATE_ENABLED else 'NONAKTIF'}</b> sbg gate entry —
-    tabel ini menganalisis SEMUA trade yg terjadi (termasuk yg akan diblokir kalau gate diaktifkan), supaya kamu
-    bisa cari rentang RSI{RSI_GATE_PERIOD} yang benar2 menguntungkan SEBELUM mengaktifkan gate-nya.
-    Kolom "Kebanyakan Menang" pakai jumlah MENANG absolut (n_win), bukan WR% semata, spy tidak kejebak nilai RSI
-    yang cuma muncul 1-2 kali dgn WR 100%.</p>
-    <div style="display:flex; flex-wrap:wrap; gap:20px;">
-      <div style="flex:1; min-width:340px;">
-        <h3>🟢 LONG (Golden Cross)</h3>
-        {_rsi_gate_side_html('Long')}
-      </div>
-      <div style="flex:1; min-width:340px;">
-        <h3>🔴 SHORT (Death Cross)</h3>
-        {_rsi_gate_side_html('Short')}
-      </div>
-    </div>
-    <div class="note" style="margin-top:10px">
-      ⚙️ Rentang FOKUS tabel di atas (bukan gate aktual) diatur via:
-      <code>RSI_ANALYSIS_MIN_LONG</code>/<code>RSI_ANALYSIS_MAX_LONG</code> (skrg {RSI_ANALYSIS_MIN_LONG:.0f}-{RSI_ANALYSIS_MAX_LONG:.0f}),
-      <code>RSI_ANALYSIS_MIN_SHORT</code>/<code>RSI_ANALYSIS_MAX_SHORT</code> (skrg {RSI_ANALYSIS_MIN_SHORT:.0f}-{RSI_ANALYSIS_MAX_SHORT:.0f}).
-      Bucket Rendah/Sedang/Tinggi otomatis dibagi rata 3 dari rentang ini — ubah env var lalu jalankan
-      ulang backtest utk lihat pembagian bucket yang baru.
-      <br>Setelah tahu rentang yang bagus, aktifkan GATE ENTRY aktual (beda dari rentang fokus di atas)
-      via Railway Variables: <code>RSI_GATE_ENABLED=1</code>, lalu atur rentang valid:
-      <code>RSI_GATE_MIN_LONG</code>/<code>RSI_GATE_MAX_LONG</code> (utk Long/Golden cross),
-      <code>RSI_GATE_MIN_SHORT</code>/<code>RSI_GATE_MAX_SHORT</code> (utk Short/Death cross).
-      Nilai RSI{RSI_GATE_PERIOD} DILUAR rentang yg kamu set akan diblokir (sinyal dilewati, tidak entry).
-      Jalankan ulang backtest setelah mengubah env var utk lihat dampaknya ke Total R & WR keseluruhan.
-    </div>
-    '''
-
-    # ── Analisis Sesi Trading (WIB) & Hari — berdasarkan entry_ts (candle SAAT FILLED) ──
-    sd = session_day_cp
-    session_rows = ''
-    session_hours = {name: (s, e) for name, s, e in _SESSION_DEFS}
-    if sd.get('sessions'):
-        for name, info in sd['sessions'].items():
-            s_h, e_h = session_hours[name]
-            wr = info['wr']
-            cls = 'y' if wr is None else ('g' if wr >= 45 else ('y' if wr >= 30 else 'r'))
-            wr_s = f'{wr:.1f}%' if wr is not None else '-'
-            session_rows += (f'<tr><td>{name} ({s_h:02d}:00-{e_h:02d}:59 WIB)</td>'
-                              f'<td>{info["n"]}</td><td class="g">{info["n_win"]}</td>'
-                              f'<td class="r">{info["n_loss"]}</td><td class="{cls}">{wr_s}</td></tr>\n')
-    day_rows = ''
-    if sd.get('days'):
-        for name in _DAY_NAMES_ID:   # urutan tetap Senin->Minggu, bukan urutan dict insert
-            info = sd['days'][name]
-            wr = info['wr']
-            cls = 'y' if wr is None else ('g' if wr >= 45 else ('y' if wr >= 30 else 'r'))
-            wr_s = f'{wr:.1f}%' if wr is not None else '-'
-            day_rows += (f'<tr><td>{name}</td><td>{info["n"]}</td><td class="g">{info["n_win"]}</td>'
-                          f'<td class="r">{info["n_loss"]}</td><td class="{cls}">{wr_s}</td></tr>\n')
-    session_day_html = f'''
-    <h2>📅 Analisis Sesi Trading (WIB) & Hari</h2>
-    <p class="note">💡 Dikelompokkan berdasarkan waktu candle SAAT FILLED (entry_ts), BUKAN saat sinyal
-    EMA cross muncul — mis. cross jam 13:00 WIB tapi baru filled jam 14:00 WIB akan masuk sesi London,
-    bukan Asia. Semua jam dalam WIB (UTC+7).</p>
-    <div style="display:flex; flex-wrap:wrap; gap:20px;">
-      <div style="flex:1; min-width:320px;">
-        <h3>Per Sesi Trading</h3>
-        <table>
-          <tr><th>Sesi</th><th>Total Trade</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
-          {session_rows or '<tr><td colspan="5" class="y">Belum ada data.</td></tr>'}
-        </table>
-      </div>
-      <div style="flex:1; min-width:320px;">
-        <h3>Per Hari</h3>
-        <table>
-          <tr><th>Hari</th><th>Total Trade</th><th>Menang</th><th>Kalah</th><th>WR%</th></tr>
-          {day_rows or '<tr><td colspan="5" class="y">Belum ada data.</td></tr>'}
-        </table>
-      </div>
-    </div>
-    '''
-
-    # ── Analisis Profit per Bulan Kalender (WIB) ──
-    mo = monthly_cp
-    monthly_rows = ''
-    if mo.get('months'):
-        _MONTH_NAMES_ID = ['', 'Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des']
-        for m in mo['months']:
-            pct = m['pct']
-            pct_s = f'{pct:+.1f}%' if pct is not None else '-'
-            cls = 'y' if pct is None else ('g' if pct >= 0 else 'r')
-            usd_cls = 'g' if m['profit_usd'] >= 0 else 'r'
-            monthly_rows += (
-                f'<tr><td>{_MONTH_NAMES_ID[m["month"]]} {m["year"]}</td>'
-                f'<td>{m["n_trade"]}</td><td class="g">{m["n_win"]}</td><td class="r">{m["n_loss"]}</td>'
-                f'<td>${m["balance_start"]:,.2f}</td>'
-                f'<td class="{usd_cls}">${m["profit_usd"]:+,.2f}</td>'
-                f'<td class="{cls}">{pct_s}</td>'
-                f'<td>${m["balance_end"]:,.2f}</td></tr>\n'
-            )
-    avg_pct_s = f"{mo['avg_pct']:+.1f}%" if mo.get('avg_pct') is not None else '-'
-    avg_usd_s = f"${mo['avg_usd']:+,.2f}" if mo.get('avg_usd') is not None else '-'
-    monthly_html = f'''
-    <h2>📆 Analisis Profit per Bulan</h2>
-    <p class="note">💡 Dikelompokkan berdasarkan waktu EXIT (bulan kalender WIB) — profit baru terealisasi
-    saat trade close. Persen tiap bulan dihitung terhadap balance di AWAL bulan itu (bukan modal awal
-    keseluruhan), supaya efek compounding antar bulan kelihatan benar — persis cara laporan bulanan
-    trading pada umumnya.</p>
-    <table>
-      <tr><th>Bulan</th><th>Total Trade</th><th>Menang</th><th>Kalah</th>
-          <th>Balance Awal</th><th>Profit $</th><th>Profit %</th><th>Balance Akhir</th></tr>
-      {monthly_rows or '<tr><td colspan="8" class="y">Belum ada data.</td></tr>'}
-    </table>
-    <p style="font-size:13px;color:#8b949e;margin-top:8px">
-    Rata-rata per bulan: <b class="{'g' if (mo.get('avg_pct') or 0) >= 0 else 'r'}">{avg_pct_s}</b> |
-    <b class="{'g' if (mo.get('avg_usd') or 0) >= 0 else 'r'}">{avg_usd_s}</b>
-    (rata-rata aritmatika sederhana dari semua bulan yang ada trade, BUKAN CAGR/rata-rata geometris —
-    kalau bulan-bulan awal untung besar lalu belakangan menyusut, rata-rata ini bisa lebih tinggi dari
-    "kesan" pertumbuhan keseluruhan).</p>
-    '''
+    kind_rows_html = ''
+    for r in kind_cp:
+        cls = 'pos' if r['total_r'] >= 0 else 'neg'
+        kind_rows_html += f'''<tr>
+            <td>{r['kind']}</td><td>{r['n']}</td><td>{r['win']}</td>
+            <td>{r['wr']:.1f}%</td><td class="{cls}">{r['total_r']:+.2f}</td>
+            <td class="{cls}">${r['total_pnl']:+.2f}</td></tr>'''
 
     return f'''<!DOCTYPE html>
 <html lang="id">
 <head>
-  <meta charset="utf-8">
-  <title>Backtest EMA-Cross Reversal + Flip Protection</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  {_CSS}
-  {refresh}
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="10">
+<title>Backtest SBR/RBS/QMS/QMR</title>
+<style>
+  body {{ font-family: -apple-system, Arial, sans-serif; background:#0f1117; color:#e6e6e6; margin:0; padding:20px; }}
+  h1 {{ font-size:20px; }}
+  h2 {{ font-size:16px; margin-top:28px; }}
+  .status {{ padding:10px 14px; border-radius:8px; margin-bottom:16px; font-weight:600; }}
+  .status.running {{ background:#3a2f00; color:#ffd866; }}
+  .status.done {{ background:#0f3a1e; color:#7ee787; }}
+  .status.error {{ background:#3a0f0f; color:#ff7b72; }}
+  .cards {{ display:flex; flex-wrap:wrap; gap:12px; margin-bottom:20px; }}
+  .card {{ background:#161b22; border:1px solid #30363d; border-radius:10px; padding:14px 18px; min-width:140px; }}
+  .card .label {{ font-size:12px; color:#8b949e; }}
+  .card .value {{ font-size:22px; font-weight:700; margin-top:4px; }}
+  table {{ border-collapse: collapse; width:100%; font-size:13px; margin-bottom: 10px; }}
+  th, td {{ border:1px solid #30363d; padding:6px 10px; text-align:right; }}
+  th {{ background:#161b22; color:#8b949e; }}
+  td:first-child, th:first-child {{ text-align:left; }}
+  .pos {{ color:#7ee787; }}
+  .neg {{ color:#ff7b72; }}
+  .note {{ background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px 16px; font-size:13px; color:#c9d1d9; margin-top:16px; line-height:1.6; }}
+  .log {{ background:#0d1117; border:1px solid #30363d; border-radius:8px; padding:12px; font-size:12px; font-family:monospace; max-height:400px; overflow-y:auto; white-space:pre-wrap; }}
+  a {{ color:#58a6ff; }}
+</style>
 </head>
 <body>
-  <h1>🤖 Backtest EMA-Cross Reversal + Flip Protection ({len(SYMBOLS)} coin, H1)</h1>
-  <p>
-    Modal awal: <b>${INITIAL_BALANCE:.0f}</b> (1 akun bersama, bukan per-coin) &nbsp;|&nbsp;
-    Slot maksimum: <b>{_fmt_max_concurrent()}</b> (global, dipakai bersama semua koin) &nbsp;|&nbsp;
-    Rentang: <b>{BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}</b> &nbsp;|&nbsp;
-    EMA <b>{EMA_FAST}/{EMA_SLOW}</b> &nbsp;|&nbsp;
-    Trail aktif <b>1:{TRAIL_ACT_R:.0f}</b> &nbsp;|&nbsp;
-    Status: <span class="chip {chip_cls}">{chip_txt}</span>
-  </p>
+  <h1>📊 Backtest SBR / RBS / QMS / QMR</h1>
+  {status_html}
 
-  {summary_html}
-
-  {filter_impact_html}
-
-  <h2>Kontribusi Per Coin</h2>
-  <div class="tbl-wrap">{coin_table}</div>
-
-  <h2>Analisis Indikator saat Cross — Pola Menang vs Kalah</h2>
-  <div class="tbl-wrap">{ind_table}</div>
-
-  <div class="note">
-    💡 Cara baca: setiap trade PUNYA nilai indikator ini yang tersimpan PERSIS saat candle cross
-    terjadi. Semua nilai itu diambil, rentang [nilai MINIMUM, nilai MAKSIMUM] dibagi 3 bagian
-    SAMA BESAR secara nilai (bukan sama jumlah trade), lalu tiap trade masuk TEPAT SATU kelompok
-    sesuai nilainya — <b>Rendah/Sedang/Tinggi TIDAK overlap</b> (beda dari versi sebelumnya yang
-    kumulatif):
-    <br>• <b>Rendah</b> = trade dengan nilai indikator di sepertiga rentang paling bawah
-    <br>• <b>Sedang</b> = trade dengan nilai di sepertiga rentang tengah
-    <br>• <b>Tinggi</b> = trade dengan nilai di sepertiga rentang paling atas
-    <br>Karena itu N di ketiga kolom TIDAK selalu sama — kalau kebanyakan trade nilainya
-    mengumpul di satu rentang (mis. mayoritas ATR ratio antara 1.0-1.5x), bucket itu akan
-    punya N jauh lebih besar dari bucket lain, meski secara NILAI ketiganya sama lebar.
-    Yang perlu dicari: apakah WR% dan jumlah <b>Menang absolut</b> berbeda jauh antar ketiga
-    kelompok — itu tanda indikator ini punya pola yang bisa dimanfaatkan sbg filter.
-    Bandingkan juga kolom "Avg saat WIN" vs "Avg saat LOSS" — kalau beda jauh, indikator itu
-    berpotensi jadi FILTER. Kolom "Batas Rendah/Sedang/Tinggi" adalah nilai t1/t2 pembagi
-    rentang (mis. "≤1.05x / ≤1.40x" artinya Rendah = sampai 1.05x, Sedang = 1.05x-1.40x,
-    Tinggi = di atas 1.40x).
-    <br>Kalau mau menerapkan filter berdasarkan hasil ini, isi env var di Railway:
-    <code>FILTER_MIN_ATR_RATIO</code>, <code>FILTER_MIN_VOL_RATIO</code>, atau
-    <code>FILTER_MAX_EMA_GAP_PCT</code> (nilai ambang batas Sedang/Tinggi di atas), lalu jalankan
-    ulang backtest untuk lihat dampaknya ke Total R & WR keseluruhan (bukan cuma per-bucket).
-    <br>⚠️ Kolom <b>N trade</b> di tiap bucket penting dicek sebelum aktifkan filter — WR tinggi di
-    bucket manapun tidak ada gunanya kalau isinya cuma 5 trade dari total 300 (bisa kebetulan/noise),
-    dan menerapkan filter seketat itu bisa membuang mayoritas sinyal & trade menang yang sebenarnya ada.
+  <div class="cards">
+    <div class="card"><div class="label">Total Trade</div><div class="value">{cr['n_trades']}</div></div>
+    <div class="card"><div class="label">Win Rate</div><div class="value">{cr['wr']:.1f}%</div></div>
+    <div class="card"><div class="label">Total R</div><div class="value {'pos' if cr['total_r']>=0 else 'neg'}">{cr['total_r']:+.2f}</div></div>
+    <div class="card"><div class="label">Avg R/Trade</div><div class="value {'pos' if cr['avg_r']>=0 else 'neg'}">{cr['avg_r']:+.2f}</div></div>
+    <div class="card"><div class="label">Balance Akhir</div><div class="value">${cr['final_balance']:.2f}</div></div>
+    <div class="card"><div class="label">ROI</div><div class="value {'pos' if cr['roi']>=0 else 'neg'}">{cr['roi']:+.1f}%</div></div>
   </div>
 
-  {rsi_gate_html}
-  {session_day_html}
-  {monthly_html}
   <div class="note">
-    💡 Mode entry: <b>{'KONFIRMASI EMA4 H1 + TRIGGER M5' if EMA_CONFIRM_MODE else 'LIMIT DI WICK (LEGACY)'}</b>
-    (atur via env var <code>EMA_CONFIRM_MODE</code>).
-    {"""Setelah cross H1 lolos RSI gate/swing/arah-candle/filter: TIDAK langsung pasang limit --
-    tunggu candle H1 berikutnya sentuh WICK EMA4 dengan close masih searah bias (golden cross:
-    low candle &le; EMA4 &amp; close &gt; EMA4; death cross: high candle &ge; EMA4 &amp; close
-    &lt; EMA4). Kalau BODY candle malah menembus EMA4 penuh (EMA4 di antara open &amp; close) →
-    batal total (lihat kolom "Blokir: EMA4 Body-Break"). Kalau belum keduanya → tetap ditunggu
-    candle demi candle. Begitu konfirmasi lolos, monitoring M5 dimulai 5 menit setelah candle H1
-    berikutnya buka (candle M5 pertama dlm jam itu dilewati) -- sistem mencari SWING POINT M5
-    PERTAMA yg valid searah bias (low/high candle M5 tsb tdk terlampaui oleh """
-    f"""<b>{SWING_M5_RIGHT}</b> candle M5 setelahnya). Begitu swing ditemukan, LIMIT ORDER
-    LANGSUNG dipasang PERSIS di level swing itu sendiri (tanpa tahap tunggu-tersentuh atau
-    EMA-cross lagi) -- lalu tunggu candle M5 berikutnya yg WICK-nya menyentuh level itu utk FILL,
-    entry persis di harga limit (= level swing). SL = <b>{SL_PCT*100:.2f}%</b> dari harga entry
-    itu.""" if EMA_CONFIRM_MODE else f"""Entry = LIMIT di <b>{ENTRY_LEVEL_PCT*100:.0f}%</b> range
-    candle penyebab EMA cross (0%=wick, 50%=titik tengah, 100%=sisi berlawanan) — atur via env var
-    <code>ENTRY_LEVEL_PCT</code>. SL = <b>{SL_PCT*100:.2f}%</b> dari entry (bukan jarak struktural
-    candle) — atur via env var <code>SL_PCT</code>."""}
-    Support valid → bias Short, Resistance valid → bias Long (arah dibalik).
-    Flip protection: cross berlawanan → keluar/batal seketika (termasuk membatalkan proses
-    konfirmasi/monitoring M5 yang sedang berjalan), tunggu cross searah lagi.
-    {"""Take Profit TETAP (limit order) di rasio 1:{:.1f}R dari entry -- begitu wick candle
-    berikutnya menyentuh level TP, fill PERSIS di harga TP itu (reason "TP"). SL diprioritaskan
-    kalau SL & TP sama2 tersentuh di candle yg sama (worst-case). Atur via env var
-    TP_R (0 = nonaktif).""".format(TP_R) if TP_R > 0 else ""}
-    {"Trailing juga aktif di rasio 1:{:.0f}, lebar {:.1f}x dist (independen dari TP di atas — mana lebih dulu tersentuh yg menang).".format(TRAIL_ACT_R, TRAIL_STOP) if TRAIL_ACT_R < 100 else ""}
-    <br>⚙️ Risk {RISK_PCT*100:.0f}% dihitung dari balance TERKINI (compounding, 1 akun bersama —
-    bukan modal terpisah per coin). Kalau slot ({MAX_CONCURRENT}) penuh saat sinyal valid baru
-    muncul di koin lain, sinyal itu dilewati (lihat kolom "Sinyal Terblokir" di ringkasan).
+    💡 <b>4 jenis level, semua basis body candle H1:</b>
+    <br>• <b>SBR</b> (Support→Resistance): support di-TEST (wick bawah sentuh, close aman) →
+    BREAK ke bawah (close tembus) → KONFIRMASI (wick atas candle berikutnya tidak balik ke
+    level). Entry <b>Short</b>.
+    <br>• <b>RBS</b> (Resistance→Support): resistance di-TEST (wick atas sentuh, close aman) →
+    BREAK ke atas → KONFIRMASI (wick bawah candle berikutnya tidak balik ke level). Entry
+    <b>Long</b>.
+    <br>• <b>QMS</b> (Quasimodo Support): support di-TEST → BREAK-1 ke bawah → BREAK-2 candle
+    berikutnya balik ke ATAS di level yang sama → KONFIRMASI (low candle setelahnya tidak
+    menyentuh level). Entry <b>Long</b> di level support awal.
+    <br>• <b>QMR</b> (Quasimodo Resistance): kebalikan QMS — resistance di-TEST → BREAK-1 ke
+    atas → BREAK-2 balik ke BAWAH → KONFIRMASI (high candle setelahnya tidak menyentuh level).
+    Entry <b>Short</b>.
+    <br>Level aktif dipantau via candle M5: masuk radius <b>{APPROACH_PCT*100:.1f}%</b> dari
+    level → limit dipasang persis di level; kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}%
+    sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). SL fix
+    <b>{SL_PCT*100:.2f}%</b> dari entry, TP fix <b>1:{TP_R:.1f}R</b>. Level MATI setelah 1x
+    terisi (menang/kalah).
+    <br>⚙️ Risk {RISK_PCT*100:.0f}% dari balance (compounding). Slot maksimum: {_fmt_max_concurrent()}.
+    Sinyal terblokir — slot: {cr.get('blocked_by_slot',0)}, margin: {cr.get('blocked_by_margin',0)},
+    min order: {cr.get('blocked_by_min_order',0)}.
     <br>Unduh semua trade: <a href="/trades.csv">/trades.csv</a> &nbsp;|&nbsp;
     Log mentah: <a href="/logs">/logs</a>
   </div>
+
+  <h2>Ringkasan per Jenis Level</h2>
+  <table>
+    <tr><th>Jenis</th><th>N Trade</th><th>Win</th><th>WR%</th><th>Total R</th><th>Total PnL</th></tr>
+    {kind_rows_html}
+  </table>
+
+  <h2>Ringkasan per Koin</h2>
+  <table>
+    <tr><th>Symbol</th><th>N Trade</th><th>Win</th><th>WR%</th><th>Total R</th><th>Total PnL</th></tr>
+    {rows_html}
+  </table>
 
   <h2>Log Progress</h2>
   <div class="log" id="log">{log_html}</div>
@@ -2414,10 +907,8 @@ def _trades_csv() -> bytes:
         trades_cp = list(_all_trades)
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=[
-        'symbol', 'direction', 'entry', 'sl', 'exit', 'reason', 'r_mult',
-        'pnl_usd', 'entry_ts', 'exit_ts', 'balance_after',
-        'vol_ratio', 'atr_ratio', 'ema_gap_pct', 'trend_pct', 'dist_pct',
-        'rsi', 'macd_hist_pct', 'sar_dist_pct', f'rsi{RSI_GATE_PERIOD}'],
+        'symbol', 'kind', 'direction', 'entry', 'sl', 'exit', 'reason', 'r_mult',
+        'pnl_usd', 'entry_ts', 'exit_ts', 'balance_after', 'level'],
         extrasaction='ignore')
     writer.writeheader()
     for t in trades_cp:
