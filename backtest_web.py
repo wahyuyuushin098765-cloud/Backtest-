@@ -226,18 +226,22 @@ def fetch_bybit_m5(symbol: str) -> pd.DataFrame:
 
 def find_levels(df):
     """Deteksi level S/R dasar dari candle H1 (basis body candle, sama pola lama).
+    Syarat kanan: candle c3 (setelah c1,c2) tidak boleh menembus body level.
+    Syarat kiri : candle SEBELUM c1 (index c1-1) juga tidak boleh menembus body
+                  level -- kalau c1 adalah candle paling awal (tidak ada candle
+                  sebelumnya), level GUGUR.
     Return list dict: {'type': 'support'/'resistance', 'level': harga, 'c1', 'c2', 'c3'}."""
     o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     n = len(df)
     levels = []
-    for i in range(0, n - 2):
+    for i in range(1, n - 2):   # mulai dari 1, supaya selalu ada candle sebelum c1
         if c[i] < o[i] and c[i + 1] > o[i + 1]:          # bearish lalu bullish
             S = c[i]
-            if l[i + 2] > S + 1e-9:                       # c3 tidak menembus body
+            if l[i + 2] > S + 1e-9 and l[i - 1] > S + 1e-9:   # kanan (c3) DAN kiri (c1-1) tidak menembus
                 levels.append({'type': 'support', 'level': S, 'c1': i, 'c2': i + 1, 'c3': i + 2})
         if c[i] > o[i] and c[i + 1] < o[i + 1]:          # bullish lalu bearish
             R = c[i]
-            if h[i + 2] < R - 1e-9:
+            if h[i + 2] < R - 1e-9 and h[i - 1] < R - 1e-9:   # kanan (c3) DAN kiri (c1-1) tidak menembus
                 levels.append({'type': 'resistance', 'level': R, 'c1': i, 'c2': i + 1, 'c3': i + 2})
     return levels
 
@@ -277,14 +281,20 @@ def detect_sbr_rbs_events(df):
 
         tested = False
         break_i = None
-        # cari TEST dulu, lalu BREAK setelah test
+        invalid = False
+        # cari TEST dulu, lalu BREAK setelah test. Kalau BREAK terjadi SEBELUM
+        # ada test valid, level ini GUGUR TOTAL (tidak dicoba lagi).
         i = start
         while i < n:
             if ty == 'support':
-                # TEST: wick bawah menyentuh level, close masih di atas (aman)
                 if not tested:
                     if l[i] <= level + 1e-9 and c[i] > level + 1e-9:
                         tested = True
+                        i += 1
+                        continue
+                    if c[i] < level - 1e-9:
+                        invalid = True   # break duluan sebelum ada test -> gugur
+                        break
                     i += 1
                     continue
                 # sudah tested -> cari BREAK (close menembus ke bawah)
@@ -296,6 +306,11 @@ def detect_sbr_rbs_events(df):
                 if not tested:
                     if h[i] >= level - 1e-9 and c[i] < level - 1e-9:
                         tested = True
+                        i += 1
+                        continue
+                    if c[i] > level + 1e-9:
+                        invalid = True
+                        break
                     i += 1
                     continue
                 if c[i] > level + 1e-9:
@@ -303,8 +318,8 @@ def detect_sbr_rbs_events(df):
                     break
                 i += 1
 
-        if break_i is None or break_i + 1 >= n:
-            continue  # tidak ada break, atau break di candle terakhir (tak ada candle konfirmasi)
+        if invalid or break_i is None or break_i + 1 >= n:
+            continue  # gugur (break sebelum test), tidak ada break, atau break di candle terakhir
 
         confirm_i = break_i + 1
         if ty == 'support':
@@ -363,12 +378,18 @@ def detect_qm_events(df):
 
         tested = False
         break1_i = None
+        invalid = False
         i = start
         while i < n:
             if ty == 'support':
                 if not tested:
                     if l[i] <= level + 1e-9 and c[i] > level + 1e-9:
                         tested = True
+                        i += 1
+                        continue
+                    if c[i] < level - 1e-9:
+                        invalid = True   # break duluan sebelum ada test -> gugur
+                        break
                     i += 1
                     continue
                 if c[i] < level - 1e-9:   # BREAK-1 ke bawah
@@ -379,6 +400,11 @@ def detect_qm_events(df):
                 if not tested:
                     if h[i] >= level - 1e-9 and c[i] < level - 1e-9:
                         tested = True
+                        i += 1
+                        continue
+                    if c[i] > level + 1e-9:
+                        invalid = True
+                        break
                     i += 1
                     continue
                 if c[i] > level + 1e-9:   # BREAK-1 ke atas
@@ -386,7 +412,7 @@ def detect_qm_events(df):
                     break
                 i += 1
 
-        if break1_i is None or break1_i + 1 >= n:
+        if invalid or break1_i is None or break1_i + 1 >= n:
             continue
 
         break2_i = break1_i + 1
