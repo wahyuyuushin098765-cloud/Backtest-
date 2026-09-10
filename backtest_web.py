@@ -39,7 +39,10 @@ RINGKASAN STRATEGI
      - Kalau sebelum fill harga malah menjauh lagi >2% dari level -> limit
        DIBATALKAN (order dicabut), tapi level TETAP tersimpan aktif -- bisa
        terpasang ulang nanti kalau harga mendekat lagi dalam radius 2%.
-   SL = SL_PCT (default 1% = 1R) dari harga entry, arah berlawanan dari entry.
+   SL = ujung wick TERPANJANG dari 2 candle pembentuk level (c1, c2) -- BUKAN
+   fix persen. QMS (Long): SL = low terendah antara low[c1] & low[c2]. QMR
+   (Short): SL = high tertinggi antara high[c1] & high[c2]. Jarak entry-ke-SL
+   ini = 1R (variatif per level, bukan fix), dipakai jg utk hitung trailing.
    TRAILING STOP: begitu profit capai TRAIL_ACTIVATE_R (default 3R), trailing
    aktif -- SL lalu mengikuti TRAIL_STOP_R (default 1R) di belakang harga
    tertinggi/terendah yang pernah dicapai (dipantau M5), SL cuma boleh
@@ -69,7 +72,7 @@ RISK_PCT         = float(os.environ.get('RISK_PCT', '0.01'))          # risk 1% 
 FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))
 FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))
 
-SL_PCT           = float(os.environ.get('SL_PCT', '0.01'))            # SL fix 1% dari entry (=1R)
+SL_PCT           = float(os.environ.get('SL_PCT', '0.01'))            # TIDAK DIPAKAI di file ini -- SL sekarang dari wick c1/c2, dibiarkan utk kompatibilitas var lain
 TRAIL_ACTIVATE_R = float(os.environ.get('TRAIL_ACTIVATE_R', '3.0'))    # trailing aktif begitu profit capai 3R
 TRAIL_STOP_R     = float(os.environ.get('TRAIL_STOP_R', '1.0'))       # setelah aktif, SL mengikuti 1R di belakang harga tertinggi/terendah
 APPROACH_PCT     = float(os.environ.get('APPROACH_PCT', '0.02'))      # radius 2% utk pasang/cabut limit
@@ -141,7 +144,7 @@ _all_trades = []
 _combined_result = {
     'n_trades': 0, 'n_win': 0, 'n_loss': 0, 'wr': 0, 'total_pnl': 0, 'roi': 0,
     'total_r': 0, 'avg_r': 0, 'final_balance': INITIAL_BALANCE,
-    'blocked_by_slot': 0, 'blocked_by_margin': 0, 'blocked_by_min_order': 0,
+    'blocked_by_slot': 0, 'blocked_by_margin': 0, 'blocked_by_min_order': 0, 'blocked_by_invalid_sl': 0,
 }
 
 
@@ -460,11 +463,18 @@ def detect_qm_events(df):
 
         kind = 'QMS' if ty == 'support' else 'QMR'
         direction = 'Long' if ty == 'support' else 'Short'
+        c1, c2 = lv['c1'], lv['c2']
+        if ty == 'support':
+            # QMS (Long): SL di ujung bawah wick TERPANJANG antara c1 & c2 (low terendah)
+            sl_wick = min(l[c1], l[c2])
+        else:
+            # QMR (Short): SL di ujung atas wick TERPANJANG antara c1 & c2 (high tertinggi)
+            sl_wick = max(h[c1], h[c2])
         events.append({
             'kind': kind, 'type': ty, 'level': level, 'direction': direction,
             'break1_i': break1_i, 'break2_i': break2_i, 'confirm_i': confirm_i,
             'confirm_ts': int(ts[confirm_i]),
-            'c1': lv['c1'], 'c2': lv['c2'],
+            'c1': c1, 'c2': c2, 'sl_wick': sl_wick,
         })
 
     events.sort(key=lambda e: e['confirm_ts'])
@@ -540,9 +550,6 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
     balance = INITIAL_BALANCE
     active_positions = {}     # key(symbol,direction+level) -> {...}
     trades = []
-    blocked_by_slot = 0
-    blocked_by_margin = 0
-    blocked_by_min_order = 0
 
     def _akey(symbol, direction, level, kind):
         return f"{symbol}|{direction}|{kind}|{level:.10f}"
@@ -569,11 +576,10 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
     def open_trade(symbol, ev, entry_price, entry_ts):
         nonlocal balance, total_margin_used
         direction = ev['direction']
-        if direction == 'Short':
-            sl = entry_price * (1 + SL_PCT)
-        else:
-            sl = entry_price * (1 - SL_PCT)
-        dist = abs(entry_price - sl)   # = 1R
+        sl = ev['sl_wick']   # SL berbasis wick terpanjang dari c1/c2 (bukan fix %)
+        dist = abs(entry_price - sl)   # = 1R (variatif per level)
+        if dist <= 1e-9:
+            return None, 'invalid_sl'   # SL wick kebetulan == entry, trade tidak valid
 
         risk_amount = balance * RISK_PCT
         raw_qty = risk_amount / dist if dist > 0 else 0
@@ -689,7 +695,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
                     still_live.append(idx)
             live_levels_by_symbol[symbol] = still_live
 
-    nonlocal_blocks = {'slot': 0, 'margin': 0, 'min_order': 0}
+    nonlocal_blocks = {'slot': 0, 'margin': 0, 'min_order': 0, 'invalid_sl': 0}
 
     # ── TIMELINE EFISIEN via K-WAY MERGE (pointer index, bukan searchsorted) ──
     # Tiap simbol punya pointer int ke posisi candle M5 berikutnya yg BELUM
@@ -760,6 +766,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
     blocked_by_slot = nonlocal_blocks['slot']
     blocked_by_margin = nonlocal_blocks['margin']
     blocked_by_min_order = nonlocal_blocks['min_order']
+    blocked_by_invalid_sl = nonlocal_blocks['invalid_sl']
 
     n_trades = len(trades)
     n_win = sum(1 for t in trades if t['pnl_usd'] > 0)
@@ -775,7 +782,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
         'wr': wr, 'total_pnl': total_pnl, 'total_r': total_r, 'avg_r': avg_r,
         'final_balance': balance, 'roi': roi,
         'blocked_by_slot': blocked_by_slot, 'blocked_by_margin': blocked_by_margin,
-        'blocked_by_min_order': blocked_by_min_order,
+        'blocked_by_min_order': blocked_by_min_order, 'blocked_by_invalid_sl': blocked_by_invalid_sl,
     }
 
 
@@ -831,8 +838,9 @@ def _run():
     global _phase, _results, _kind_results, _all_trades, _combined_result
     try:
         _log_msg(f"🚀 Mulai backtest QMS/QMR — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
-        _log_msg(f"   SL={SL_PCT*100:.2f}% (=1R)  Trailing: aktif di {TRAIL_ACTIVATE_R:.1f}R, "
-                  f"jarak {TRAIL_STOP_R:.1f}R dari extreme  APPROACH_PCT={APPROACH_PCT*100:.1f}%")
+        _log_msg(f"   SL=wick terpanjang c1/c2 (variatif per level, =1R)  Trailing: aktif di "
+                  f"{TRAIL_ACTIVATE_R:.1f}R, jarak {TRAIL_STOP_R:.1f}R dari extreme  "
+                  f"APPROACH_PCT={APPROACH_PCT*100:.1f}%")
 
         coins = {}
         m5_data = {}
@@ -866,6 +874,7 @@ def _run():
                 'blocked_by_slot': result['blocked_by_slot'],
                 'blocked_by_margin': result['blocked_by_margin'],
                 'blocked_by_min_order': result['blocked_by_min_order'],
+                'blocked_by_invalid_sl': result['blocked_by_invalid_sl'],
             })
             _results[:] = per_symbol_breakdown(result['trades'])
             _kind_results[:] = per_kind_breakdown(result['trades'])
@@ -977,14 +986,14 @@ def _render_html() -> bytes:
     menyentuh level DAN body candle bearish, searah break-2). Entry <b>Short</b>.
     <br>Level aktif dipantau via candle M5: masuk radius <b>{APPROACH_PCT*100:.1f}%</b> dari
     level → limit dipasang persis di level; kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}%
-    sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). SL fix
-    <b>{SL_PCT*100:.2f}%</b> dari entry (=1R). <b>Trailing stop</b>: aktif begitu profit
-    capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti <b>{TRAIL_STOP_R:.1f}R</b> di
-    belakang harga tertinggi/terendah yang pernah dicapai (dipantau M5). Level MATI setelah 1x
-    terisi (menang/kalah).
+    sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). <b>SL</b> = ujung wick
+    terpanjang dari 2 candle pembentuk level (bukan fix %) — jarak ini = 1R. <b>Trailing
+    stop</b>: aktif begitu profit capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti
+    <b>{TRAIL_STOP_R:.1f}R</b> di belakang harga tertinggi/terendah yang pernah dicapai
+    (dipantau M5). Level MATI setelah 1x terisi (menang/kalah).
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dari balance (compounding). Slot maksimum: {_fmt_max_concurrent()}.
     Sinyal terblokir — slot: {cr.get('blocked_by_slot',0)}, margin: {cr.get('blocked_by_margin',0)},
-    min order: {cr.get('blocked_by_min_order',0)}.
+    min order: {cr.get('blocked_by_min_order',0)}, SL invalid: {cr.get('blocked_by_invalid_sl',0)}.
     <br>Unduh semua trade: <a href="/trades.csv">/trades.csv</a> &nbsp;|&nbsp;
     Log mentah: <a href="/logs">/logs</a>
   </div>
