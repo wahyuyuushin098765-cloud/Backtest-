@@ -69,6 +69,7 @@ FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))
 FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))
 
 SL_PCT           = float(os.environ.get('SL_PCT', '0.01'))            # TIDAK DIPAKAI di file ini -- SL sekarang dari wick c1/c2, dibiarkan utk kompatibilitas var lain
+MIN_SL_PCT       = float(os.environ.get('MIN_SL_PCT', '0.002'))       # jarak SL minimum dari entry (0.2%) -- kalau SL wick lebih sempit, diperlebar ke sini
 TRAIL_ACTIVATE_R = float(os.environ.get('TRAIL_ACTIVATE_R', '3.0'))    # trailing aktif begitu profit capai 3R
 TRAIL_STOP_R     = float(os.environ.get('TRAIL_STOP_R', '1.0'))       # setelah aktif, SL mengikuti 1R di belakang harga tertinggi/terendah
 APPROACH_PCT     = float(os.environ.get('APPROACH_PCT', '0.02'))      # radius 2% utk pasang/cabut limit
@@ -574,8 +575,11 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
         direction = ev['direction']
         sl = ev['sl_wick']   # SL berbasis wick terpanjang dari c1/c2 (bukan fix %)
         dist = abs(entry_price - sl)   # = 1R (variatif per level)
-        if dist <= 1e-9:
-            return None, 'invalid_sl'   # SL wick kebetulan == entry, trade tidak valid
+        min_dist = entry_price * MIN_SL_PCT
+        if dist < min_dist:
+            # SL wick terlalu sempit -> perlebar ke jarak minimum, arah tetap sama
+            dist = min_dist
+            sl = entry_price + dist if direction == 'Short' else entry_price - dist
 
         risk_amount = balance * RISK_PCT
         raw_qty = risk_amount / dist if dist > 0 else 0
@@ -980,10 +984,12 @@ def _render_html() -> bytes:
     <br>Level aktif dipantau via candle M5: masuk radius <b>{APPROACH_PCT*100:.1f}%</b> dari
     level → limit dipasang persis di level; kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}%
     sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). <b>SL</b> = ujung atas
-    wick terpanjang dari 2 candle pembentuk level (bukan fix %) — jarak ini = 1R. <b>Trailing
-    stop</b>: aktif begitu profit capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti
-    <b>{TRAIL_STOP_R:.1f}R</b> di belakang harga terendah yang pernah dicapai (dipantau M5).
-    Level MATI setelah 1x terisi (menang/kalah).
+    wick terpanjang dari 2 candle pembentuk level (bukan fix %), dengan jarak minimum
+    <b>{MIN_SL_PCT*100:.2f}%</b> dari entry (kalau wick lebih sempit, SL diperlebar ke jarak
+    minimum ini) — jarak ini = 1R. <b>Trailing stop</b>: aktif begitu profit capai
+    <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti <b>{TRAIL_STOP_R:.1f}R</b> di belakang
+    harga terendah yang pernah dicapai (dipantau M5). Level MATI setelah 1x terisi
+    (menang/kalah).
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dari balance (compounding). Slot maksimum: {_fmt_max_concurrent()}.
     Sinyal terblokir — slot: {cr.get('blocked_by_slot',0)}, margin: {cr.get('blocked_by_margin',0)},
     min order: {cr.get('blocked_by_min_order',0)}, SL invalid: {cr.get('blocked_by_invalid_sl',0)}.
