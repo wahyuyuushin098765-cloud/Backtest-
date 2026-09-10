@@ -59,8 +59,9 @@ RISK_PCT         = float(os.environ.get('RISK_PCT', '0.01'))          # risk 1% 
 FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))
 FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))
 
-SL_PCT           = float(os.environ.get('SL_PCT', '0.01'))            # SL fix 1% dari entry
-TP_R             = float(os.environ.get('TP_R', '4.0'))               # TP fix rasio 1:4R dari entry
+SL_PCT           = float(os.environ.get('SL_PCT', '0.01'))            # SL fix 1% dari entry (=1R)
+TRAIL_ACTIVATE_R = float(os.environ.get('TRAIL_ACTIVATE_R', '3.0'))    # trailing aktif begitu profit capai 3R
+TRAIL_STOP_R     = float(os.environ.get('TRAIL_STOP_R', '1.0'))       # setelah aktif, SL mengikuti 1R di belakang harga tertinggi/terendah
 APPROACH_PCT     = float(os.environ.get('APPROACH_PCT', '0.02'))      # radius 2% utk pasang/cabut limit
 
 LEVERAGE           = float(os.environ.get('LEVERAGE', '50'))
@@ -269,7 +270,7 @@ def detect_sbr_rbs_events(df):
      'direction': Short/Long, 'break_i', 'confirm_i', 'confirm_ts', 'c1', 'c2'}
     """
     ts = df['ts'].values
-    h = df['high'].values; l = df['low'].values; c = df['close'].values
+    o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     n = len(df)
     levels = find_levels(df)
     events = []
@@ -324,10 +325,16 @@ def detect_sbr_rbs_events(df):
         confirm_i = break_i + 1
         if ty == 'support':
             # break ke bawah -> retest gagal berarti wick ATAS tidak balik naik ke level
-            confirmed = h[confirm_i] < level - 1e-9
+            wick_ok = h[confirm_i] < level - 1e-9
+            # DAN body candle konfirmasi harus searah break (bearish: close < open)
+            body_ok = c[confirm_i] < o[confirm_i] - 1e-9
         else:
             # break ke atas -> retest gagal berarti wick BAWAH tidak balik turun ke level
-            confirmed = l[confirm_i] > level + 1e-9
+            wick_ok = l[confirm_i] > level + 1e-9
+            # DAN body candle konfirmasi harus searah break (bullish: close > open)
+            body_ok = c[confirm_i] > o[confirm_i] + 1e-9
+
+        confirmed = wick_ok and body_ok
 
         if not confirmed:
             continue
@@ -366,7 +373,7 @@ def detect_qm_events(df):
      'c1', 'c2'}
     """
     ts = df['ts'].values
-    h = df['high'].values; l = df['low'].values; c = df['close'].values
+    o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     n = len(df)
     levels = find_levels(df)
     events = []
@@ -428,11 +435,15 @@ def detect_qm_events(df):
 
         confirm_i = break2_i + 1
         if ty == 'support':
-            # QMS -> entry Long: konfirmasi = low candle ini TIDAK menyentuh level
-            confirmed = l[confirm_i] > level + 1e-9
+            # QMS -> entry Long: wick TIDAK menyentuh level, DAN body searah (bullish)
+            wick_ok = l[confirm_i] > level + 1e-9
+            body_ok = c[confirm_i] > o[confirm_i] + 1e-9
         else:
-            # QMR -> entry Short: konfirmasi = high candle ini TIDAK menyentuh level
-            confirmed = h[confirm_i] < level - 1e-9
+            # QMR -> entry Short: wick TIDAK menyentuh level, DAN body searah (bearish)
+            wick_ok = h[confirm_i] < level - 1e-9
+            body_ok = c[confirm_i] < o[confirm_i] - 1e-9
+
+        confirmed = wick_ok and body_ok
 
         if not confirmed:
             continue
@@ -451,10 +462,22 @@ def detect_qm_events(df):
 
 
 def detect_all_events(df):
-    """Gabungan SBR + RBS + QMS + QMR, urut by confirm_ts."""
+    """Gabungan SBR + RBS + QMS + QMR, urut by confirm_ts.
+    Dedup: 2 event dgn (kind, level, confirm_ts) SAMA PERSIS dianggap 1 sinyal
+    yg sama (bisa terjadi kalau 2 basis candle c1/c2 berbeda kebetulan
+    menghasilkan level & window break/confirm yg identik) -- ambil salah satu
+    saja supaya tidak dihitung 2x atau collision key posisi trading."""
     events = detect_sbr_rbs_events(df) + detect_qm_events(df)
-    events.sort(key=lambda e: e['confirm_ts'])
-    return events
+    seen = set()
+    deduped = []
+    for e in events:
+        dedup_key = (e['kind'], round(e['level'], 10), e['confirm_ts'])
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        deduped.append(e)
+    deduped.sort(key=lambda e: e['confirm_ts'])
+    return deduped
 
 
 # ============================================================
@@ -513,53 +536,33 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
     def _akey(symbol, direction, level, kind):
         return f"{symbol}|{direction}|{kind}|{level:.10f}"
 
+    total_margin_used = 0.0   # dijaga incremental, bukan sum() ulang tiap panggilan (O(1) bukan O(n))
+
     def _slots_used():
         return len(active_positions)
 
-    def _current_margin_used():
-        return sum((p['entry'] * p['qty']) / LEVERAGE for p in active_positions.values())
-
-    # ── timeline global M5: gabungan semua timestamp M5 semua koin, urut kronologis ──
-    all_ts = set()
-    for symbol, m5 in m5_data.items():
-        if m5 is not None:
-            all_ts.update(int(t) for t in m5['TS'])
-    timeline = sorted(all_ts)
-
-    # index cepat: ts -> row index, per simbol (O(1) lookup, bukan np.where linear tiap kali)
-    ts_to_idx = {}
-    for symbol, m5 in m5_data.items():
-        if m5 is not None:
-            ts_to_idx[symbol] = {int(t): i for i, t in enumerate(m5['TS'])}
-
-    # daftar posisi aktif per simbol (utk hindari scan semua active_positions tiap tick)
     positions_by_symbol = {}   # symbol -> set(keys)
 
-    # state per level per koin, DIURUTKAN by confirm_ts supaya bisa "aktifkan" scr progresif
-    # tanpa scan ulang semua level tiap tick (pointer per simbol: level yg blm confirm_ts
-    # dilewati, sekali lewat confirm_ts baru masuk daftar 'live' simbol itu).
     level_state = {}   # (symbol, idx_event) -> {'status', 'used'}
     for symbol, cp in coins.items():
         for idx, ev in enumerate(cp['events']):
             level_state[(symbol, idx)] = {'status': 'waiting', 'used': False}
-    live_levels_by_symbol = {symbol: [] for symbol in coins}   # levels sudah lewat confirm_ts
-    pending_activation = {}    # symbol -> list of (confirm_ts, idx) belum diaktifkan, urut asc
+
+    # pending_activation: level yg confirm_ts-nya BELUM lewat, urut asc per simbol
+    pending_activation = {}
+    live_levels_by_symbol = {symbol: [] for symbol in coins}
     for symbol, cp in coins.items():
         pending_activation[symbol] = sorted(
             [(ev['confirm_ts'], idx) for idx, ev in enumerate(cp['events'])])
 
     def open_trade(symbol, ev, entry_price, entry_ts):
-        nonlocal balance
+        nonlocal balance, total_margin_used
         direction = ev['direction']
         if direction == 'Short':
             sl = entry_price * (1 + SL_PCT)
         else:
             sl = entry_price * (1 - SL_PCT)
-        dist = abs(entry_price - sl)
-        if TP_R > 0:
-            tp = entry_price - TP_R * dist if direction == 'Short' else entry_price + TP_R * dist
-        else:
-            tp = None
+        dist = abs(entry_price - sl)   # = 1R
 
         risk_amount = balance * RISK_PCT
         raw_qty = risk_amount / dist if dist > 0 else 0
@@ -569,7 +572,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
 
         notional = entry_price * qty
         margin_needed = notional / LEVERAGE
-        if (_current_margin_used() + margin_needed) > balance * MARGIN_USAGE_CAP:
+        if (total_margin_used + margin_needed) > balance * MARGIN_USAGE_CAP:
             return None, 'margin'
 
         if _slots_used() >= MAX_CONCURRENT:
@@ -578,16 +581,19 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
         key = _akey(symbol, direction, ev['level'], ev['kind'])
         active_positions[key] = {
             'symbol': symbol, 'direction': direction, 'entry': entry_price, 'sl': sl,
-            'tp': tp, 'dist': dist, 'qty': qty, 'entry_ts': entry_ts, 'level': ev['level'],
-            'kind': ev['kind'],
+            'dist': dist, 'qty': qty, 'entry_ts': entry_ts, 'level': ev['level'],
+            'kind': ev['kind'], 'margin': margin_needed,
+            'trail_active': False, 'extreme': entry_price,   # high/low-water mark, mulai dari entry
         }
+        total_margin_used += margin_needed
         positions_by_symbol.setdefault(symbol, set()).add(key)
         return key, None
 
     def close_trade(key, exit_price, reason, exit_ts):
-        nonlocal balance
+        nonlocal balance, total_margin_used
         pos = active_positions.pop(key)
         positions_by_symbol.get(pos['symbol'], set()).discard(key)
+        total_margin_used -= pos['margin']
         entry, dist, qty, direction = pos['entry'], pos['dist'], pos['qty'], pos['direction']
         pnl_gross = (exit_price - entry) * qty if direction == 'Long' else (entry - exit_price) * qty
         fee = entry * qty * FEE_ENTRY_PCT + exit_price * qty * FEE_EXIT_PCT
@@ -601,63 +607,60 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
             'level': pos['level'], 'kind': pos['kind'],
         })
 
-    for now_ts in timeline:
-        # 1) proses SL/exit posisi aktif dulu (hanya simbol yg punya posisi aktif)
-        for symbol in list(positions_by_symbol.keys()):
-            keys = positions_by_symbol.get(symbol)
-            if not keys:
-                continue
-            idx_map = ts_to_idx.get(symbol)
-            if idx_map is None or now_ts not in idx_map:
-                continue
-            j = idx_map[now_ts]
-            m5 = m5_data[symbol]
-            hi, lo = m5['H'][j], m5['L'][j]
+    def process_symbol_tick(symbol, j):
+        """Proses SEMUA hal (exit posisi & level live) untuk 1 simbol di index candle j."""
+        m5 = m5_data[symbol]
+        now_ts = int(m5['TS'][j])
+        hi, lo, close_p = m5['H'][j], m5['L'][j], m5['C'][j]
+
+        # 1) exit posisi aktif simbol ini (dgn trailing stop 1:3 aktivasi, 1R trailing)
+        keys = positions_by_symbol.get(symbol)
+        if keys:
             for key in list(keys):
                 pos = active_positions[key]
                 direction = pos['direction']
-                sl_hit = (hi >= pos['sl'] - 1e-12) if direction == 'Short' else (lo <= pos['sl'] + 1e-12)
-                tp_hit = False
-                if pos['tp'] is not None:
-                    tp_hit = (lo <= pos['tp'] + 1e-12) if direction == 'Short' else (hi >= pos['tp'] - 1e-12)
-                # SL diprioritaskan kalau keduanya kena di candle yg sama (worst-case)
-                if sl_hit:
-                    close_trade(key, pos['sl'], 'SL', now_ts)
-                elif tp_hit:
-                    close_trade(key, pos['tp'], 'TP', now_ts)
+                entry, dist = pos['entry'], pos['dist']
 
-        # 2) aktifkan level yg baru lewat confirm_ts (pindah dari pending ke live), per simbol
-        for symbol, plist in pending_activation.items():
-            while plist and plist[0][0] < now_ts:
-                _, idx = plist.pop(0)
-                live_levels_by_symbol[symbol].append(idx)
+                if direction == 'Long':
+                    # update high-water mark & cek aktivasi pakai HIGH candle (best-case dulu)
+                    if hi > pos['extreme']:
+                        pos['extreme'] = hi
+                    profit_r = (pos['extreme'] - entry) / dist
+                    if not pos['trail_active'] and profit_r >= TRAIL_ACTIVATE_R:
+                        pos['trail_active'] = True
+                    if pos['trail_active']:
+                        new_sl = pos['extreme'] - TRAIL_STOP_R * dist
+                        if new_sl > pos['sl']:
+                            pos['sl'] = new_sl   # SL cuma boleh naik (menguntungkan), tak pernah mundur
+                    # cek SL kena pakai LOW candle (worst-case, setelah SL di-update)
+                    if lo <= pos['sl'] + 1e-12:
+                        close_trade(key, pos['sl'], 'SL' if not pos['trail_active'] else 'TRAIL', now_ts)
+                else:  # Short
+                    if lo < pos['extreme']:
+                        pos['extreme'] = lo
+                    profit_r = (entry - pos['extreme']) / dist
+                    if not pos['trail_active'] and profit_r >= TRAIL_ACTIVATE_R:
+                        pos['trail_active'] = True
+                    if pos['trail_active']:
+                        new_sl = pos['extreme'] + TRAIL_STOP_R * dist
+                        if new_sl < pos['sl']:
+                            pos['sl'] = new_sl
+                    if hi >= pos['sl'] - 1e-12:
+                        close_trade(key, pos['sl'], 'SL' if not pos['trail_active'] else 'TRAIL', now_ts)
 
-        # 3) proses level SBR live: waiting->armed->fill, hanya simbol yg punya candle M5 di now_ts
-        for symbol, cp in coins.items():
-            live_idxs = live_levels_by_symbol.get(symbol)
-            if not live_idxs:
-                continue
-            idx_map = ts_to_idx.get(symbol)
-            if idx_map is None or now_ts not in idx_map:
-                continue
-            j = idx_map[now_ts]
-            m5 = m5_data[symbol]
-            close_p, hi, lo = m5['C'][j], m5['H'][j], m5['L'][j]
-
+        # 2) level live simbol ini: waiting -> armed -> fill
+        cp = coins[symbol]
+        live_idxs = live_levels_by_symbol.get(symbol)
+        if live_idxs:
             still_live = []
             for idx in live_idxs:
-                ev = cp['events'][idx]
                 st = level_state[(symbol, idx)]
                 if st['used']:
-                    continue   # level mati, buang dari daftar live
+                    continue   # sudah dipakai -> dibuang dari daftar live (tidak scan lagi)
+                ev = cp['events'][idx]
                 level = ev['level']
-                key_pos = _akey(symbol, ev['direction'], level, ev['kind'])
-                if key_pos in active_positions:
-                    still_live.append(idx)
-                    continue
 
                 dist_pct = abs(close_p - level) / level
-
                 if st['status'] == 'waiting':
                     if dist_pct <= APPROACH_PCT:
                         st['status'] = 'armed'
@@ -668,17 +671,84 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
                         if opened_key is not None:
                             st['used'] = True
                         else:
-                            if block_reason == 'slot':
-                                blocked_by_slot += 1
-                            elif block_reason == 'margin':
-                                blocked_by_margin += 1
-                            elif block_reason == 'min_order':
-                                blocked_by_min_order += 1
-                            # tetap 'armed' -- coba lagi candle M5 berikutnya kalau msh dlm radius
+                            nonlocal_blocks[block_reason] += 1
                     elif dist_pct > APPROACH_PCT:
-                        st['status'] = 'waiting'   # menjauh lagi, cabut limit, level tetap hidup
-                still_live.append(idx)
+                        st['status'] = 'waiting'
+                if not st['used']:
+                    still_live.append(idx)
             live_levels_by_symbol[symbol] = still_live
+
+    nonlocal_blocks = {'slot': 0, 'margin': 0, 'min_order': 0}
+
+    # ── TIMELINE EFISIEN via K-WAY MERGE (pointer index, bukan searchsorted) ──
+    # Tiap simbol punya pointer int ke posisi candle M5 berikutnya yg BELUM
+    # diproses. Heap cuma menyimpan (ts_candle_berikutnya, symbol) utk tahu
+    # simbol mana yg harus diproses duluan (urutan kronologis lintas simbol,
+    # perlu utk shared balance/margin/slot). Advance pointer = O(1) (i+=1),
+    # bukan np.searchsorted (O(log n) tapi overhead call besar tiap tick).
+    import heapq
+
+    ptr = {symbol: 0 for symbol in coins}   # pointer index candle M5 berikutnya per simbol
+    m5_ts_arr = {symbol: m5['TS'] for symbol, m5 in m5_data.items() if m5 is not None}
+    m5_len = {symbol: len(arr) for symbol, arr in m5_ts_arr.items()}
+
+    # simbol mulai diproses dari pointer candle M5 pertama SETELAH confirm_ts level pertamanya
+    def _advance_ptr_to(symbol, target_ts):
+        """Majukan ptr[symbol] sampai candle M5 pertama dgn ts >= target_ts (linear, tapi
+        dipanggil jarang -- hanya saat lompat jauh, bukan tiap tick normal)."""
+        arr = m5_ts_arr.get(symbol)
+        if arr is None:
+            return
+        i = ptr[symbol]
+        n = m5_len[symbol]
+        while i < n and arr[i] < target_ts:
+            i += 1
+        ptr[symbol] = i
+
+    heap = []   # (ts, symbol) -- symbol siap diproses di candle ptr[symbol]
+
+    for symbol, cp in coins.items():
+        if not cp['events'] or symbol not in m5_ts_arr:
+            continue
+        first_confirm = cp['events'][0]['confirm_ts']
+        _advance_ptr_to(symbol, first_confirm + 1)
+        if ptr[symbol] < m5_len[symbol]:
+            heapq.heappush(heap, (int(m5_ts_arr[symbol][ptr[symbol]]), symbol))
+
+    while heap:
+        now_ts, symbol = heapq.heappop(heap)
+        i = ptr[symbol]
+        if i >= m5_len[symbol] or m5_ts_arr[symbol][i] != now_ts:
+            continue   # stale entry (seharusnya tidak terjadi, safety check)
+
+        # aktifkan level yg confirm_ts-nya sudah lewat now_ts
+        plist = pending_activation.get(symbol)
+        if plist:
+            while plist and plist[0][0] < now_ts:
+                _, idx = plist.pop(0)
+                live_levels_by_symbol[symbol].append(idx)
+
+        process_symbol_tick(symbol, i)
+
+        # advance pointer: kalau simbol masih 'aktif' (posisi/level live), lanjut
+        # candle BERIKUTNYA (i+1, O(1)). Kalau tidak ada apa2 yg live, lompat
+        # jauh ke confirm_ts level pending berikutnya (hemat banyak tick).
+        has_active = bool(positions_by_symbol.get(symbol)) or bool(live_levels_by_symbol.get(symbol))
+        if has_active:
+            ptr[symbol] = i + 1
+        else:
+            plist = pending_activation.get(symbol)
+            if plist:
+                _advance_ptr_to(symbol, plist[0][0] + 1)
+            else:
+                ptr[symbol] = m5_len[symbol]   # tidak ada level pending lagi -> selesai
+
+        if ptr[symbol] < m5_len[symbol]:
+            heapq.heappush(heap, (int(m5_ts_arr[symbol][ptr[symbol]]), symbol))
+
+    blocked_by_slot = nonlocal_blocks['slot']
+    blocked_by_margin = nonlocal_blocks['margin']
+    blocked_by_min_order = nonlocal_blocks['min_order']
 
     n_trades = len(trades)
     n_win = sum(1 for t in trades if t['pnl_usd'] > 0)
@@ -750,7 +820,8 @@ def _run():
     global _phase, _results, _kind_results, _all_trades, _combined_result
     try:
         _log_msg(f"🚀 Mulai backtest SBR/RBS/QMS/QMR — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
-        _log_msg(f"   SL={SL_PCT*100:.2f}%  TP=1:{TP_R:.1f}R  APPROACH_PCT={APPROACH_PCT*100:.1f}%")
+        _log_msg(f"   SL={SL_PCT*100:.2f}% (=1R)  Trailing: aktif di {TRAIL_ACTIVATE_R:.1f}R, "
+                  f"jarak {TRAIL_STOP_R:.1f}R dari extreme  APPROACH_PCT={APPROACH_PCT*100:.1f}%")
 
         coins = {}
         m5_data = {}
@@ -884,23 +955,26 @@ def _render_html() -> bytes:
   </div>
 
   <div class="note">
-    💡 <b>4 jenis level, semua basis body candle H1:</b>
+    💡 <b>4 jenis level, semua basis body candle H1</b> (level dasar disyaratkan candle
+    kiri MAUPUN kanan tidak menembus body-nya):
     <br>• <b>SBR</b> (Support→Resistance): support di-TEST (wick bawah sentuh, close aman) →
-    BREAK ke bawah (close tembus) → KONFIRMASI (wick atas candle berikutnya tidak balik ke
-    level). Entry <b>Short</b>.
+    BREAK ke bawah (close tembus) → KONFIRMASI (wick atas tidak balik ke level DAN body candle
+    bearish, searah break). Entry <b>Short</b>.
     <br>• <b>RBS</b> (Resistance→Support): resistance di-TEST (wick atas sentuh, close aman) →
-    BREAK ke atas → KONFIRMASI (wick bawah candle berikutnya tidak balik ke level). Entry
-    <b>Long</b>.
+    BREAK ke atas → KONFIRMASI (wick bawah tidak balik ke level DAN body candle bullish, searah
+    break). Entry <b>Long</b>.
     <br>• <b>QMS</b> (Quasimodo Support): support di-TEST → BREAK-1 ke bawah → BREAK-2 candle
-    berikutnya balik ke ATAS di level yang sama → KONFIRMASI (low candle setelahnya tidak
-    menyentuh level). Entry <b>Long</b> di level support awal.
+    berikutnya balik ke ATAS di level yang sama → KONFIRMASI (low tidak menyentuh level DAN
+    body candle bullish, searah break-2). Entry <b>Long</b> di level support awal.
     <br>• <b>QMR</b> (Quasimodo Resistance): kebalikan QMS — resistance di-TEST → BREAK-1 ke
-    atas → BREAK-2 balik ke BAWAH → KONFIRMASI (high candle setelahnya tidak menyentuh level).
-    Entry <b>Short</b>.
+    atas → BREAK-2 balik ke BAWAH → KONFIRMASI (high tidak menyentuh level DAN body candle
+    bearish, searah break-2). Entry <b>Short</b>.
     <br>Level aktif dipantau via candle M5: masuk radius <b>{APPROACH_PCT*100:.1f}%</b> dari
     level → limit dipasang persis di level; kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}%
     sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). SL fix
-    <b>{SL_PCT*100:.2f}%</b> dari entry, TP fix <b>1:{TP_R:.1f}R</b>. Level MATI setelah 1x
+    <b>{SL_PCT*100:.2f}%</b> dari entry (=1R). <b>Trailing stop</b>: aktif begitu profit
+    capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti <b>{TRAIL_STOP_R:.1f}R</b> di
+    belakang harga tertinggi/terendah yang pernah dicapai (dipantau M5). Level MATI setelah 1x
     terisi (menang/kalah).
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dari balance (compounding). Slot maksimum: {_fmt_max_concurrent()}.
     Sinyal terblokir — slot: {cr.get('blocked_by_slot',0)}, margin: {cr.get('blocked_by_margin',0)},
