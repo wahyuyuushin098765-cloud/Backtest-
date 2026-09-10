@@ -1,56 +1,52 @@
 """
-backtest_qm.py — Backtest strategi QMS + QMR (Quasimodo Support/Resistance), H1
+backtest_qmr.py — Backtest strategi QMR SAJA (Quasimodo Resistance), H1
 ================================================================================
-KHUSUS QMS & QMR SAJA — SBR dan RBS sengaja TIDAK diikutkan di file ini
-(dipisah dari backtest_sbr.py yang mencakup keempatnya).
+KHUSUS QMR SAJA — SBR, RBS, dan QMS sengaja TIDAK diikutkan di file ini
+(dipisah dari backtest_qm.py yang mencakup QMS+QMR, dan backtest_sbr.py yang
+mencakup keempatnya).
 
 RINGKASAN STRATEGI
 -------------------
-1) DETEKSI LEVEL (H1):
-   Support: candle c1 bearish (close<open) lalu c2 bullish (close>open).
-            Level = close[c1]. Valid kalau:
-            - low candle c3 (setelah c1,c2) TIDAK lebih rendah dari level
-            - low candle SEBELUM c1 JUGA TIDAK lebih rendah dari level
-            (kiri MAUPUN kanan tidak boleh menembus body level).
-   Resistance: kebalikannya (c1 bullish, c2 bearish). Level = close[c1].
-            Valid kalau high candle c3 DAN high candle sebelum c1 < level.
+1) DETEKSI LEVEL RESISTANCE (H1):
+   Candle c1 bullish (close>open) lalu c2 bearish (close<open). Level =
+   close[c1]. Valid kalau:
+   - high candle c3 (setelah c1,c2) TIDAK lebih tinggi dari level
+   - high candle SEBELUM c1 JUGA TIDAK lebih tinggi dari level
+   (kiri MAUPUN kanan tidak boleh menembus body level).
 
-2) JADI LEVEL "QMS" (Quasimodo Support) — SETELAH level support terbentuk:
-   a. TEST: minimal 1 candle wick bawah menyentuh level, close masih aman (di
-      atas level). Boleh lebih dari 1x.
-   b. BREAK-1: candle close menembus level ke BAWAH.
-   c. BREAK-2: candle TEPAT SETELAH break-1, close balik menembus level ke ATAS
-      (level yang sama ditembus 2x, arah berlawanan).
-   d. KONFIRMASI: candle TEPAT SETELAH break-2 — low-nya TIDAK menyentuh level
-      lagi, DAN body candle ini harus bullish (close>open, searah break-2).
-   Begitu semua terpenuhi -> level jadi QMS AKTIF, entry arah LONG di level
-   support awal, disimpan dgn status 'menunggu harga mendekat'.
+2) JADI LEVEL "QMR" (Quasimodo Resistance) — SETELAH level resistance terbentuk:
+   a. TEST: minimal 1 candle wick atas menyentuh level, close masih aman (di
+      bawah level). Boleh lebih dari 1x.
+   b. BREAK-1: candle close menembus level ke ATAS.
+   c. BREAK-2: candle TEPAT SETELAH break-1, close balik menembus level ke
+      BAWAH (level yang sama ditembus 2x, arah berlawanan).
+   d. KONFIRMASI: candle TEPAT SETELAH break-2 — high-nya TIDAK menyentuh
+      level lagi, DAN body candle ini harus bearish (close<open, searah
+      break-2).
+   Begitu semua terpenuhi -> level jadi QMR AKTIF, entry arah SHORT di level
+   resistance awal, disimpan dgn status 'menunggu harga mendekat'.
 
-   "QMR" (Quasimodo Resistance) adalah kebalikan totalnya: level resistance,
-   break-1 ke ATAS, break-2 balik ke BAWAH, konfirmasi high tidak menyentuh
-   level DAN body bearish (searah break-2). Entry arah SHORT.
-
-3) TRIGGER ENTRY (dipantau di candle M5, presisi) — SETELAH level QMS/QMR aktif:
+3) TRIGGER ENTRY (dipantau di candle M5, presisi) — SETELAH level QMR aktif:
    Selama level belum dipakai, tiap candle M5 dicek jaraknya ke level:
-     - Kalau harga masuk radius 2% dari level -> limit order dipasang PERSIS
-       di level itu (arah sesuai QMS=Long / QMR=Short).
+     - Kalau harga masuk radius 2% dari level -> limit order Short dipasang
+       PERSIS di level itu.
      - Selama limit terpasang, kalau wick M5 menyentuh level -> FILL persis
        di level (harga limit).
      - Kalau sebelum fill harga malah menjauh lagi >2% dari level -> limit
        DIBATALKAN (order dicabut), tapi level TETAP tersimpan aktif -- bisa
        terpasang ulang nanti kalau harga mendekat lagi dalam radius 2%.
-   SL = ujung wick TERPANJANG dari 2 candle pembentuk level (c1, c2) -- BUKAN
-   fix persen. QMS (Long): SL = low terendah antara low[c1] & low[c2]. QMR
-   (Short): SL = high tertinggi antara high[c1] & high[c2]. Jarak entry-ke-SL
-   ini = 1R (variatif per level, bukan fix), dipakai jg utk hitung trailing.
+   SL = ujung atas wick TERPANJANG dari 2 candle pembentuk level (c1, c2) --
+   BUKAN fix persen. SL = high tertinggi antara high[c1] & high[c2]. Jarak
+   entry-ke-SL ini = 1R (variatif per level, bukan fix), dipakai jg utk
+   hitung trailing.
    TRAILING STOP: begitu profit capai TRAIL_ACTIVATE_R (default 3R), trailing
    aktif -- SL lalu mengikuti TRAIL_STOP_R (default 1R) di belakang harga
-   tertinggi/terendah yang pernah dicapai (dipantau M5), SL cuma boleh
-   bergerak menguntungkan, tak pernah mundur.
+   terendah yang pernah dicapai (dipantau M5), SL cuma boleh bergerak
+   menguntungkan (turun), tak pernah mundur.
    Level MATI (tidak dipakai lagi) setelah 1x FILLED (menang ataupun kalah).
 
 Deploy ke Railway:
-  Start command -> python backtest_qm.py
+  Start command -> python backtest_qmr.py
   Buka domain Railway -> lihat progress & hasil di browser (auto-refresh)
 """
 
@@ -482,12 +478,12 @@ def detect_qm_events(df):
 
 
 def detect_all_events(df):
-    """KHUSUS QMS + QMR SAJA (SBR/RBS sengaja tidak diikutkan di file ini).
+    """KHUSUS QMR SAJA (SBR/RBS/QMS sengaja tidak diikutkan di file ini).
     Dedup: 2 event dgn (kind, level, confirm_ts) SAMA PERSIS dianggap 1 sinyal
     yg sama (bisa terjadi kalau 2 basis candle c1/c2 berbeda kebetulan
     menghasilkan level & window break/confirm yg identik) -- ambil salah satu
     saja supaya tidak dihitung 2x atau collision key posisi trading."""
-    events = detect_qm_events(df)   # HANYA QMS/QMR -- detect_sbr_rbs_events tidak dipanggil
+    events = [e for e in detect_qm_events(df) if e['kind'] == 'QMR']   # HANYA QMR
     seen = set()
     deduped = []
     for e in events:
@@ -837,7 +833,7 @@ def per_kind_breakdown(trades):
 def _run():
     global _phase, _results, _kind_results, _all_trades, _combined_result
     try:
-        _log_msg(f"🚀 Mulai backtest QMS/QMR — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
+        _log_msg(f"🚀 Mulai backtest QMR — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
         _log_msg(f"   SL=wick terpanjang c1/c2 (variatif per level, =1R)  Trailing: aktif di "
                   f"{TRAIL_ACTIVATE_R:.1f}R, jarak {TRAIL_STOP_R:.1f}R dari extreme  "
                   f"APPROACH_PCT={APPROACH_PCT*100:.1f}%")
@@ -937,7 +933,7 @@ def _render_html() -> bytes:
 <head>
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="10">
-<title>Backtest QMS/QMR</title>
+<title>Backtest QMR</title>
 <style>
   body {{ font-family: -apple-system, Arial, sans-serif; background:#0f1117; color:#e6e6e6; margin:0; padding:20px; }}
   h1 {{ font-size:20px; }}
@@ -962,7 +958,7 @@ def _render_html() -> bytes:
 </style>
 </head>
 <body>
-  <h1>📊 Backtest QMS / QMR (Quasimodo Support/Resistance)</h1>
+  <h1>📊 Backtest QMR (Quasimodo Resistance)</h1>
   {status_html}
 
   <div class="cards">
@@ -975,22 +971,19 @@ def _render_html() -> bytes:
   </div>
 
   <div class="note">
-    💡 <b>Khusus QMS + QMR saja</b> (SBR/RBS tidak diikutkan di versi ini), basis body
+    💡 <b>Khusus QMR saja</b> (SBR/RBS/QMS tidak diikutkan di versi ini), basis body
     candle H1 (level dasar disyaratkan candle kiri MAUPUN kanan tidak menembus body-nya):
-    <br>• <b>QMS</b> (Quasimodo Support): support di-TEST (wick bawah sentuh, close aman) →
-    BREAK-1 ke bawah → BREAK-2 candle berikutnya balik ke ATAS di level yang sama →
-    KONFIRMASI (low tidak menyentuh level DAN body candle bullish, searah break-2). Entry
-    <b>Long</b> di level support awal.
-    <br>• <b>QMR</b> (Quasimodo Resistance): kebalikan QMS — resistance di-TEST (wick atas
-    sentuh, close aman) → BREAK-1 ke atas → BREAK-2 balik ke BAWAH → KONFIRMASI (high tidak
-    menyentuh level DAN body candle bearish, searah break-2). Entry <b>Short</b>.
+    <br>• <b>QMR</b> (Quasimodo Resistance): resistance di-TEST (wick atas sentuh, close
+    aman) → BREAK-1 ke atas → BREAK-2 candle berikutnya balik ke BAWAH di level yang sama →
+    KONFIRMASI (high tidak menyentuh level DAN body candle bearish, searah break-2). Entry
+    <b>Short</b> di level resistance awal.
     <br>Level aktif dipantau via candle M5: masuk radius <b>{APPROACH_PCT*100:.1f}%</b> dari
     level → limit dipasang persis di level; kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}%
-    sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). <b>SL</b> = ujung wick
-    terpanjang dari 2 candle pembentuk level (bukan fix %) — jarak ini = 1R. <b>Trailing
+    sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). <b>SL</b> = ujung atas
+    wick terpanjang dari 2 candle pembentuk level (bukan fix %) — jarak ini = 1R. <b>Trailing
     stop</b>: aktif begitu profit capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti
-    <b>{TRAIL_STOP_R:.1f}R</b> di belakang harga tertinggi/terendah yang pernah dicapai
-    (dipantau M5). Level MATI setelah 1x terisi (menang/kalah).
+    <b>{TRAIL_STOP_R:.1f}R</b> di belakang harga terendah yang pernah dicapai (dipantau M5).
+    Level MATI setelah 1x terisi (menang/kalah).
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dari balance (compounding). Slot maksimum: {_fmt_max_concurrent()}.
     Sinyal terblokir — slot: {cr.get('blocked_by_slot',0)}, margin: {cr.get('blocked_by_margin',0)},
     min order: {cr.get('blocked_by_min_order',0)}, SL invalid: {cr.get('blocked_by_invalid_sl',0)}.
