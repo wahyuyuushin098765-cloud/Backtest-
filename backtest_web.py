@@ -112,14 +112,22 @@ BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', _default_end_date())
 CACHE_DIR = os.environ.get('CACHE_DIR', './data_cache')
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Semua koin yang dipakai bot.
+# Hasil backtest strategi Resistance murni (1 tahun) -- hanya koin dengan
+# ROI% > 0 yang dipakai. Sisanya (32 koin) tidak diikutkan lagi.
 SYMBOLS = [
-    'XPLUSDT', 'MNTUSDT', 'PLUMEUSDT', 'HYPEUSDT', 'BNBUSDT', 'BELUSDT', 'BERAUSDT', 'DASHUSDT',
-    'DOGEUSDT', 'USUALUSDT', 'TAOUSDT', 'ESPORTSUSDT', 'LABUSDT', 'HUSDT', 'AVAXUSDT', 'REUSDT',
-    '1000BONKUSDT', 'ORCAUSDT', 'AAVEUSDT', 'GMXUSDT', 'LTCUSDT', 'ICPUSDT', 'VIRTUALUSDT', 'CFXUSDT',
-    'UNIUSDT', 'ONDOUSDT', 'SUIUSDT', 'ALGOUSDT', 'HBARUSDT', 'EIGENUSDT', 'XRPUSDT', 'SOLUSDT',
-    'CRVUSDT', 'RENDERUSDT', 'XVGUSDT', 'SANDUSDT', 'AXSUSDT', 'IMXUSDT', 'FARTCOINUSDT', 'OPUSDT',
-    '1000PEPEUSDT', 'TIAUSDT', 'GALAUSDT', 'APEUSDT', 'FLOWUSDT',
+    'CFXUSDT',    # +31.7%
+    'LTCUSDT',    # +22.0%
+    'GALAUSDT',   # +21.7%
+    'AVAXUSDT',   # +10.8%
+    'SOLUSDT',    # +10.4%
+    'SANDUSDT',   # +9.1%
+    'DOGEUSDT',   # +9.1%
+    'UNIUSDT',    # +7.6%
+    'MNTUSDT',    # +6.7%
+    'ORCAUSDT',   # +6.3%
+    'DASHUSDT',   # +5.3%
+    'XVGUSDT',    # +3.6%
+    'AAVEUSDT',   # +2.3%
 ]
 
 
