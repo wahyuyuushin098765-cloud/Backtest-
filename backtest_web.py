@@ -51,6 +51,14 @@ RINGKASAN STRATEGI
 Deploy ke Railway:
   Start command -> python backtest_snr.py
   Buka domain Railway -> lihat progress & hasil di browser (auto-refresh)
+
+Periode default: 2 bulan ke belakang dari hari script dijalankan (bisa
+di-override lewat env BACKTEST_START_DATE / BACKTEST_END_DATE).
+
+trades.csv sekarang menyertakan waktu (WIB, UTC+7) level terbentuk,
+waktu entry, dan waktu exit -- kolom 'level_formed_wib', 'entry_wib',
+'exit_wib' -- selain versi epoch ms mentahnya. Kolom 'reason' berisi
+'SL' atau 'TRAIL' (hasil exit karena stop-loss awal atau trailing stop).
 """
 
 import os, threading, time, io, csv
@@ -89,8 +97,16 @@ MIN_ORDER_USD       = float(os.environ.get('MIN_ORDER_USD', '5.0'))
 ORDER_BUMP_FLOOR     = float(os.environ.get('ORDER_BUMP_FLOOR', '4.0'))
 QTY_STEP_APPROX      = float(os.environ.get('QTY_STEP_APPROX', '0.000001'))
 
-BACKTEST_START_DATE = os.environ.get('BACKTEST_START_DATE', '2025-08-01')
-BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', '2026-07-31')
+def _default_end_date():
+    return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+def _default_start_date():
+    d = datetime.now(timezone.utc)
+    # mundur ~2 bulan kalender (60 hari) dari hari ini
+    return (d - timedelta(days=60)).strftime('%Y-%m-%d')
+
+BACKTEST_START_DATE = os.environ.get('BACKTEST_START_DATE', _default_start_date())
+BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', _default_end_date())
 
 CACHE_DIR = os.environ.get('CACHE_DIR', './data_cache')
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -151,6 +167,13 @@ _combined_result = {
 
 def _ts():
     return (datetime.now(timezone.utc) + timedelta(hours=7)).strftime('%H:%M:%S')
+
+def _fmt_wib(ts_ms):
+    """epoch ms (UTC) -> 'YYYY-MM-DD HH:MM WIB' (UTC+7)."""
+    if ts_ms is None:
+        return ''
+    dt = datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc) + timedelta(hours=7)
+    return dt.strftime('%Y-%m-%d %H:%M WIB')
 
 def _log_msg(msg: str):
     line = f"[{_ts()}] {msg}"
@@ -446,7 +469,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
         active_positions[key] = {
             'symbol': symbol, 'direction': direction, 'entry': entry_price, 'sl': sl,
             'dist': dist, 'qty': qty, 'entry_ts': entry_ts, 'level': ev['level'],
-            'kind': ev['kind'], 'margin': margin_needed,
+            'kind': ev['kind'], 'margin': margin_needed, 'confirm_ts': ev['confirm_ts'],
             'trail_active': False, 'extreme': entry_price,   # high/low-water mark, mulai dari entry
         }
         total_margin_used += margin_needed
@@ -468,7 +491,10 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
             'symbol': pos['symbol'], 'direction': direction, 'entry': entry, 'sl': pos['sl'],
             'exit': exit_price, 'reason': reason, 'r_mult': r_mult, 'pnl_usd': pnl_net,
             'entry_ts': pos['entry_ts'], 'exit_ts': exit_ts, 'balance_after': balance,
-            'level': pos['level'], 'kind': pos['kind'],
+            'level': pos['level'], 'kind': pos['kind'], 'level_formed_ts': pos['confirm_ts'],
+            'level_formed_wib': _fmt_wib(pos['confirm_ts']),
+            'entry_wib': _fmt_wib(pos['entry_ts']),
+            'exit_wib': _fmt_wib(exit_ts),
         })
 
     def process_symbol_tick(symbol, j):
@@ -929,8 +955,11 @@ def _trades_csv() -> bytes:
         trades_cp = list(_all_trades)
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=[
-        'symbol', 'kind', 'direction', 'entry', 'sl', 'exit', 'reason', 'r_mult',
-        'pnl_usd', 'entry_ts', 'exit_ts', 'balance_after', 'level'],
+        'symbol', 'kind', 'direction', 'level',
+        'level_formed_wib', 'entry_wib', 'exit_wib',
+        'entry', 'sl', 'exit', 'reason', 'r_mult',
+        'pnl_usd', 'balance_after',
+        'level_formed_ts', 'entry_ts', 'exit_ts'],
         extrasaction='ignore')
     writer.writeheader()
     for t in trades_cp:
