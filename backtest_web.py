@@ -271,12 +271,16 @@ def find_levels(df):
                   tidak boleh melebihi level. Semua 5 candle kiri harus
                   bersih. Kalau candle kiri tidak cukup (c1 terlalu dekat ke
                   awal data), level GUGUR.
-    'entry_price' = UJUNG WICK TERPANJANG di antara wick c1 dan wick c2
-                  (bukan lagi body/close). Untuk support dibandingkan wick
-                  BAWAH (lower shadow) c1 vs c2, dipilih yang lebih panjang,
-                  entry di LOW candle tsb. Untuk resistance dibandingkan wick
-                  ATAS (upper shadow) c1 vs c2, dipilih yang lebih panjang,
-                  entry di HIGH candle tsb.
+    Syarat wick c1 vs c2:
+      - c1 WAJIB punya wick sungguhan -- ujung wick c1 tidak boleh sama
+        persis dengan ujung body c1 (mis. ujung body 0.1, ujung wick harus
+        beda, misal 0.09 -- bukan sama-sama 0.1). Kalau sama (tidak ada
+        wick), level GUGUR.
+      - Wick c2 (di sisi yang sama: bawah untuk support, atas untuk
+        resistance) HARUS LEBIH PANJANG dari wick c1. Kalau wick c2 <= wick
+        c1, level GUGUR.
+    'entry_price' = UJUNG WICK C1 (bukan c2, bukan body/close lagi).
+                  Support -> low[c1]. Resistance -> high[c1].
     'level' tetap = body candle c1 (close[c1]) -- dipakai untuk syarat
                   validitas kiri/kanan (wick tidak boleh menyentuh level ini).
     Return list dict: {'type', 'level', 'entry_price', 'c1', 'c2', ..., 'c7'}."""
@@ -285,25 +289,28 @@ def find_levels(df):
     levels = []
     N_RIGHT = 5   # jumlah candle kanan yang harus bersih (tidak menyentuh wick)
     N_LEFT = 5    # jumlah candle kiri yang harus bersih (tidak menyentuh wick)
+    WICK_EPS = 1e-9   # beda minimum supaya wick dianggap "ada" (tidak sama dgn body)
     for i in range(N_LEFT, n - (1 + N_RIGHT)):   # perlu 5 candle kiri + c1,c2 + 5 candle kanan
         if c[i] < o[i] and c[i + 1] > o[i + 1]:          # bearish lalu bullish -> support
             S = c[i]
             right_ok = all(l[i + 2 + k] > S + 1e-9 for k in range(N_RIGHT))   # c3..c7 wick bersih
             left_ok = all(l[i - 1 - k] > S + 1e-9 for k in range(N_LEFT))     # 5 candle kiri bersih
-            if right_ok and left_ok:
-                lower_wick_c1 = c[i] - l[i]         # wick bawah c1 (bearish): close - low
-                lower_wick_c2 = o[i + 1] - l[i + 1]  # wick bawah c2 (bullish): open - low
-                entry_price = l[i] if lower_wick_c1 >= lower_wick_c2 else l[i + 1]
+            lower_wick_c1 = c[i] - l[i]          # wick bawah c1 (bearish): close - low
+            lower_wick_c2 = o[i + 1] - l[i + 1]  # wick bawah c2 (bullish): open - low
+            wick_ok = (lower_wick_c1 > WICK_EPS) and (lower_wick_c2 > lower_wick_c1 + WICK_EPS)
+            if right_ok and left_ok and wick_ok:
+                entry_price = l[i]   # ujung wick c1
                 levels.append({'type': 'support', 'level': S, 'entry_price': entry_price,
                                 'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
         if c[i] > o[i] and c[i + 1] < o[i + 1]:          # bullish lalu bearish -> resistance
             R = c[i]
             right_ok = all(h[i + 2 + k] < R - 1e-9 for k in range(N_RIGHT))
             left_ok = all(h[i - 1 - k] < R - 1e-9 for k in range(N_LEFT))
-            if right_ok and left_ok:
-                upper_wick_c1 = h[i] - c[i]          # wick atas c1 (bullish): high - close
-                upper_wick_c2 = h[i + 1] - o[i + 1]  # wick atas c2 (bearish): high - open
-                entry_price = h[i] if upper_wick_c1 >= upper_wick_c2 else h[i + 1]
+            upper_wick_c1 = h[i] - c[i]          # wick atas c1 (bullish): high - close
+            upper_wick_c2 = h[i + 1] - o[i + 1]  # wick atas c2 (bearish): high - open
+            wick_ok = (upper_wick_c1 > WICK_EPS) and (upper_wick_c2 > upper_wick_c1 + WICK_EPS)
+            if right_ok and left_ok and wick_ok:
+                entry_price = h[i]   # ujung wick c1
                 levels.append({'type': 'resistance', 'level': R, 'entry_price': entry_price,
                                 'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
     return levels
