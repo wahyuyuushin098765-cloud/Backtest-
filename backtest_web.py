@@ -1,52 +1,56 @@
 """
-backtest_qmr.py — Backtest strategi QMR SAJA (Quasimodo Resistance), H1
+backtest_snr.py — Backtest strategi Support & Resistance MURNI (tanpa break), H1
 ================================================================================
-KHUSUS QMR SAJA — SBR, RBS, dan QMS sengaja TIDAK diikutkan di file ini
-(dipisah dari backtest_qm.py yang mencakup QMS+QMR, dan backtest_sbr.py yang
-mencakup keempatnya).
+Support/Resistance biasa, TANPA syarat break sama sekali. Level dianggap aktif
+begitu tersentuh wick sekali (test), lalu 1 candle berikutnya tidak menyentuh
+level lagi -- langsung bisa dipasang limit order. Level yang sama BISA dipakai
+berulang kali (re-entry) selama belum pernah di-body-break.
 
 RINGKASAN STRATEGI
 -------------------
-1) DETEKSI LEVEL RESISTANCE (H1):
-   Candle c1 bullish (close>open) lalu c2 bearish (close<open). Level =
-   close[c1]. Valid kalau:
-   - high candle c3 (setelah c1,c2) TIDAK lebih tinggi dari level
-   - high candle SEBELUM c1 JUGA TIDAK lebih tinggi dari level
-   (kiri MAUPUN kanan tidak boleh menembus body level).
+1) DETEKSI LEVEL (H1):
+   Support: candle c1 bearish (close<open) lalu c2 bullish (close>open).
+            Level = close[c1]. Valid kalau:
+            - low 2 candle SETELAH c1,c2 (c3 DAN c4) TIDAK lebih rendah dari level
+            - low candle SEBELUM c1 JUGA TIDAK lebih rendah dari level
+            (kiri 1 candle, kanan 2 candle -- semua tidak boleh menembus body).
+   Resistance: kebalikannya (c1 bullish, c2 bearish). Level = close[c1].
+            Valid kalau high c3 DAN c4 DAN high candle sebelum c1 < level.
 
-2) JADI LEVEL "QMR" (Quasimodo Resistance) — SETELAH level resistance terbentuk:
-   a. TEST: minimal 1 candle wick atas menyentuh level, close masih aman (di
-      bawah level). Boleh lebih dari 1x.
-   b. BREAK-1: candle close menembus level ke ATAS.
-   c. BREAK-2: candle TEPAT SETELAH break-1, close balik menembus level ke
-      BAWAH (level yang sama ditembus 2x, arah berlawanan).
-   d. KONFIRMASI: candle TEPAT SETELAH break-2 — high-nya TIDAK menyentuh
-      level lagi, DAN body candle ini harus bearish (close<open, searah
-      break-2).
-   Begitu semua terpenuhi -> level jadi QMR AKTIF, entry arah SHORT di level
-   resistance awal, disimpan dgn status 'menunggu harga mendekat'.
+2) JADI LEVEL AKTIF, DENGAN RE-ENTRY BERULANG -- SETELAH level terbentuk
+   (mulai dari c3, scan maju):
+   a. TEST: 1 candle wick menyentuh level, TAPI close masih di sisi aman
+      (support: low<=level, close>level -- resistance: high>=level, close<level).
+   b. KONFIRMASI: candle TEPAT SETELAH test -- wick-nya TIDAK menyentuh level
+      lagi (support: low>level -- resistance: high<level).
+   Begitu (a) dan (b) terpenuhi -> ENTRY dicatat (bisa entry ke-1, ke-2, ke-3,
+   dst -- tidak dibatasi jumlah), lalu scan LANJUT dari situ mencari pola
+   test+konfirmasi BARU di level yang sama.
+   c. LEVEL MATI PERMANEN: begitu ada candle H1 MANAPUN yang close-nya
+      menembus body level (body break) -- baik saat mencari test atau di
+      candle konfirmasi itu sendiri -- level berhenti dicari lagi SETERUSNYA
+      (entry-entry sebelumnya yg sudah tercatat tetap sah).
+   Entry: Support -> Long, Resistance -> Short.
 
-3) TRIGGER ENTRY (dipantau di candle M5, presisi) — SETELAH level QMR aktif:
-   Selama level belum dipakai, tiap candle M5 dicek jaraknya ke level:
-     - Kalau harga masuk radius 2% dari level -> limit order Short dipasang
-       PERSIS di level itu.
+3) TRIGGER ENTRY (dipantau di candle M5, presisi) -- SETELAH level aktif:
+   Selama entry itu belum terpakai, tiap candle M5 dicek jaraknya ke level:
+     - Kalau harga masuk radius 2% dari level -> limit order dipasang PERSIS
+       di level itu (arah sesuai Support=Long / Resistance=Short).
      - Selama limit terpasang, kalau wick M5 menyentuh level -> FILL persis
        di level (harga limit).
      - Kalau sebelum fill harga malah menjauh lagi >2% dari level -> limit
-       DIBATALKAN (order dicabut), tapi level TETAP tersimpan aktif -- bisa
+       DIBATALKAN (order dicabut), tapi entry ini TETAP tersimpan aktif -- bisa
        terpasang ulang nanti kalau harga mendekat lagi dalam radius 2%.
-   SL = ujung atas wick TERPANJANG dari 2 candle pembentuk level (c1, c2) --
-   BUKAN fix persen. SL = high tertinggi antara high[c1] & high[c2]. Jarak
-   entry-ke-SL ini = 1R (variatif per level, bukan fix), dipakai jg utk
-   hitung trailing.
+   SL = SL_PCT (default 1% = 1R) dari harga entry, arah berlawanan dari entry.
    TRAILING STOP: begitu profit capai TRAIL_ACTIVATE_R (default 3R), trailing
    aktif -- SL lalu mengikuti TRAIL_STOP_R (default 1R) di belakang harga
-   terendah yang pernah dicapai (dipantau M5), SL cuma boleh bergerak
-   menguntungkan (turun), tak pernah mundur.
-   Level MATI (tidak dipakai lagi) setelah 1x FILLED (menang ataupun kalah).
+   tertinggi/terendah yang pernah dicapai (dipantau M5), SL cuma boleh
+   bergerak menguntungkan, tak pernah mundur.
+   Entry MATI (tidak dipakai lagi) setelah 1x FILLED (menang ataupun kalah) --
+   tapi level yang sama bisa entry lagi kalau ada re-entry event berikutnya.
 
 Deploy ke Railway:
-  Start command -> python backtest_qmr.py
+  Start command -> python backtest_snr.py
   Buka domain Railway -> lihat progress & hasil di browser (auto-refresh)
 """
 
@@ -68,8 +72,7 @@ RISK_PCT         = float(os.environ.get('RISK_PCT', '0.01'))          # risk 1% 
 FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))
 FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))
 
-SL_PCT           = float(os.environ.get('SL_PCT', '0.01'))            # TIDAK DIPAKAI di file ini -- SL sekarang dari wick c1/c2, dibiarkan utk kompatibilitas var lain
-MIN_SL_PCT       = float(os.environ.get('MIN_SL_PCT', '0.002'))       # jarak SL minimum dari entry (0.2%) -- kalau SL wick lebih sempit, diperlebar ke sini
+SL_PCT           = float(os.environ.get('SL_PCT', '0.01'))            # SL fix 1% dari entry (=1R)
 TRAIL_ACTIVATE_R = float(os.environ.get('TRAIL_ACTIVATE_R', '3.0'))    # trailing aktif begitu profit capai 3R
 TRAIL_STOP_R     = float(os.environ.get('TRAIL_STOP_R', '1.0'))       # setelah aktif, SL mengikuti 1R di belakang harga tertinggi/terendah
 APPROACH_PCT     = float(os.environ.get('APPROACH_PCT', '0.02'))      # radius 2% utk pasang/cabut limit
@@ -237,23 +240,25 @@ def fetch_bybit_m5(symbol: str) -> pd.DataFrame:
 
 def find_levels(df):
     """Deteksi level S/R dasar dari candle H1 (basis body candle, sama pola lama).
-    Syarat kanan: candle c3 (setelah c1,c2) tidak boleh menembus body level.
+    Syarat kanan: 2 candle SETELAH c1,c2 (yaitu c3 DAN c4) tidak boleh menembus
+                  body level -- keduanya harus aman.
     Syarat kiri : candle SEBELUM c1 (index c1-1) juga tidak boleh menembus body
                   level -- kalau c1 adalah candle paling awal (tidak ada candle
                   sebelumnya), level GUGUR.
-    Return list dict: {'type': 'support'/'resistance', 'level': harga, 'c1', 'c2', 'c3'}."""
+    Return list dict: {'type': 'support'/'resistance', 'level': harga, 'c1', 'c2', 'c3', 'c4'}."""
     o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     n = len(df)
     levels = []
-    for i in range(1, n - 2):   # mulai dari 1, supaya selalu ada candle sebelum c1
+    for i in range(1, n - 3):   # mulai dari 1 (ada candle sebelum c1); butuh c3 DAN c4 di kanan
         if c[i] < o[i] and c[i + 1] > o[i + 1]:          # bearish lalu bullish
             S = c[i]
-            if l[i + 2] > S + 1e-9 and l[i - 1] > S + 1e-9:   # kanan (c3) DAN kiri (c1-1) tidak menembus
-                levels.append({'type': 'support', 'level': S, 'c1': i, 'c2': i + 1, 'c3': i + 2})
+            # kanan: c3 (i+2) DAN c4 (i+3) tidak menembus. kiri: c1-1 tidak menembus.
+            if l[i + 2] > S + 1e-9 and l[i + 3] > S + 1e-9 and l[i - 1] > S + 1e-9:
+                levels.append({'type': 'support', 'level': S, 'c1': i, 'c2': i + 1, 'c3': i + 2, 'c4': i + 3})
         if c[i] > o[i] and c[i + 1] < o[i + 1]:          # bullish lalu bearish
             R = c[i]
-            if h[i + 2] < R - 1e-9 and h[i - 1] < R - 1e-9:   # kanan (c3) DAN kiri (c1-1) tidak menembus
-                levels.append({'type': 'resistance', 'level': R, 'c1': i, 'c2': i + 1, 'c3': i + 2})
+            if h[i + 2] < R - 1e-9 and h[i + 3] < R - 1e-9 and h[i - 1] < R - 1e-9:
+                levels.append({'type': 'resistance', 'level': R, 'c1': i, 'c2': i + 1, 'c3': i + 2, 'c4': i + 3})
     return levels
 
 
@@ -274,13 +279,31 @@ def find_levels(df):
 # candle tidak bisa jadi TEST dan BREAK sekaligus, jadi otomatis break selalu
 # candle yang berbeda dan setelah test pertama).
 
-def detect_sbr_rbs_events(df):
-    """Return list dict SBR/RBS aktif:
-    {'kind': 'SBR'/'RBS', 'type': support/resistance, 'level': harga,
-     'direction': Short/Long, 'break_i', 'confirm_i', 'confirm_ts', 'c1', 'c2'}
+def detect_snr_events(df):
+    """Deteksi level Support & Resistance MURNI (tanpa break), dengan RE-ENTRY
+    berulang selama level belum pernah di-BODY-BREAK.
+    Return list dict (BISA lebih dari 1 per level, jika re-entry terjadi):
+    {'kind': 'SNR_SUPPORT'/'SNR_RESISTANCE', 'type': support/resistance,
+     'level': harga, 'direction': Long/Short, 'test_i', 'confirm_i',
+     'confirm_ts', 'c1', 'c2', 'entry_seq'}
+
+    Urutan:
+    1) Level terbentuk (find_levels): 2 candle berlawanan arah, kiri (1 candle)
+       & kanan (2 candle: c3 DAN c4) tidak menembus body level.
+    2) TEST: candle wick menyentuh level, TAPI close masih di sisi aman.
+    3) KONFIRMASI: candle TEPAT SETELAH test -- wick-nya TIDAK menyentuh level
+       lagi. Begitu ini terpenuhi, event ke-1 dicatat (level aktif).
+    4) RE-ENTRY: setelah konfirmasi ke-1, scan LANJUT (mulai dari confirm_i+1)
+       mencari pola test+konfirmasi BARU di level yang sama -- kalau ketemu,
+       event ke-2 dicatat, dst, TANPA BATAS JUMLAH -- selama scan berjalan.
+    5) LEVEL MATI PERMANEN: begitu ada candle H1 MANAPUN (baik saat mencari
+       test, saat 'netral', atau di antara entry) yang CLOSE-nya menembus body
+       level (body break) -- scan berhenti total, semua event sebelum titik
+       itu tetap sah, tapi tidak ada event baru sesudahnya.
+    Entry: Support -> Long, Resistance -> Short.
     """
     ts = df['ts'].values
-    o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
+    h = df['high'].values; l = df['low'].values; c = df['close'].values
     n = len(df)
     levels = find_levels(df)
     events = []
@@ -288,203 +311,71 @@ def detect_sbr_rbs_events(df):
     for lv in levels:
         level = lv['level']
         ty = lv['type']
-        start = lv['c3']  # mulai scan dari candle c3 (candle pertama setelah level terbentuk)
+        i = lv['c3']  # mulai scan dari candle c3 (candle pertama setelah level terbentuk)
+        entry_seq = 0
 
-        tested = False
-        break_i = None
-        invalid = False
-        # cari TEST dulu, lalu BREAK setelah test. Kalau BREAK terjadi SEBELUM
-        # ada test valid, level ini GUGUR TOTAL (tidak dicoba lagi).
-        i = start
         while i < n:
-            if ty == 'support':
-                if not tested:
-                    if l[i] <= level + 1e-9 and c[i] > level + 1e-9:
-                        tested = True
-                        i += 1
-                        continue
+            # cari TEST berikutnya, sambil terus cek body-break di sepanjang jalan
+            test_i = None
+            broken = False
+            while i < n:
+                if ty == 'support':
                     if c[i] < level - 1e-9:
-                        invalid = True   # break duluan sebelum ada test -> gugur
+                        broken = True   # body break -> level mati permanen dari titik ini
                         break
-                    i += 1
-                    continue
-                # sudah tested -> cari BREAK (close menembus ke bawah)
-                if c[i] < level - 1e-9:
-                    break_i = i
-                    break
-                i += 1
-            else:  # resistance
-                if not tested:
-                    if h[i] >= level - 1e-9 and c[i] < level - 1e-9:
-                        tested = True
-                        i += 1
-                        continue
-                    if c[i] > level + 1e-9:
-                        invalid = True
-                        break
-                    i += 1
-                    continue
-                if c[i] > level + 1e-9:
-                    break_i = i
-                    break
-                i += 1
-
-        if invalid or break_i is None or break_i + 1 >= n:
-            continue  # gugur (break sebelum test), tidak ada break, atau break di candle terakhir
-
-        confirm_i = break_i + 1
-        if ty == 'support':
-            # break ke bawah -> retest gagal berarti wick ATAS tidak balik naik ke level
-            wick_ok = h[confirm_i] < level - 1e-9
-            # DAN body candle konfirmasi harus searah break (bearish: close < open)
-            body_ok = c[confirm_i] < o[confirm_i] - 1e-9
-        else:
-            # break ke atas -> retest gagal berarti wick BAWAH tidak balik turun ke level
-            wick_ok = l[confirm_i] > level + 1e-9
-            # DAN body candle konfirmasi harus searah break (bullish: close > open)
-            body_ok = c[confirm_i] > o[confirm_i] + 1e-9
-
-        confirmed = wick_ok and body_ok
-
-        if not confirmed:
-            continue
-
-        kind = 'SBR' if ty == 'support' else 'RBS'
-        direction = 'Short' if ty == 'support' else 'Long'
-        events.append({
-            'kind': kind, 'type': ty, 'level': level, 'direction': direction,
-            'break_i': break_i, 'confirm_i': confirm_i,
-            'confirm_ts': int(ts[confirm_i]),
-            'c1': lv['c1'], 'c2': lv['c2'],
-        })
-
-    events.sort(key=lambda e: e['confirm_ts'])
-    return events
-
-
-# ============================================================
-# DETEKSI QMS & QMR (Quasimodo Support / Resistance)
-# ============================================================
-# QMS = level SUPPORT di-break ke bawah (BREAK-1), lalu candle BERIKUTNYA
-#       balik break ke ATAS di level yang SAMA (BREAK-2), lalu candle
-#       setelahnya (KONFIRMASI) low-nya TIDAK menyentuh level lagi.
-#       Entry: LONG di level (support awal yang jadi acuan).
-# QMR = kebalikannya: level RESISTANCE di-break ke atas (BREAK-1), lalu
-#       candle berikutnya balik break ke BAWAH (BREAK-2), konfirmasi
-#       high-nya TIDAK menyentuh level lagi. Entry: SHORT.
-#
-# TEST tetap wajib sebelum BREAK-1 (sama seperti SBR/RBS): minimal 1 candle
-# wick menyentuh level dengan close masih aman, sebelum break pertama terjadi.
-
-def detect_qm_events(df):
-    """Return list dict QMS/QMR aktif:
-    {'kind': 'QMS'/'QMR', 'type': support/resistance, 'level': harga,
-     'direction': Long/Short, 'break1_i', 'break2_i', 'confirm_i', 'confirm_ts',
-     'c1', 'c2'}
-    """
-    ts = df['ts'].values
-    o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
-    n = len(df)
-    levels = find_levels(df)
-    events = []
-
-    for lv in levels:
-        level = lv['level']
-        ty = lv['type']
-        start = lv['c3']
-
-        tested = False
-        break1_i = None
-        invalid = False
-        i = start
-        while i < n:
-            if ty == 'support':
-                if not tested:
                     if l[i] <= level + 1e-9 and c[i] > level + 1e-9:
-                        tested = True
-                        i += 1
-                        continue
-                    if c[i] < level - 1e-9:
-                        invalid = True   # break duluan sebelum ada test -> gugur
+                        test_i = i
                         break
-                    i += 1
-                    continue
-                if c[i] < level - 1e-9:   # BREAK-1 ke bawah
-                    break1_i = i
-                    break
-                i += 1
-            else:  # resistance
-                if not tested:
-                    if h[i] >= level - 1e-9 and c[i] < level - 1e-9:
-                        tested = True
-                        i += 1
-                        continue
+                else:
                     if c[i] > level + 1e-9:
-                        invalid = True
+                        broken = True
                         break
-                    i += 1
-                    continue
-                if c[i] > level + 1e-9:   # BREAK-1 ke atas
-                    break1_i = i
-                    break
+                    if h[i] >= level - 1e-9 and c[i] < level - 1e-9:
+                        test_i = i
+                        break
                 i += 1
 
-        if invalid or break1_i is None or break1_i + 1 >= n:
-            continue
+            if broken or test_i is None:
+                break   # level mati permanen (broken), atau tidak ada test lagi sampai akhir data
 
-        break2_i = break1_i + 1
-        if ty == 'support':
-            # BREAK-2: candle tepat setelah break1 balik close di ATAS level
-            break2_ok = c[break2_i] > level + 1e-9
-        else:
-            # BREAK-2: candle tepat setelah break1 balik close di BAWAH level
-            break2_ok = c[break2_i] < level - 1e-9
+            confirm_i = test_i + 1
+            if confirm_i >= n:
+                break   # test di candle terakhir, tidak ada candle konfirmasi
 
-        if not break2_ok or break2_i + 1 >= n:
-            continue
+            # body break JUGA dicek di candle konfirmasi (bukan cuma wick)
+            if ty == 'support':
+                confirm_broken = c[confirm_i] < level - 1e-9
+                confirmed = l[confirm_i] > level + 1e-9
+            else:
+                confirm_broken = c[confirm_i] > level + 1e-9
+                confirmed = h[confirm_i] < level - 1e-9
 
-        confirm_i = break2_i + 1
-        if ty == 'support':
-            # QMS -> entry Long: wick TIDAK menyentuh level, DAN body searah (bullish)
-            wick_ok = l[confirm_i] > level + 1e-9
-            body_ok = c[confirm_i] > o[confirm_i] + 1e-9
-        else:
-            # QMR -> entry Short: wick TIDAK menyentuh level, DAN body searah (bearish)
-            wick_ok = h[confirm_i] < level - 1e-9
-            body_ok = c[confirm_i] < o[confirm_i] - 1e-9
+            if confirm_broken:
+                break   # candle konfirmasi ternyata body-break -> level mati permanen, tidak dicatat
 
-        confirmed = wick_ok and body_ok
-
-        if not confirmed:
-            continue
-
-        kind = 'QMS' if ty == 'support' else 'QMR'
-        direction = 'Long' if ty == 'support' else 'Short'
-        c1, c2 = lv['c1'], lv['c2']
-        if ty == 'support':
-            # QMS (Long): SL di ujung bawah wick TERPANJANG antara c1 & c2 (low terendah)
-            sl_wick = min(l[c1], l[c2])
-        else:
-            # QMR (Short): SL di ujung atas wick TERPANJANG antara c1 & c2 (high tertinggi)
-            sl_wick = max(h[c1], h[c2])
-        events.append({
-            'kind': kind, 'type': ty, 'level': level, 'direction': direction,
-            'break1_i': break1_i, 'break2_i': break2_i, 'confirm_i': confirm_i,
-            'confirm_ts': int(ts[confirm_i]),
-            'c1': c1, 'c2': c2, 'sl_wick': sl_wick,
-        })
+            if confirmed:
+                entry_seq += 1
+                kind = 'SNR_SUPPORT' if ty == 'support' else 'SNR_RESISTANCE'
+                direction = 'Long' if ty == 'support' else 'Short'
+                events.append({
+                    'kind': kind, 'type': ty, 'level': level, 'direction': direction,
+                    'test_i': test_i, 'confirm_i': confirm_i,
+                    'confirm_ts': int(ts[confirm_i]),
+                    'c1': lv['c1'], 'c2': lv['c2'], 'entry_seq': entry_seq,
+                })
+                i = confirm_i + 1   # lanjut scan cari re-entry berikutnya
+            else:
+                i = confirm_i   # konfirmasi gagal (wick masih sentuh) -> lanjut cari test baru dari sini
 
     events.sort(key=lambda e: e['confirm_ts'])
     return events
 
 
 def detect_all_events(df):
-    """KHUSUS QMR SAJA (SBR/RBS/QMS sengaja tidak diikutkan di file ini).
-    Dedup: 2 event dgn (kind, level, confirm_ts) SAMA PERSIS dianggap 1 sinyal
-    yg sama (bisa terjadi kalau 2 basis candle c1/c2 berbeda kebetulan
-    menghasilkan level & window break/confirm yg identik) -- ambil salah satu
-    saja supaya tidak dihitung 2x atau collision key posisi trading."""
-    events = [e for e in detect_qm_events(df) if e['kind'] == 'QMR']   # HANYA QMR
+    """Support & Resistance MURNI (tanpa break) -- SNR_SUPPORT (Long) dan
+    SNR_RESISTANCE (Short). Dedup: 2 event dgn (kind, level, confirm_ts) SAMA
+    PERSIS dianggap 1 sinyal yg sama -- ambil salah satu saja."""
+    events = detect_snr_events(df)
     seen = set()
     deduped = []
     for e in events:
@@ -495,6 +386,7 @@ def detect_all_events(df):
         deduped.append(e)
     deduped.sort(key=lambda e: e['confirm_ts'])
     return deduped
+
 
 
 
@@ -548,8 +440,8 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
     active_positions = {}     # key(symbol,direction+level) -> {...}
     trades = []
 
-    def _akey(symbol, direction, level, kind):
-        return f"{symbol}|{direction}|{kind}|{level:.10f}"
+    def _akey(symbol, direction, level, kind, entry_seq):
+        return f"{symbol}|{direction}|{kind}|{level:.10f}|{entry_seq}"
 
     total_margin_used = 0.0   # dijaga incremental, bukan sum() ulang tiap panggilan (O(1) bukan O(n))
 
@@ -573,13 +465,11 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
     def open_trade(symbol, ev, entry_price, entry_ts):
         nonlocal balance, total_margin_used
         direction = ev['direction']
-        sl = ev['sl_wick']   # SL berbasis wick terpanjang dari c1/c2 (bukan fix %)
-        dist = abs(entry_price - sl)   # = 1R (variatif per level)
-        min_dist = entry_price * MIN_SL_PCT
-        if dist < min_dist:
-            # SL wick terlalu sempit -> perlebar ke jarak minimum, arah tetap sama
-            dist = min_dist
-            sl = entry_price + dist if direction == 'Short' else entry_price - dist
+        if direction == 'Short':
+            sl = entry_price * (1 + SL_PCT)
+        else:
+            sl = entry_price * (1 - SL_PCT)
+        dist = abs(entry_price - sl)   # = 1R (fix, SL_PCT)
 
         risk_amount = balance * RISK_PCT
         raw_qty = risk_amount / dist if dist > 0 else 0
@@ -595,7 +485,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
         if _slots_used() >= MAX_CONCURRENT:
             return None, 'slot'
 
-        key = _akey(symbol, direction, ev['level'], ev['kind'])
+        key = _akey(symbol, direction, ev['level'], ev['kind'], ev.get('entry_seq', 1))
         active_positions[key] = {
             'symbol': symbol, 'direction': direction, 'entry': entry_price, 'sl': sl,
             'dist': dist, 'qty': qty, 'entry_ts': entry_ts, 'level': ev['level'],
@@ -810,7 +700,7 @@ def per_symbol_breakdown(trades):
 
 
 def per_kind_breakdown(trades):
-    """Breakdown performa per JENIS level: SBR / RBS / QMS / QMR."""
+    """Breakdown performa per JENIS level: SNR_SUPPORT / SNR_RESISTANCE."""
     by_kind = {}
     for t in trades:
         k = t.get('kind', '?')
@@ -825,7 +715,7 @@ def per_kind_breakdown(trades):
         wr = d['win'] / d['n'] * 100 if d['n'] else 0
         rows.append({'kind': k, 'n': d['n'], 'win': d['win'], 'wr': wr,
                      'total_r': d['total_r'], 'total_pnl': d['total_pnl']})
-    order = {'SBR': 0, 'RBS': 1, 'QMS': 2, 'QMR': 3}
+    order = {'SNR_SUPPORT': 0, 'SNR_RESISTANCE': 1}
     rows.sort(key=lambda r: order.get(r['kind'], 99))
     return rows
 
@@ -837,7 +727,7 @@ def per_kind_breakdown(trades):
 def _run():
     global _phase, _results, _kind_results, _all_trades, _combined_result
     try:
-        _log_msg(f"🚀 Mulai backtest QMR — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
+        _log_msg(f"🚀 Mulai backtest SNR (Support/Resistance murni) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
         _log_msg(f"   SL=wick terpanjang c1/c2 (variatif per level, =1R)  Trailing: aktif di "
                   f"{TRAIL_ACTIVATE_R:.1f}R, jarak {TRAIL_STOP_R:.1f}R dari extreme  "
                   f"APPROACH_PCT={APPROACH_PCT*100:.1f}%")
@@ -937,7 +827,7 @@ def _render_html() -> bytes:
 <head>
 <meta charset="utf-8">
 <meta http-equiv="refresh" content="10">
-<title>Backtest QMR</title>
+<title>Backtest SNR</title>
 <style>
   body {{ font-family: -apple-system, Arial, sans-serif; background:#0f1117; color:#e6e6e6; margin:0; padding:20px; }}
   h1 {{ font-size:20px; }}
@@ -962,7 +852,7 @@ def _render_html() -> bytes:
 </style>
 </head>
 <body>
-  <h1>📊 Backtest QMR (Quasimodo Resistance)</h1>
+  <h1>📊 Backtest SNR (Support & Resistance Murni)</h1>
   {status_html}
 
   <div class="cards">
@@ -975,24 +865,26 @@ def _render_html() -> bytes:
   </div>
 
   <div class="note">
-    💡 <b>Khusus QMR saja</b> (SBR/RBS/QMS tidak diikutkan di versi ini), basis body
-    candle H1 (level dasar disyaratkan candle kiri MAUPUN kanan tidak menembus body-nya):
-    <br>• <b>QMR</b> (Quasimodo Resistance): resistance di-TEST (wick atas sentuh, close
-    aman) → BREAK-1 ke atas → BREAK-2 candle berikutnya balik ke BAWAH di level yang sama →
-    KONFIRMASI (high tidak menyentuh level DAN body candle bearish, searah break-2). Entry
-    <b>Short</b> di level resistance awal.
+    💡 <b>Support & Resistance MURNI (tanpa break), dengan RE-ENTRY</b>, basis body candle
+    H1 (level dasar disyaratkan candle kiri 1x dan kanan 2x tidak menembus body-nya):
+    <br>• <b>SNR Support</b>: level di-TEST (wick bawah sentuh, close aman/di atas level) →
+    candle BERIKUTNYA wick-nya TIDAK menyentuh level lagi → ENTRY (Long). Selama level
+    belum pernah di-BODY-BREAK (close menembus), pola test+konfirmasi bisa terulang lagi →
+    entry ke-2, ke-3, dst, TANPA BATAS JUMLAH.
+    <br>• <b>SNR Resistance</b>: kebalikannya — level di-TEST (wick atas sentuh, close
+    aman/di bawah level) → candle BERIKUTNYA tidak menyentuh lagi → ENTRY (Short), re-entry
+    berlaku sama.
+    <br>Begitu ada candle H1 MANAPUN yang body-nya (close) menembus level, level itu MATI
+    PERMANEN (tidak dipakai lagi seterusnya).
     <br>Level aktif dipantau via candle M5: masuk radius <b>{APPROACH_PCT*100:.1f}%</b> dari
     level → limit dipasang persis di level; kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}%
-    sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). <b>SL</b> = ujung atas
-    wick terpanjang dari 2 candle pembentuk level (bukan fix %), dengan jarak minimum
-    <b>{MIN_SL_PCT*100:.2f}%</b> dari entry (kalau wick lebih sempit, SL diperlebar ke jarak
-    minimum ini) — jarak ini = 1R. <b>Trailing stop</b>: aktif begitu profit capai
-    <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti <b>{TRAIL_STOP_R:.1f}R</b> di belakang
-    harga terendah yang pernah dicapai (dipantau M5). Level MATI setelah 1x terisi
-    (menang/kalah).
+    sebelum fill → limit dicabut (entry ini tetap hidup, bisa coba lagi). SL fix
+    <b>{SL_PCT*100:.2f}%</b> dari entry (=1R). <b>Trailing stop</b>: aktif begitu profit
+    capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti <b>{TRAIL_STOP_R:.1f}R</b> di
+    belakang harga tertinggi/terendah yang pernah dicapai (dipantau M5).
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dari balance (compounding). Slot maksimum: {_fmt_max_concurrent()}.
     Sinyal terblokir — slot: {cr.get('blocked_by_slot',0)}, margin: {cr.get('blocked_by_margin',0)},
-    min order: {cr.get('blocked_by_min_order',0)}, SL invalid: {cr.get('blocked_by_invalid_sl',0)}.
+    min order: {cr.get('blocked_by_min_order',0)}.
     <br>Unduh semua trade: <a href="/trades.csv">/trades.csv</a> &nbsp;|&nbsp;
     Log mentah: <a href="/logs">/logs</a>
   </div>
