@@ -29,14 +29,19 @@ RINGKASAN STRATEGI
    Entry: Support -> Long, Resistance -> Short.
 
 3) TRIGGER ENTRY (dipantau di candle M5, presisi) -- SETELAH level aktif:
-   Selama level belum dipakai, tiap candle M5 dicek jaraknya ke level:
-     - Kalau harga masuk radius 2% dari level -> limit order dipasang PERSIS
-       di level itu (arah sesuai Support=Long / Resistance=Short).
-     - Selama limit terpasang, kalau wick M5 menyentuh level -> FILL persis
-       di level (harga limit).
-     - Kalau sebelum fill harga malah menjauh lagi >2% dari level -> limit
-       DIBATALKAN (order dicabut), tapi level TETAP tersimpan aktif -- bisa
-       terpasang ulang nanti kalau harga mendekat lagi dalam radius 2%.
+   Limit order dipasang di ENTRY_PRICE = ujung wick TERPANJANG antara c1 & c2
+   (bukan di level body). Support: entry_price = low terendah antara
+   low[c1],low[c2]. Resistance: entry_price = high tertinggi antara
+   high[c1],high[c2]. (Level body tetap dipakai HANYA utk cek test/konfirmasi
+   di langkah 2 di atas.)
+   Selama level belum dipakai, tiap candle M5 dicek jaraknya ke entry_price:
+     - Kalau harga masuk radius 2% dari entry_price -> limit order dipasang
+       PERSIS di entry_price (arah sesuai Support=Long / Resistance=Short).
+     - Selama limit terpasang, kalau wick M5 menyentuh entry_price -> FILL
+       persis di situ (harga limit).
+     - Kalau sebelum fill harga malah menjauh lagi >2% dari entry_price ->
+       limit DIBATALKAN (order dicabut), tapi level TETAP tersimpan aktif --
+       bisa terpasang ulang nanti kalau harga mendekat lagi dalam radius 2%.
    SL = SL_PCT (default 1% = 1R) dari harga entry, arah berlawanan dari entry.
    TRAILING STOP: begitu profit capai TRAIL_ACTIVATE_R (default 3R), trailing
    aktif -- SL lalu mengikuti TRAIL_STOP_R (default 1R) di belakang harga
@@ -241,7 +246,9 @@ def find_levels(df):
     Syarat kiri : candle SEBELUM c1 (index c1-1) juga tidak boleh menembus body
                   level -- kalau c1 adalah candle paling awal (tidak ada candle
                   sebelumnya), level GUGUR.
-    Return list dict: {'type': 'support'/'resistance', 'level': harga, 'c1', 'c2', 'c3', 'c4'}."""
+    'entry_price' = ujung wick TERPANJANG antara c1 & c2 (bukan body) -- inilah
+    titik limit order dipasang. 'level' (body) tetap dipakai utk test/konfirmasi.
+    Return list dict: {'type', 'level', 'entry_price', 'c1', 'c2', 'c3', 'c4'}."""
     o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     n = len(df)
     levels = []
@@ -250,11 +257,15 @@ def find_levels(df):
             S = c[i]
             # kanan: c3 (i+2) DAN c4 (i+3) tidak menembus. kiri: c1-1 tidak menembus.
             if l[i + 2] > S + 1e-9 and l[i + 3] > S + 1e-9 and l[i - 1] > S + 1e-9:
-                levels.append({'type': 'support', 'level': S, 'c1': i, 'c2': i + 1, 'c3': i + 2, 'c4': i + 3})
+                entry_price = min(l[i], l[i + 1])   # wick bawah terpanjang antara c1,c2
+                levels.append({'type': 'support', 'level': S, 'entry_price': entry_price,
+                                'c1': i, 'c2': i + 1, 'c3': i + 2, 'c4': i + 3})
         if c[i] > o[i] and c[i + 1] < o[i + 1]:          # bullish lalu bearish
             R = c[i]
             if h[i + 2] < R - 1e-9 and h[i + 3] < R - 1e-9 and h[i - 1] < R - 1e-9:
-                levels.append({'type': 'resistance', 'level': R, 'c1': i, 'c2': i + 1, 'c3': i + 2, 'c4': i + 3})
+                entry_price = max(h[i], h[i + 1])   # wick atas terpanjang antara c1,c2
+                levels.append({'type': 'resistance', 'level': R, 'entry_price': entry_price,
+                                'c1': i, 'c2': i + 1, 'c3': i + 2, 'c4': i + 3})
     return levels
 
 
@@ -343,7 +354,8 @@ def detect_snr_events(df):
         kind = 'SNR_SUPPORT' if ty == 'support' else 'SNR_RESISTANCE'
         direction = 'Long' if ty == 'support' else 'Short'
         events.append({
-            'kind': kind, 'type': ty, 'level': level, 'direction': direction,
+            'kind': kind, 'type': ty, 'level': level, 'entry_price': lv['entry_price'],
+            'direction': direction,
             'test_i': test_i, 'confirm_i': confirm_i,
             'confirm_ts': int(ts[confirm_i]),
             'c1': lv['c1'], 'c2': lv['c2'],
@@ -547,16 +559,16 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
                 if st['used']:
                     continue   # sudah dipakai -> dibuang dari daftar live (tidak scan lagi)
                 ev = cp['events'][idx]
-                level = ev['level']
+                entry_price = ev['entry_price']   # limit dipasang di ujung wick, bukan body
 
-                dist_pct = abs(close_p - level) / level
+                dist_pct = abs(close_p - entry_price) / entry_price
                 if st['status'] == 'waiting':
                     if dist_pct <= APPROACH_PCT:
                         st['status'] = 'armed'
                 elif st['status'] == 'armed':
-                    touched = (lo <= level <= hi)
+                    touched = (lo <= entry_price <= hi)
                     if touched:
-                        opened_key, block_reason = open_trade(symbol, ev, level, now_ts)
+                        opened_key, block_reason = open_trade(symbol, ev, entry_price, now_ts)
                         if opened_key is not None:
                             st['used'] = True
                         else:
@@ -899,13 +911,16 @@ def _render_html() -> bytes:
     aman/di bawah level) → candle BERIKUTNYA tidak menyentuh lagi → ENTRY (Short).
     <br>Kalau ada candle H1 yang body-nya (close) menembus level SEBELUM test ketemu, level
     gugur total (tidak dipakai sama sekali).
+    <br><b>Entry limit dipasang di ujung WICK terpanjang</b> antara c1 & c2 (bukan di level
+    body) — Support: low terendah, Resistance: high tertinggi. Level body tetap dipakai
+    hanya untuk cek test/konfirmasi.
     <br>Level aktif dipantau via candle M5: masuk radius <b>{APPROACH_PCT*100:.1f}%</b> dari
-    level → limit dipasang persis di level; kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}%
-    sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). SL fix
-    <b>{SL_PCT*100:.2f}%</b> dari entry (=1R). <b>Trailing stop</b>: aktif begitu profit
-    capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti <b>{TRAIL_STOP_R:.1f}R</b> di
-    belakang harga tertinggi/terendah yang pernah dicapai (dipantau M5). Level MATI setelah
-    1x terisi (menang/kalah).
+    entry_price (wick) → limit dipasang persis di situ; kalau menjauh lagi
+    &gt;{APPROACH_PCT*100:.1f}% sebelum fill → limit dicabut (level tetap hidup, bisa coba
+    lagi). SL fix <b>{SL_PCT*100:.2f}%</b> dari entry (=1R). <b>Trailing stop</b>: aktif
+    begitu profit capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti
+    <b>{TRAIL_STOP_R:.1f}R</b> di belakang harga tertinggi/terendah yang pernah dicapai
+    (dipantau M5). Level MATI setelah 1x terisi (menang/kalah).
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dari balance (compounding). Slot maksimum: {_fmt_max_concurrent()}.
     Sinyal terblokir — slot: {cr.get('blocked_by_slot',0)}, margin: {cr.get('blocked_by_margin',0)},
     min order: {cr.get('blocked_by_min_order',0)}.
