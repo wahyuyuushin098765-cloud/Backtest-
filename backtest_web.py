@@ -111,13 +111,32 @@ BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', _default_end_date())
 CACHE_DIR = os.environ.get('CACHE_DIR', './data_cache')
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-SYMBOLS = [
+# Semua koin kandidat yang pernah di-backtest. Disimpan sebagai referensi
+# saja -- TIDAK dipakai langsung oleh bot (lihat SYMBOLS di bawah).
+SYMBOLS_ALL = [
     'XPLUSDT', 'MNTUSDT', 'PLUMEUSDT', 'HYPEUSDT', 'BNBUSDT', 'BELUSDT', 'BERAUSDT', 'DASHUSDT',
     'DOGEUSDT', 'USUALUSDT', 'TAOUSDT', 'ESPORTSUSDT', 'LABUSDT', 'HUSDT', 'AVAXUSDT', 'REUSDT',
     '1000BONKUSDT', 'ORCAUSDT', 'AAVEUSDT', 'GMXUSDT', 'LTCUSDT', 'ICPUSDT', 'VIRTUALUSDT', 'CFXUSDT',
     'UNIUSDT', 'ONDOUSDT', 'SUIUSDT', 'ALGOUSDT', 'HBARUSDT', 'EIGENUSDT', 'XRPUSDT', 'SOLUSDT',
     'CRVUSDT', 'RENDERUSDT', 'XVGUSDT', 'SANDUSDT', 'AXSUSDT', 'IMXUSDT', 'FARTCOINUSDT', 'OPUSDT',
     '1000PEPEUSDT', 'TIAUSDT', 'GALAUSDT', 'APEUSDT', 'FLOWUSDT',
+]
+
+# Hasil backtest 1 tahun terakhir -- koin yang ROI-nya negatif/breakeven
+# TIDAK diikutkan (disimpan di SYMBOLS_ALL di atas untuk referensi, tapi
+# tidak dipakai bot). GALAUSDT ikut dibuang walau total_r sedikit positif
+# (+0.41R) karena ROI $ akhirnya tetap minus (-0.1%, final balance < modal
+# awal). Hanya koin dengan ROI% > 0 yang dipakai:
+SYMBOLS = [
+    'SOLUSDT',        # +21.0%
+    'CFXUSDT',        # +19.8%
+    'ORCAUSDT',       # +17.6%
+    'LTCUSDT',        # +7.2%
+    'TAOUSDT',        # +3.9%
+    'SANDUSDT',       # +3.2%
+    'ESPORTSUSDT',    # +1.8%
+    'MNTUSDT',        # +1.6%
+    'UNIUSDT',        # +0.8%
 ]
 
 
@@ -338,8 +357,8 @@ def detect_snr_events(df):
     wick sama sekali.
     Return list dict:
     {'kind': 'SNR_SUPPORT'/'SNR_RESISTANCE', 'type': support/resistance,
-     'level': harga body c1, 'entry_price': harga ujung wick terpanjang
-     (c1/c2), 'direction': Long/Short, 'confirm_ts', 'c1_ts', 'c1', 'c2'}
+     'level': harga body c1, 'entry_price': harga ujung wick c1,
+     'direction': Long/Short, 'confirm_ts', 'c1_ts', 'c1', 'c2'}
 
     Urutan (semua syarat sudah dicek di find_levels):
     1) Level terbentuk: c1+c2 (2 candle berlawanan arah). c1_ts = waktu
@@ -349,13 +368,15 @@ def detect_snr_events(df):
        melebihi level.
     3) KANAN: 5 candle setelah c2 (c3 s/d c7) -- wick-nya (bukan cuma body)
        tidak boleh menyentuh level SAMA SEKALI, semua 5 candle harus bersih.
-    Begitu (2) dan (3) terpenuhi, level LANGSUNG AKTIF (confirm_ts = waktu
+    4) WICK: c1 wajib punya wick sungguhan (beda dari body), dan wick c2
+       (sisi yang sama) harus LEBIH PANJANG dari wick c1.
+    Begitu semua syarat terpenuhi, level LANGSUNG AKTIF (confirm_ts = waktu
     candle kanan terakhir, c7, selesai) -- tidak ada test/konfirmasi lagi.
     confirm_ts dipakai untuk MULAI MEMANTAU harga (kapan bot boleh mulai
     approach/arm), sedangkan c1_ts murni menandakan kapan levelnya sendiri
     terbentuk di chart.
-    Entry: Support -> Long, Resistance -> Short, di ujung wick terpanjang
-    (c1 vs c2), BUKAN di body/level lagi.
+    Entry: Support -> Long, Resistance -> Short, di UJUNG WICK C1 (bukan c2,
+    bukan body/level lagi).
     """
     ts = df['ts'].values
     levels = find_levels(df)
@@ -771,7 +792,8 @@ def _run():
     global _phase, _results, _kind_results, _per_coin_results, _all_trades, _combined_result
     try:
         _log_msg(f"🚀 Mulai backtest SNR (Support/Resistance murni) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
-        _log_msg(f"   SL=wick terpanjang c1/c2 (variatif per level, =1R)  Trailing: aktif di "
+        _log_msg(f"   Entry=ujung wick c1 (syarat wick c2 > wick c1)  SL={SL_PCT*100:.2f}% fix dari entry (=1R)  "
+                  f"Trailing: aktif di "
                   f"{TRAIL_ACTIVATE_R:.1f}R, jarak {TRAIL_STOP_R:.1f}R dari extreme  "
                   f"APPROACH_PCT={APPROACH_PCT*100:.1f}%")
 
