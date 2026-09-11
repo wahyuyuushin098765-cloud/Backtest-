@@ -3,8 +3,8 @@ backtest_snr.py — Backtest strategi Support & Resistance MURNI (tanpa break), 
 ================================================================================
 Support/Resistance biasa, TANPA syarat break sama sekali. Level dianggap aktif
 begitu tersentuh wick sekali (test), lalu 1 candle berikutnya tidak menyentuh
-level lagi -- langsung bisa dipasang limit order. Level yang sama BISA dipakai
-berulang kali (re-entry) selama belum pernah di-body-break.
+level lagi -- langsung bisa dipasang limit order. Tiap level HANYA dipakai 1x
+(tidak ada re-entry).
 
 RINGKASAN STRATEGI
 -------------------
@@ -17,37 +17,32 @@ RINGKASAN STRATEGI
    Resistance: kebalikannya (c1 bullish, c2 bearish). Level = close[c1].
             Valid kalau high c3 DAN c4 DAN high candle sebelum c1 < level.
 
-2) JADI LEVEL AKTIF, DENGAN RE-ENTRY BERULANG -- SETELAH level terbentuk
-   (mulai dari c3, scan maju):
+2) JADI LEVEL AKTIF (1x SAJA) -- SETELAH level terbentuk (mulai dari c3, scan
+   maju, sambil terus cek body-break):
    a. TEST: 1 candle wick menyentuh level, TAPI close masih di sisi aman
       (support: low<=level, close>level -- resistance: high>=level, close<level).
    b. KONFIRMASI: candle TEPAT SETELAH test -- wick-nya TIDAK menyentuh level
       lagi (support: low>level -- resistance: high<level).
-   Begitu (a) dan (b) terpenuhi -> ENTRY dicatat (bisa entry ke-1, ke-2, ke-3,
-   dst -- tidak dibatasi jumlah), lalu scan LANJUT dari situ mencari pola
-   test+konfirmasi BARU di level yang sama.
-   c. LEVEL MATI PERMANEN: begitu ada candle H1 MANAPUN yang close-nya
-      menembus body level (body break) -- baik saat mencari test atau di
-      candle konfirmasi itu sendiri -- level berhenti dicari lagi SETERUSNYA
-      (entry-entry sebelumnya yg sudah tercatat tetap sah).
+   Begitu (a) dan (b) terpenuhi -> level AKTIF (1x entry saja untuk level ini).
+   c. GUGUR: kalau ADA candle H1 yang close-nya menembus body level SEBELUM
+      test ketemu, level gugur total (tidak dicatat sama sekali).
    Entry: Support -> Long, Resistance -> Short.
 
 3) TRIGGER ENTRY (dipantau di candle M5, presisi) -- SETELAH level aktif:
-   Selama entry itu belum terpakai, tiap candle M5 dicek jaraknya ke level:
+   Selama level belum dipakai, tiap candle M5 dicek jaraknya ke level:
      - Kalau harga masuk radius 2% dari level -> limit order dipasang PERSIS
        di level itu (arah sesuai Support=Long / Resistance=Short).
      - Selama limit terpasang, kalau wick M5 menyentuh level -> FILL persis
        di level (harga limit).
      - Kalau sebelum fill harga malah menjauh lagi >2% dari level -> limit
-       DIBATALKAN (order dicabut), tapi entry ini TETAP tersimpan aktif -- bisa
+       DIBATALKAN (order dicabut), tapi level TETAP tersimpan aktif -- bisa
        terpasang ulang nanti kalau harga mendekat lagi dalam radius 2%.
    SL = SL_PCT (default 1% = 1R) dari harga entry, arah berlawanan dari entry.
    TRAILING STOP: begitu profit capai TRAIL_ACTIVATE_R (default 3R), trailing
    aktif -- SL lalu mengikuti TRAIL_STOP_R (default 1R) di belakang harga
    tertinggi/terendah yang pernah dicapai (dipantau M5), SL cuma boleh
    bergerak menguntungkan, tak pernah mundur.
-   Entry MATI (tidak dipakai lagi) setelah 1x FILLED (menang ataupun kalah) --
-   tapi level yang sama bisa entry lagi kalau ada re-entry event berikutnya.
+   Level MATI (tidak dipakai lagi) setelah 1x FILLED (menang ataupun kalah).
 
 Deploy ke Railway:
   Start command -> python backtest_snr.py
@@ -140,6 +135,7 @@ _log        = []
 _phase      = 'running'
 _results    = []
 _kind_results = []
+_per_coin_results = []   # list dict: {symbol, n_trades, n_win, wr, total_r, final_balance, roi}
 _all_trades = []
 _combined_result = {
     'n_trades': 0, 'n_win': 0, 'n_loss': 0, 'wr': 0, 'total_pnl': 0, 'roi': 0,
@@ -280,26 +276,22 @@ def find_levels(df):
 # candle yang berbeda dan setelah test pertama).
 
 def detect_snr_events(df):
-    """Deteksi level Support & Resistance MURNI (tanpa break), dengan RE-ENTRY
-    berulang selama level belum pernah di-BODY-BREAK.
-    Return list dict (BISA lebih dari 1 per level, jika re-entry terjadi):
+    """Deteksi level Support & Resistance MURNI (tanpa break), 1x entry saja
+    per level (TIDAK ada re-entry).
+    Return list dict:
     {'kind': 'SNR_SUPPORT'/'SNR_RESISTANCE', 'type': support/resistance,
      'level': harga, 'direction': Long/Short, 'test_i', 'confirm_i',
-     'confirm_ts', 'c1', 'c2', 'entry_seq'}
+     'confirm_ts', 'c1', 'c2'}
 
     Urutan:
     1) Level terbentuk (find_levels): 2 candle berlawanan arah, kiri (1 candle)
        & kanan (2 candle: c3 DAN c4) tidak menembus body level.
     2) TEST: candle wick menyentuh level, TAPI close masih di sisi aman.
     3) KONFIRMASI: candle TEPAT SETELAH test -- wick-nya TIDAK menyentuh level
-       lagi. Begitu ini terpenuhi, event ke-1 dicatat (level aktif).
-    4) RE-ENTRY: setelah konfirmasi ke-1, scan LANJUT (mulai dari confirm_i+1)
-       mencari pola test+konfirmasi BARU di level yang sama -- kalau ketemu,
-       event ke-2 dicatat, dst, TANPA BATAS JUMLAH -- selama scan berjalan.
-    5) LEVEL MATI PERMANEN: begitu ada candle H1 MANAPUN (baik saat mencari
-       test, saat 'netral', atau di antara entry) yang CLOSE-nya menembus body
-       level (body break) -- scan berhenti total, semua event sebelum titik
-       itu tetap sah, tapi tidak ada event baru sesudahnya.
+       lagi. Begitu ini terpenuhi, event dicatat (level aktif), SELESAI --
+       tidak dicari entry berikutnya di level yang sama.
+    4) GUGUR: kalau ada candle H1 yang CLOSE-nya menembus body level SEBELUM
+       test/konfirmasi ketemu, level gugur total (tidak dicatat sama sekali).
     Entry: Support -> Long, Resistance -> Short.
     """
     ts = df['ts'].values
@@ -312,60 +304,50 @@ def detect_snr_events(df):
         level = lv['level']
         ty = lv['type']
         i = lv['c3']  # mulai scan dari candle c3 (candle pertama setelah level terbentuk)
-        entry_seq = 0
 
+        # cari TEST, sambil cek body-break di sepanjang jalan
+        test_i = None
+        broken = False
         while i < n:
-            # cari TEST berikutnya, sambil terus cek body-break di sepanjang jalan
-            test_i = None
-            broken = False
-            while i < n:
-                if ty == 'support':
-                    if c[i] < level - 1e-9:
-                        broken = True   # body break -> level mati permanen dari titik ini
-                        break
-                    if l[i] <= level + 1e-9 and c[i] > level + 1e-9:
-                        test_i = i
-                        break
-                else:
-                    if c[i] > level + 1e-9:
-                        broken = True
-                        break
-                    if h[i] >= level - 1e-9 and c[i] < level - 1e-9:
-                        test_i = i
-                        break
-                i += 1
-
-            if broken or test_i is None:
-                break   # level mati permanen (broken), atau tidak ada test lagi sampai akhir data
-
-            confirm_i = test_i + 1
-            if confirm_i >= n:
-                break   # test di candle terakhir, tidak ada candle konfirmasi
-
-            # body break JUGA dicek di candle konfirmasi (bukan cuma wick)
             if ty == 'support':
-                confirm_broken = c[confirm_i] < level - 1e-9
-                confirmed = l[confirm_i] > level + 1e-9
+                if c[i] < level - 1e-9:
+                    broken = True   # body break sebelum test -> level gugur
+                    break
+                if l[i] <= level + 1e-9 and c[i] > level + 1e-9:
+                    test_i = i
+                    break
             else:
-                confirm_broken = c[confirm_i] > level + 1e-9
-                confirmed = h[confirm_i] < level - 1e-9
+                if c[i] > level + 1e-9:
+                    broken = True
+                    break
+                if h[i] >= level - 1e-9 and c[i] < level - 1e-9:
+                    test_i = i
+                    break
+            i += 1
 
-            if confirm_broken:
-                break   # candle konfirmasi ternyata body-break -> level mati permanen, tidak dicatat
+        if broken or test_i is None:
+            continue   # gugur (broken), atau tidak ada test sampai akhir data
 
-            if confirmed:
-                entry_seq += 1
-                kind = 'SNR_SUPPORT' if ty == 'support' else 'SNR_RESISTANCE'
-                direction = 'Long' if ty == 'support' else 'Short'
-                events.append({
-                    'kind': kind, 'type': ty, 'level': level, 'direction': direction,
-                    'test_i': test_i, 'confirm_i': confirm_i,
-                    'confirm_ts': int(ts[confirm_i]),
-                    'c1': lv['c1'], 'c2': lv['c2'], 'entry_seq': entry_seq,
-                })
-                i = confirm_i + 1   # lanjut scan cari re-entry berikutnya
-            else:
-                i = confirm_i   # konfirmasi gagal (wick masih sentuh) -> lanjut cari test baru dari sini
+        confirm_i = test_i + 1
+        if confirm_i >= n:
+            continue   # test di candle terakhir, tidak ada candle konfirmasi
+
+        if ty == 'support':
+            confirmed = l[confirm_i] > level + 1e-9   # wick TIDAK menyentuh level lagi
+        else:
+            confirmed = h[confirm_i] < level - 1e-9
+
+        if not confirmed:
+            continue
+
+        kind = 'SNR_SUPPORT' if ty == 'support' else 'SNR_RESISTANCE'
+        direction = 'Long' if ty == 'support' else 'Short'
+        events.append({
+            'kind': kind, 'type': ty, 'level': level, 'direction': direction,
+            'test_i': test_i, 'confirm_i': confirm_i,
+            'confirm_ts': int(ts[confirm_i]),
+            'c1': lv['c1'], 'c2': lv['c2'],
+        })
 
     events.sort(key=lambda e: e['confirm_ts'])
     return events
@@ -440,8 +422,8 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
     active_positions = {}     # key(symbol,direction+level) -> {...}
     trades = []
 
-    def _akey(symbol, direction, level, kind, entry_seq):
-        return f"{symbol}|{direction}|{kind}|{level:.10f}|{entry_seq}"
+    def _akey(symbol, direction, level, kind):
+        return f"{symbol}|{direction}|{kind}|{level:.10f}"
 
     total_margin_used = 0.0   # dijaga incremental, bukan sum() ulang tiap panggilan (O(1) bukan O(n))
 
@@ -485,7 +467,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
         if _slots_used() >= MAX_CONCURRENT:
             return None, 'slot'
 
-        key = _akey(symbol, direction, ev['level'], ev['kind'], ev.get('entry_seq', 1))
+        key = _akey(symbol, direction, ev['level'], ev['kind'])
         active_positions[key] = {
             'symbol': symbol, 'direction': direction, 'entry': entry_price, 'sl': sl,
             'dist': dist, 'qty': qty, 'entry_ts': entry_ts, 'level': ev['level'],
@@ -677,6 +659,27 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
 
 
 # ============================================================
+# SIMULASI PER-KOIN (independen, bukan gabungan)
+# ============================================================
+# Selain simulasi GABUNGAN (1 balance dipakai bersama semua koin -- lebih
+# realistis krn simulasikan 1 akun beneran), kita juga jalankan simulasi
+# PER-KOIN: tiap koin dapat modal awal sendiri (INITIAL_BALANCE), balance &
+# slot terpisah dari koin lain. Ini menjawab pertanyaan "kalau CUMA trading
+# koin ini sendirian, berapa trade & WR-nya" -- tanpa pengaruh rebutan
+# margin/slot dari koin lain.
+
+def run_per_coin_backtests(coins: dict, m5_data: dict) -> dict:
+    """Return dict: symbol -> hasil run_combined_backtest (dgn 1 koin saja)."""
+    results = {}
+    for symbol, cp in coins.items():
+        m5 = m5_data.get(symbol)
+        if m5 is None:
+            continue
+        results[symbol] = run_combined_backtest({symbol: cp}, {symbol: m5})
+    return results
+
+
+# ============================================================
 # BREAKDOWN PER SIMBOL
 # ============================================================
 
@@ -725,7 +728,7 @@ def per_kind_breakdown(trades):
 # ============================================================
 
 def _run():
-    global _phase, _results, _kind_results, _all_trades, _combined_result
+    global _phase, _results, _kind_results, _per_coin_results, _all_trades, _combined_result
     try:
         _log_msg(f"🚀 Mulai backtest SNR (Support/Resistance murni) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
         _log_msg(f"   SL=wick terpanjang c1/c2 (variatif per level, =1R)  Trailing: aktif di "
@@ -754,6 +757,17 @@ def _run():
         _log_msg(f"🧮 Menjalankan simulasi gabungan ({len(coins)} koin)...")
         result = run_combined_backtest(coins, m5_data)
 
+        _log_msg(f"🧮 Menjalankan simulasi PER-KOIN (independen, {len(coins)} koin)...")
+        per_coin_raw = run_per_coin_backtests(coins, m5_data)
+        per_coin_rows = []
+        for symbol, r in per_coin_raw.items():
+            per_coin_rows.append({
+                'symbol': symbol, 'n_trades': r['n_trades'], 'n_win': r['n_win'],
+                'wr': r['wr'], 'total_r': r['total_r'], 'final_balance': r['final_balance'],
+                'roi': r['roi'],
+            })
+        per_coin_rows.sort(key=lambda r: -r['total_r'])
+
         with _lock:
             _all_trades[:] = result['trades']
             _combined_result.update({
@@ -768,6 +782,7 @@ def _run():
             })
             _results[:] = per_symbol_breakdown(result['trades'])
             _kind_results[:] = per_kind_breakdown(result['trades'])
+            _per_coin_results[:] = per_coin_rows
             _phase = 'done'
 
         _log_msg(f"✅ SELESAI. {result['n_trades']} trade, WR {result['wr']:.1f}%, "
@@ -795,6 +810,7 @@ def _render_html() -> bytes:
         cr = dict(_combined_result)
         results_cp = list(_results)
         kind_cp = list(_kind_results)
+        per_coin_cp = list(_per_coin_results)
         log_cp = list(_log[-300:])
 
     log_html = '\n'.join(l for l in log_cp)
@@ -821,6 +837,15 @@ def _render_html() -> bytes:
             <td>{r['kind']}</td><td>{r['n']}</td><td>{r['win']}</td>
             <td>{r['wr']:.1f}%</td><td class="{cls}">{r['total_r']:+.2f}</td>
             <td class="{cls}">${r['total_pnl']:+.2f}</td></tr>'''
+
+    per_coin_rows_html = ''
+    for r in per_coin_cp:
+        cls = 'pos' if r['total_r'] >= 0 else 'neg'
+        per_coin_rows_html += f'''<tr>
+            <td>{r['symbol']}</td><td>{r['n_trades']}</td><td>{r['n_win']}</td>
+            <td>{r['wr']:.1f}%</td><td class="{cls}">{r['total_r']:+.2f}</td>
+            <td>${r['final_balance']:.2f}</td>
+            <td class="{cls}">{r['roi']:+.1f}%</td></tr>'''
 
     return f'''<!DOCTYPE html>
 <html lang="id">
@@ -865,23 +890,22 @@ def _render_html() -> bytes:
   </div>
 
   <div class="note">
-    💡 <b>Support & Resistance MURNI (tanpa break), dengan RE-ENTRY</b>, basis body candle
-    H1 (level dasar disyaratkan candle kiri 1x dan kanan 2x tidak menembus body-nya):
+    💡 <b>Support & Resistance MURNI (tanpa break)</b>, basis body candle H1 (level dasar
+    disyaratkan candle kiri 1x dan kanan 2x tidak menembus body-nya):
     <br>• <b>SNR Support</b>: level di-TEST (wick bawah sentuh, close aman/di atas level) →
-    candle BERIKUTNYA wick-nya TIDAK menyentuh level lagi → ENTRY (Long). Selama level
-    belum pernah di-BODY-BREAK (close menembus), pola test+konfirmasi bisa terulang lagi →
-    entry ke-2, ke-3, dst, TANPA BATAS JUMLAH.
+    candle BERIKUTNYA wick-nya TIDAK menyentuh level lagi → ENTRY (Long). Tiap level HANYA
+    dipakai 1x.
     <br>• <b>SNR Resistance</b>: kebalikannya — level di-TEST (wick atas sentuh, close
-    aman/di bawah level) → candle BERIKUTNYA tidak menyentuh lagi → ENTRY (Short), re-entry
-    berlaku sama.
-    <br>Begitu ada candle H1 MANAPUN yang body-nya (close) menembus level, level itu MATI
-    PERMANEN (tidak dipakai lagi seterusnya).
+    aman/di bawah level) → candle BERIKUTNYA tidak menyentuh lagi → ENTRY (Short).
+    <br>Kalau ada candle H1 yang body-nya (close) menembus level SEBELUM test ketemu, level
+    gugur total (tidak dipakai sama sekali).
     <br>Level aktif dipantau via candle M5: masuk radius <b>{APPROACH_PCT*100:.1f}%</b> dari
     level → limit dipasang persis di level; kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}%
-    sebelum fill → limit dicabut (entry ini tetap hidup, bisa coba lagi). SL fix
+    sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). SL fix
     <b>{SL_PCT*100:.2f}%</b> dari entry (=1R). <b>Trailing stop</b>: aktif begitu profit
     capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti <b>{TRAIL_STOP_R:.1f}R</b> di
-    belakang harga tertinggi/terendah yang pernah dicapai (dipantau M5).
+    belakang harga tertinggi/terendah yang pernah dicapai (dipantau M5). Level MATI setelah
+    1x terisi (menang/kalah).
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dari balance (compounding). Slot maksimum: {_fmt_max_concurrent()}.
     Sinyal terblokir — slot: {cr.get('blocked_by_slot',0)}, margin: {cr.get('blocked_by_margin',0)},
     min order: {cr.get('blocked_by_min_order',0)}.
@@ -889,16 +913,22 @@ def _render_html() -> bytes:
     Log mentah: <a href="/logs">/logs</a>
   </div>
 
-  <h2>Ringkasan per Jenis Level</h2>
+  <h2>Ringkasan per Jenis Level (simulasi gabungan)</h2>
   <table>
     <tr><th>Jenis</th><th>N Trade</th><th>Win</th><th>WR%</th><th>Total R</th><th>Total PnL</th></tr>
     {kind_rows_html}
   </table>
 
-  <h2>Ringkasan per Koin</h2>
+  <h2>Kontribusi per Koin (simulasi gabungan, 1 balance bersama)</h2>
   <table>
     <tr><th>Symbol</th><th>N Trade</th><th>Win</th><th>WR%</th><th>Total R</th><th>Total PnL</th></tr>
     {rows_html}
+  </table>
+
+  <h2>Simulasi Per-Koin (independen, modal awal sendiri-sendiri)</h2>
+  <table>
+    <tr><th>Symbol</th><th>N Trade</th><th>Win</th><th>WR%</th><th>Total R</th><th>Balance Akhir</th><th>ROI</th></tr>
+    {per_coin_rows_html}
   </table>
 
   <h2>Log Progress</h2>
