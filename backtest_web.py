@@ -267,30 +267,44 @@ def find_levels(df):
     Syarat kanan: 5 candle SETELAH c1,c2 (c3 s/d c7) -- WICK-nya (bukan cuma
                   body) tidak boleh menyentuh level sama sekali. Semua 5
                   candle harus bersih.
-    Syarat kiri : 1 candle SEBELUM c1 (index c1-1) -- WICK-nya juga tidak
-                  boleh melebihi level. Kalau c1 candle paling awal (tidak
-                  ada candle sebelumnya), level GUGUR.
-    'entry_price' = level body itu sendiri (close[c1]) -- limit dipasang di
-    situ (bukan wick).
+    Syarat kiri : 5 candle SEBELUM c1 (index c1-5 s/d c1-1) -- WICK-nya juga
+                  tidak boleh melebihi level. Semua 5 candle kiri harus
+                  bersih. Kalau candle kiri tidak cukup (c1 terlalu dekat ke
+                  awal data), level GUGUR.
+    'entry_price' = UJUNG WICK TERPANJANG di antara wick c1 dan wick c2
+                  (bukan lagi body/close). Untuk support dibandingkan wick
+                  BAWAH (lower shadow) c1 vs c2, dipilih yang lebih panjang,
+                  entry di LOW candle tsb. Untuk resistance dibandingkan wick
+                  ATAS (upper shadow) c1 vs c2, dipilih yang lebih panjang,
+                  entry di HIGH candle tsb.
+    'level' tetap = body candle c1 (close[c1]) -- dipakai untuk syarat
+                  validitas kiri/kanan (wick tidak boleh menyentuh level ini).
     Return list dict: {'type', 'level', 'entry_price', 'c1', 'c2', ..., 'c7'}."""
     o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     n = len(df)
     levels = []
     N_RIGHT = 5   # jumlah candle kanan yang harus bersih (tidak menyentuh wick)
-    for i in range(1, n - (1 + N_RIGHT)):   # perlu 1 candle kiri + c1,c2 + 5 candle kanan
+    N_LEFT = 5    # jumlah candle kiri yang harus bersih (tidak menyentuh wick)
+    for i in range(N_LEFT, n - (1 + N_RIGHT)):   # perlu 5 candle kiri + c1,c2 + 5 candle kanan
         if c[i] < o[i] and c[i + 1] > o[i + 1]:          # bearish lalu bullish -> support
             S = c[i]
             right_ok = all(l[i + 2 + k] > S + 1e-9 for k in range(N_RIGHT))   # c3..c7 wick bersih
-            left_ok = l[i - 1] > S + 1e-9   # kiri: wick candle sebelum c1 tidak melebihi
+            left_ok = all(l[i - 1 - k] > S + 1e-9 for k in range(N_LEFT))     # 5 candle kiri bersih
             if right_ok and left_ok:
-                levels.append({'type': 'support', 'level': S, 'entry_price': S,
+                lower_wick_c1 = c[i] - l[i]         # wick bawah c1 (bearish): close - low
+                lower_wick_c2 = o[i + 1] - l[i + 1]  # wick bawah c2 (bullish): open - low
+                entry_price = l[i] if lower_wick_c1 >= lower_wick_c2 else l[i + 1]
+                levels.append({'type': 'support', 'level': S, 'entry_price': entry_price,
                                 'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
         if c[i] > o[i] and c[i + 1] < o[i + 1]:          # bullish lalu bearish -> resistance
             R = c[i]
             right_ok = all(h[i + 2 + k] < R - 1e-9 for k in range(N_RIGHT))
-            left_ok = h[i - 1] < R - 1e-9
+            left_ok = all(h[i - 1 - k] < R - 1e-9 for k in range(N_LEFT))
             if right_ok and left_ok:
-                levels.append({'type': 'resistance', 'level': R, 'entry_price': R,
+                upper_wick_c1 = h[i] - c[i]          # wick atas c1 (bullish): high - close
+                upper_wick_c2 = h[i + 1] - o[i + 1]  # wick atas c2 (bearish): high - open
+                entry_price = h[i] if upper_wick_c1 >= upper_wick_c2 else h[i + 1]
+                levels.append({'type': 'resistance', 'level': R, 'entry_price': entry_price,
                                 'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
     return levels
 
@@ -317,18 +331,24 @@ def detect_snr_events(df):
     wick sama sekali.
     Return list dict:
     {'kind': 'SNR_SUPPORT'/'SNR_RESISTANCE', 'type': support/resistance,
-     'level': harga, 'entry_price': harga (=level, body), 'direction': Long/Short,
-     'confirm_ts', 'c1', 'c2'}
+     'level': harga body c1, 'entry_price': harga ujung wick terpanjang
+     (c1/c2), 'direction': Long/Short, 'confirm_ts', 'c1_ts', 'c1', 'c2'}
 
     Urutan (semua syarat sudah dicek di find_levels):
-    1) Level terbentuk: c1+c2 (2 candle berlawanan arah).
-    2) KIRI: 1 candle sebelum c1 -- wick-nya (bukan cuma body) tidak boleh
+    1) Level terbentuk: c1+c2 (2 candle berlawanan arah). c1_ts = waktu
+       candle c1 -- ini "tempat" support/resistance itu sesungguhnya
+       terbentuk (mis. c1 jam 2, c2 jam 3 -> c1_ts = jam 2).
+    2) KIRI: 5 candle sebelum c1 -- wick-nya (bukan cuma body) tidak boleh
        melebihi level.
     3) KANAN: 5 candle setelah c2 (c3 s/d c7) -- wick-nya (bukan cuma body)
        tidak boleh menyentuh level SAMA SEKALI, semua 5 candle harus bersih.
     Begitu (2) dan (3) terpenuhi, level LANGSUNG AKTIF (confirm_ts = waktu
     candle kanan terakhir, c7, selesai) -- tidak ada test/konfirmasi lagi.
-    Entry: Support -> Long, Resistance -> Short, di level BODY (bukan wick).
+    confirm_ts dipakai untuk MULAI MEMANTAU harga (kapan bot boleh mulai
+    approach/arm), sedangkan c1_ts murni menandakan kapan levelnya sendiri
+    terbentuk di chart.
+    Entry: Support -> Long, Resistance -> Short, di ujung wick terpanjang
+    (c1 vs c2), BUKAN di body/level lagi.
     """
     ts = df['ts'].values
     levels = find_levels(df)
@@ -344,6 +364,7 @@ def detect_snr_events(df):
             'kind': kind, 'type': ty, 'level': level, 'entry_price': lv['entry_price'],
             'direction': direction,
             'confirm_ts': int(ts[last_right_i]),
+            'c1_ts': int(ts[lv['c1']]),
             'c1': lv['c1'], 'c2': lv['c2'],
         })
 
@@ -470,6 +491,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
             'symbol': symbol, 'direction': direction, 'entry': entry_price, 'sl': sl,
             'dist': dist, 'qty': qty, 'entry_ts': entry_ts, 'level': ev['level'],
             'kind': ev['kind'], 'margin': margin_needed, 'confirm_ts': ev['confirm_ts'],
+            'c1_ts': ev['c1_ts'],
             'trail_active': False, 'extreme': entry_price,   # high/low-water mark, mulai dari entry
         }
         total_margin_used += margin_needed
@@ -491,8 +513,9 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
             'symbol': pos['symbol'], 'direction': direction, 'entry': entry, 'sl': pos['sl'],
             'exit': exit_price, 'reason': reason, 'r_mult': r_mult, 'pnl_usd': pnl_net,
             'entry_ts': pos['entry_ts'], 'exit_ts': exit_ts, 'balance_after': balance,
-            'level': pos['level'], 'kind': pos['kind'], 'level_formed_ts': pos['confirm_ts'],
-            'level_formed_wib': _fmt_wib(pos['confirm_ts']),
+            'level': pos['level'], 'kind': pos['kind'],
+            'level_formed_ts': pos['c1_ts'],
+            'level_formed_wib': _fmt_wib(pos['c1_ts']),
             'entry_wib': _fmt_wib(pos['entry_ts']),
             'exit_wib': _fmt_wib(exit_ts),
         })
