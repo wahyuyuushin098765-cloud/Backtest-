@@ -1,37 +1,40 @@
 """
-backtest_snr.py — Backtest strategi Resistance MURNI, H1
+backtest_snr.py — Backtest strategi Support & Resistance MURNI, H1
 ================================================================================
-Resistance saja (strategi Support sudah DIHILANGKAN, hanya arah Short yang
-dipakai), TANPA konsep test/konfirmasi wick sama sekali.
-Level dianggap aktif begitu 5 candle setelah level terbentuk semuanya bersih
-(wick tidak pernah menyentuh level) -- langsung bisa dipasang limit order di
-ujung wick c1. Tiap level HANYA dipakai 1x (tidak ada re-entry).
+Support & Resistance, TANPA konsep test/konfirmasi wick sama sekali.
+Level dianggap aktif begitu N_RIGHT candle setelah level terbentuk semuanya
+bersih (wick tidak pernah menyentuh level) -- langsung bisa dipasang limit
+order di ujung wick c1. Tiap level HANYA dipakai 1x (tidak ada re-entry).
 
 RINGKASAN STRATEGI
 -------------------
 1) DETEKSI LEVEL (H1):
+   Support: candle c1 bearish (close<open) lalu c2 bullish (close>open).
+            Level = close[c1].
    Resistance: candle c1 bullish (close>open) lalu c2 bearish (close<open).
-            Level = close[c1]. Valid kalau:
-            - KIRI: 5 candle SEBELUM c1 -- WICK-nya (high) tidak boleh lebih
-              tinggi dari level.
-            - KANAN: 5 candle SETELAH c1,c2 (c3 s/d c7) -- WICK-nya (high)
-              tidak boleh menyentuh level SAMA SEKALI, semua 5 candle harus
-              bersih.
-            - WICK: c1 wajib punya wick atas sungguhan (beda dari body), dan
-              wick atas c2 harus LEBIH PANJANG dari wick c1. Kalau tidak,
-              level gugur.
+            Level = close[c1].
+   Kedua arah valid kalau:
+            - KIRI: N_LEFT candle SEBELUM c1 (default 1) -- WICK-nya tidak
+              boleh melebihi level.
+            - KANAN: N_RIGHT candle SETELAH c1,c2 (default 1) -- WICK-nya
+              tidak boleh menyentuh level SAMA SEKALI, semua candle kanan
+              harus bersih.
+            - WICK: c1 wajib punya wick sungguhan (beda dari body), dan
+              wick c2 (sisi yang sama) harus LEBIH PANJANG dari wick c1.
+              Kalau tidak, level gugur.
 
 2) JADI LEVEL AKTIF (1x SAJA), TANPA TEST/KONFIRMASI:
    Begitu syarat kiri+kanan+wick di atas terpenuhi, level LANGSUNG AKTIF
-   (mulai aktif setelah candle kanan ke-5/c7 selesai) -- tidak ada lagi
+   (mulai aktif setelah candle kanan terakhir selesai) -- tidak ada lagi
    pengecekan wick-sentuh-lalu-tidak-sentuh seperti versi sebelumnya.
-   Entry: Short, di UJUNG WICK C1 (high[c1]) -- bukan c2, bukan body/level.
+   Entry: Support -> Long, Resistance -> Short, di UJUNG WICK C1 -- bukan
+   c2, bukan body/level.
 
 3) TRIGGER ENTRY (dipantau di candle M5, presisi) -- SETELAH level aktif:
    Limit order dipasang PERSIS di entry_price (ujung wick c1).
    Selama level belum dipakai, tiap candle M5 dicek jaraknya ke entry_price:
      - Kalau harga masuk radius 2% dari entry_price -> limit order dipasang
-       PERSIS di situ (arah Short).
+       PERSIS di situ (arah sesuai Support=Long / Resistance=Short).
      - Selama limit terpasang, kalau wick M5 menyentuh entry_price -> FILL
        persis di situ (harga limit).
      - Kalau sebelum fill harga malah menjauh lagi >2% dari entry_price ->
@@ -103,8 +106,8 @@ def _default_end_date():
 
 def _default_start_date():
     d = datetime.now(timezone.utc)
-    # mundur 1 tahun kalender dari hari ini
-    return (d - timedelta(days=365)).strftime('%Y-%m-%d')
+    # mundur 1 bulan kalender (30 hari) dari hari ini
+    return (d - timedelta(days=30)).strftime('%Y-%m-%d')
 
 BACKTEST_START_DATE = os.environ.get('BACKTEST_START_DATE', _default_start_date())
 BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', _default_end_date())
@@ -112,22 +115,14 @@ BACKTEST_END_DATE   = os.environ.get('BACKTEST_END_DATE', _default_end_date())
 CACHE_DIR = os.environ.get('CACHE_DIR', './data_cache')
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# Hasil backtest strategi Resistance murni (1 tahun) -- hanya koin dengan
-# ROI% > 0 yang dipakai. Sisanya (32 koin) tidak diikutkan lagi.
+# Semua koin yang dipakai bot.
 SYMBOLS = [
-    'CFXUSDT',    # +31.7%
-    'LTCUSDT',    # +22.0%
-    'GALAUSDT',   # +21.7%
-    'AVAXUSDT',   # +10.8%
-    'SOLUSDT',    # +10.4%
-    'SANDUSDT',   # +9.1%
-    'DOGEUSDT',   # +9.1%
-    'UNIUSDT',    # +7.6%
-    'MNTUSDT',    # +6.7%
-    'ORCAUSDT',   # +6.3%
-    'DASHUSDT',   # +5.3%
-    'XVGUSDT',    # +3.6%
-    'AAVEUSDT',   # +2.3%
+    'XPLUSDT', 'MNTUSDT', 'PLUMEUSDT', 'HYPEUSDT', 'BNBUSDT', 'BELUSDT', 'BERAUSDT', 'DASHUSDT',
+    'DOGEUSDT', 'USUALUSDT', 'TAOUSDT', 'ESPORTSUSDT', 'LABUSDT', 'HUSDT', 'AVAXUSDT', 'REUSDT',
+    '1000BONKUSDT', 'ORCAUSDT', 'AAVEUSDT', 'GMXUSDT', 'LTCUSDT', 'ICPUSDT', 'VIRTUALUSDT', 'CFXUSDT',
+    'UNIUSDT', 'ONDOUSDT', 'SUIUSDT', 'ALGOUSDT', 'HBARUSDT', 'EIGENUSDT', 'XRPUSDT', 'SOLUSDT',
+    'CRVUSDT', 'RENDERUSDT', 'XVGUSDT', 'SANDUSDT', 'AXSUSDT', 'IMXUSDT', 'FARTCOINUSDT', 'OPUSDT',
+    '1000PEPEUSDT', 'TIAUSDT', 'GALAUSDT', 'APEUSDT', 'FLOWUSDT',
 ]
 
 
@@ -272,35 +267,47 @@ def fetch_bybit_m5(symbol: str) -> pd.DataFrame:
 # DETEKSI LEVEL SUPPORT / RESISTANCE (H1)
 # ============================================================
 
+N_RIGHT = 1   # jumlah candle kanan yang harus bersih (tidak menyentuh wick) -- minimal 1
+N_LEFT = 1    # jumlah candle kiri yang harus bersih (tidak menyentuh wick) -- minimal 1
+
 def find_levels(df):
-    """Deteksi level Resistance dari candle H1 (basis body candle).
-    STRATEGI SUPPORT DIHILANGKAN -- hanya Resistance (arah Short) yang
-    dipakai.
-    Syarat kanan: 5 candle SETELAH c1,c2 (c3 s/d c7) -- WICK-nya (bukan cuma
-                  body) tidak boleh menyentuh level sama sekali. Semua 5
-                  candle harus bersih.
-    Syarat kiri : 5 candle SEBELUM c1 (index c1-5 s/d c1-1) -- WICK-nya juga
-                  tidak boleh melebihi level. Semua 5 candle kiri harus
-                  bersih. Kalau candle kiri tidak cukup (c1 terlalu dekat ke
-                  awal data), level GUGUR.
+    """Deteksi level Support & Resistance dari candle H1 (basis body candle).
+    Syarat kanan: N_RIGHT candle SETELAH c1,c2 -- WICK-nya (bukan cuma body)
+                  tidak boleh menyentuh level sama sekali. Semua candle kanan
+                  harus bersih.
+    Syarat kiri : N_LEFT candle SEBELUM c1 -- WICK-nya juga tidak boleh
+                  melebihi level. Semua candle kiri harus bersih. Kalau
+                  candle kiri tidak cukup (c1 terlalu dekat ke awal data),
+                  level GUGUR.
     Syarat wick c1 vs c2:
       - c1 WAJIB punya wick sungguhan -- ujung wick c1 tidak boleh sama
         persis dengan ujung body c1 (mis. ujung body 0.1, ujung wick harus
         beda, misal 0.09 -- bukan sama-sama 0.1). Kalau sama (tidak ada
         wick), level GUGUR.
-      - Wick c2 (atas, sisi yang sama) HARUS LEBIH PANJANG dari wick c1.
-        Kalau wick c2 <= wick c1, level GUGUR.
-    'entry_price' = UJUNG WICK C1 (bukan c2, bukan body/close lagi) = high[c1].
+      - Wick c2 (sisi yang sama: bawah utk support, atas utk resistance)
+        HARUS LEBIH PANJANG dari wick c1. Kalau wick c2 <= wick c1, level
+        GUGUR.
+    'entry_price' = UJUNG WICK C1 (bukan c2, bukan body/close lagi).
+                  Support -> low[c1]. Resistance -> high[c1].
     'level' tetap = body candle c1 (close[c1]) -- dipakai untuk syarat
                   validitas kiri/kanan (wick tidak boleh menyentuh level ini).
-    Return list dict: {'type', 'level', 'entry_price', 'c1', 'c2', ..., 'c7'}."""
+    Return list dict: {'type', 'level', 'entry_price', 'c1', 'c2', 'c_right'}."""
     o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     n = len(df)
     levels = []
-    N_RIGHT = 5   # jumlah candle kanan yang harus bersih (tidak menyentuh wick)
-    N_LEFT = 5    # jumlah candle kiri yang harus bersih (tidak menyentuh wick)
     WICK_EPS = 1e-9   # beda minimum supaya wick dianggap "ada" (tidak sama dgn body)
-    for i in range(N_LEFT, n - (1 + N_RIGHT)):   # perlu 5 candle kiri + c1,c2 + 5 candle kanan
+    for i in range(N_LEFT, n - (1 + N_RIGHT)):   # perlu N_LEFT candle kiri + c1,c2 + N_RIGHT candle kanan
+        if c[i] < o[i] and c[i + 1] > o[i + 1]:          # bearish lalu bullish -> support
+            S = c[i]
+            right_ok = all(l[i + 2 + k] > S + 1e-9 for k in range(N_RIGHT))
+            left_ok = all(l[i - 1 - k] > S + 1e-9 for k in range(N_LEFT))
+            lower_wick_c1 = c[i] - l[i]           # wick bawah c1 (bearish): close - low
+            lower_wick_c2 = o[i + 1] - l[i + 1]   # wick bawah c2 (bullish): open - low
+            wick_ok = (lower_wick_c1 > WICK_EPS) and (lower_wick_c2 > lower_wick_c1 + WICK_EPS)
+            if right_ok and left_ok and wick_ok:
+                entry_price = l[i]   # ujung wick c1
+                levels.append({'type': 'support', 'level': S, 'entry_price': entry_price,
+                                'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
         if c[i] > o[i] and c[i + 1] < o[i + 1]:          # bullish lalu bearish -> resistance
             R = c[i]
             right_ok = all(h[i + 2 + k] < R - 1e-9 for k in range(N_RIGHT))
@@ -333,30 +340,30 @@ def find_levels(df):
 # candle yang berbeda dan setelah test pertama).
 
 def detect_snr_events(df):
-    """Deteksi level Resistance MURNI, TANPA konsep test/konfirmasi wick sama
-    sekali. STRATEGI SUPPORT DIHILANGKAN -- find_levels() cuma mengembalikan
-    level 'resistance', jadi kind di sini selalu 'SNR_RESISTANCE'.
+    """Deteksi level Support & Resistance MURNI, TANPA konsep test/konfirmasi
+    wick sama sekali.
     Return list dict:
-    {'kind': 'SNR_RESISTANCE', 'type': 'resistance',
+    {'kind': 'SNR_SUPPORT'/'SNR_RESISTANCE', 'type': support/resistance,
      'level': harga body c1, 'entry_price': harga ujung wick c1,
-     'direction': 'Short', 'confirm_ts', 'c1_ts', 'c1', 'c2'}
+     'direction': Long/Short, 'confirm_ts', 'c1_ts', 'c1', 'c2'}
 
     Urutan (semua syarat sudah dicek di find_levels):
     1) Level terbentuk: c1+c2 (2 candle berlawanan arah). c1_ts = waktu
-       candle c1 -- ini "tempat" resistance itu sesungguhnya
+       candle c1 -- ini "tempat" support/resistance itu sesungguhnya
        terbentuk (mis. c1 jam 2, c2 jam 3 -> c1_ts = jam 2).
-    2) KIRI: 5 candle sebelum c1 -- wick-nya (bukan cuma body) tidak boleh
-       melebihi level.
-    3) KANAN: 5 candle setelah c2 (c3 s/d c7) -- wick-nya (bukan cuma body)
-       tidak boleh menyentuh level SAMA SEKALI, semua 5 candle harus bersih.
+    2) KIRI: N_LEFT candle sebelum c1 -- wick-nya (bukan cuma body) tidak
+       boleh melebihi level.
+    3) KANAN: N_RIGHT candle setelah c2 -- wick-nya (bukan cuma body) tidak
+       boleh menyentuh level SAMA SEKALI, semua candle kanan harus bersih.
     4) WICK: c1 wajib punya wick sungguhan (beda dari body), dan wick c2
        (sisi yang sama) harus LEBIH PANJANG dari wick c1.
     Begitu semua syarat terpenuhi, level LANGSUNG AKTIF (confirm_ts = waktu
-    candle kanan terakhir, c7, selesai) -- tidak ada test/konfirmasi lagi.
+    candle kanan terakhir selesai) -- tidak ada test/konfirmasi lagi.
     confirm_ts dipakai untuk MULAI MEMANTAU harga (kapan bot boleh mulai
     approach/arm), sedangkan c1_ts murni menandakan kapan levelnya sendiri
     terbentuk di chart.
-    Entry: Short, di UJUNG WICK C1 (bukan c2, bukan body/level lagi).
+    Entry: Support -> Long, Resistance -> Short, di UJUNG WICK C1 (bukan c2,
+    bukan body/level lagi).
     """
     ts = df['ts'].values
     levels = find_levels(df)
@@ -365,9 +372,9 @@ def detect_snr_events(df):
     for lv in levels:
         level = lv['level']
         ty = lv['type']
-        kind = 'SNR_RESISTANCE'
-        direction = 'Short'
-        last_right_i = lv['c_right'][-1]   # candle kanan terakhir (c7) -- level aktif setelah ini selesai
+        kind = 'SNR_SUPPORT' if ty == 'support' else 'SNR_RESISTANCE'
+        direction = 'Long' if ty == 'support' else 'Short'
+        last_right_i = lv['c_right'][-1]   # candle kanan terakhir -- level aktif setelah ini selesai
         events.append({
             'kind': kind, 'type': ty, 'level': level, 'entry_price': lv['entry_price'],
             'direction': direction,
@@ -381,10 +388,9 @@ def detect_snr_events(df):
 
 
 def detect_all_events(df):
-    """Resistance MURNI (tanpa break) -- SNR_RESISTANCE (Short) saja.
-    Strategi Support sudah dihilangkan (find_levels tidak lagi
-    mendeteksi level support). Dedup: 2 event dgn (kind, level, confirm_ts)
-    SAMA PERSIS dianggap 1 sinyal yg sama -- ambil salah satu saja."""
+    """Support & Resistance MURNI (tanpa break) -- SNR_SUPPORT (Long) dan
+    SNR_RESISTANCE (Short). Dedup: 2 event dgn (kind, level, confirm_ts) SAMA
+    PERSIS dianggap 1 sinyal yg sama -- ambil salah satu saja."""
     events = detect_snr_events(df)
     seen = set()
     deduped = []
@@ -745,8 +751,7 @@ def per_symbol_breakdown(trades):
 
 
 def per_kind_breakdown(trades):
-    """Breakdown performa per JENIS level. Strategi Support sudah
-    dihilangkan, jadi seharusnya cuma ada 'SNR_RESISTANCE' di sini."""
+    """Breakdown performa per JENIS level: SNR_SUPPORT / SNR_RESISTANCE."""
     by_kind = {}
     for t in trades:
         k = t.get('kind', '?')
@@ -761,7 +766,7 @@ def per_kind_breakdown(trades):
         wr = d['win'] / d['n'] * 100 if d['n'] else 0
         rows.append({'kind': k, 'n': d['n'], 'win': d['win'], 'wr': wr,
                      'total_r': d['total_r'], 'total_pnl': d['total_pnl']})
-    order = {'SNR_RESISTANCE': 0}
+    order = {'SNR_SUPPORT': 0, 'SNR_RESISTANCE': 1}
     rows.sort(key=lambda r: order.get(r['kind'], 99))
     return rows
 
@@ -773,7 +778,7 @@ def per_kind_breakdown(trades):
 def _run():
     global _phase, _results, _kind_results, _per_coin_results, _all_trades, _combined_result
     try:
-        _log_msg(f"🚀 Mulai backtest SNR (Resistance murni, Support dihilangkan) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
+        _log_msg(f"🚀 Mulai backtest SNR (Support & Resistance murni) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
         _log_msg(f"   Entry=ujung wick c1 (syarat wick c2 > wick c1)  SL={SL_PCT*100:.2f}% fix dari entry (=1R)  "
                   f"Trailing: aktif di "
                   f"{TRAIL_ACTIVATE_R:.1f}R, jarak {TRAIL_STOP_R:.1f}R dari extreme  "
@@ -922,7 +927,7 @@ def _render_html() -> bytes:
 </style>
 </head>
 <body>
-  <h1>📊 Backtest SNR (Resistance Murni)</h1>
+  <h1>📊 Backtest SNR (Support & Resistance Murni)</h1>
   {status_html}
 
   <div class="cards">
@@ -935,15 +940,15 @@ def _render_html() -> bytes:
   </div>
 
   <div class="note">
-    💡 <b>Resistance MURNI</b> (strategi Support sudah dihilangkan, hanya arah Short yang
-    dipakai), basis body candle H1, TANPA konsep test/konfirmasi wick:
-    <br>• Level terbentuk dari c1 bullish → c2 bearish. KIRI: 5 candle sebelum c1, wick-nya
-    tidak boleh menembus level dari atas. KANAN: 5 candle setelah c2, wick-nya tidak boleh
-    menyentuh level SAMA SEKALI (semua 5 harus bersih).
-    <br>• Syarat wick: c1 wajib punya wick atas sungguhan (beda dari body), dan wick atas c2
-    harus LEBIH PANJANG dari wick c1. Kalau tidak terpenuhi, level gugur.
-    <br>• Begitu semua syarat terpenuhi → level LANGSUNG AKTIF → ENTRY (Short) di UJUNG WICK
-    C1 (bukan body/level lagi). Tiap level HANYA dipakai 1x.
+    💡 <b>Support & Resistance MURNI</b>, basis body candle H1, TANPA konsep test/konfirmasi
+    wick:
+    <br>• Level terbentuk dari c1+c2 (2 candle berlawanan arah). KIRI: {N_LEFT} candle sebelum
+    c1, wick-nya tidak boleh melewati level. KANAN: {N_RIGHT} candle setelah c2, wick-nya tidak
+    boleh menyentuh level SAMA SEKALI (semua candle kanan harus bersih).
+    <br>• Syarat wick: c1 wajib punya wick sungguhan (beda dari body), dan wick c2 (sisi yang
+    sama) harus LEBIH PANJANG dari wick c1. Kalau tidak terpenuhi, level gugur.
+    <br>• Begitu semua syarat terpenuhi → level LANGSUNG AKTIF → ENTRY (Support→Long,
+    Resistance→Short) di UJUNG WICK C1 (bukan body/level lagi). Tiap level HANYA dipakai 1x.
     <br>Level aktif dipantau via candle M5: masuk radius <b>{APPROACH_PCT*100:.1f}%</b> dari
     entry_price → limit dipasang persis di situ; kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}%
     sebelum fill → limit dicabut (level tetap hidup, bisa coba lagi). Kalau tersentuh SEBELUM
