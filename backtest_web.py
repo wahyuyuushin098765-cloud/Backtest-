@@ -123,13 +123,33 @@ CACHE_DIR = os.environ.get('CACHE_DIR', './data_cache')
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 # Semua koin yang dipakai bot.
+# Hasil backtest 1 tahun (Support & Resistance + EMA4/10 cross) -- hanya
+# koin dengan ROI% > 0 yang dipakai. 22 koin sisanya (ROI negatif/breakeven
+# di bawah FLOWUSDT -0.1%) tidak diikutkan lagi.
 SYMBOLS = [
-    'XPLUSDT', 'MNTUSDT', 'PLUMEUSDT', 'HYPEUSDT', 'BNBUSDT', 'BELUSDT', 'BERAUSDT', 'DASHUSDT',
-    'DOGEUSDT', 'USUALUSDT', 'TAOUSDT', 'ESPORTSUSDT', 'LABUSDT', 'HUSDT', 'AVAXUSDT', 'REUSDT',
-    '1000BONKUSDT', 'ORCAUSDT', 'AAVEUSDT', 'GMXUSDT', 'LTCUSDT', 'ICPUSDT', 'VIRTUALUSDT', 'CFXUSDT',
-    'UNIUSDT', 'ONDOUSDT', 'SUIUSDT', 'ALGOUSDT', 'HBARUSDT', 'EIGENUSDT', 'XRPUSDT', 'SOLUSDT',
-    'CRVUSDT', 'RENDERUSDT', 'XVGUSDT', 'SANDUSDT', 'AXSUSDT', 'IMXUSDT', 'FARTCOINUSDT', 'OPUSDT',
-    '1000PEPEUSDT', 'TIAUSDT', 'GALAUSDT', 'APEUSDT', 'FLOWUSDT',
+    'ESPORTSUSDT',    # +43.4%
+    'HBARUSDT',       # +21.3%
+    '1000BONKUSDT',   # +18.7%
+    'USUALUSDT',      # +16.8%
+    'HUSDT',          # +15.9%
+    'ICPUSDT',        # +15.3%
+    'VIRTUALUSDT',    # +13.4%
+    'ORCAUSDT',       # +11.7%
+    'FARTCOINUSDT',   # +11.3%
+    'IMXUSDT',        # +9.3%
+    'XPLUSDT',        # +6.5%
+    'LABUSDT',        # +6.1%
+    'AAVEUSDT',       # +5.9%
+    'HYPEUSDT',       # +3.9%
+    'ALGOUSDT',       # +3.4%
+    'MNTUSDT',        # +3.1%
+    'OPUSDT',         # +2.6%
+    'SUIUSDT',        # +2.5%
+    'PLUMEUSDT',      # +1.7%
+    'RENDERUSDT',     # +1.1%
+    'CRVUSDT',        # +0.5%
+    'TAOUSDT',        # +0.3%
+    'DOGEUSDT',       # +0.2%
 ]
 
 
