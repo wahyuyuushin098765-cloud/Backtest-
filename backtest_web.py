@@ -20,6 +20,13 @@ RINGKASAN STRATEGI
               TANPA syarat kiri sama sekali (candle sebelum c1 tidak dicek).
               TANPA syarat wick sama sekali -- c1/c2 boleh tidak punya wick
               (wick selevel dengan ujung body juga tidak masalah).
+            - EMA CROSS: candle c2 HARUS menjadi PENYEBAB cross EMA_FAST/
+              EMA_SLOW (default 4/10, dari close H1) yang searah dengan
+              arah level: Support -> GOLDEN CROSS di c2 (EMA4 <= EMA10 di
+              c1, lalu EMA4 > EMA10 di c2). Resistance -> DEATH CROSS di c2
+              (EMA4 >= EMA10 di c1, lalu EMA4 < EMA10 di c2). Kalau c2
+              bukan penyebab cross yang sesuai, level GUGUR dari awal
+              (tidak pernah terbentuk).
    'patokan' = LEVEL itu sendiri (ujung body c1, sama persis dengan 'level')
               -- dipakai sebagai acuan TEST1 di bawah.
 
@@ -266,6 +273,8 @@ def fetch_bybit_m5(symbol: str) -> pd.DataFrame:
 # DETEKSI LEVEL SUPPORT / RESISTANCE (H1)
 # ============================================================
 
+EMA_FAST = int(os.environ.get('EMA_FAST', 4))
+EMA_SLOW = int(os.environ.get('EMA_SLOW', 10))
 N_RIGHT = 1   # jumlah candle kanan yang harus bersih (tidak menyentuh wick) -- cukup c3 saja
 
 def find_levels(df):
@@ -276,6 +285,14 @@ def find_levels(df):
                   body) tidak boleh menyentuh level sama sekali.
     TIDAK ADA syarat wick lagi -- c1/c2 boleh sama sekali tidak punya wick
                   (wick selevel dengan ujung body juga tidak masalah).
+    Syarat EMA CROSS di candle c2 (EMA_FAST/EMA_SLOW, default 4/10 dari
+                  close H1): candle c2 HARUS menjadi penyebab cross yang
+                  searah dengan arah level:
+                  - Support -> GOLDEN CROSS di c2 (EMA4 dari <= EMA10 di c1
+                    jadi > EMA10 di c2).
+                  - Resistance -> DEATH CROSS di c2 (EMA4 dari >= EMA10 di
+                    c1 jadi < EMA10 di c2).
+                  Kalau c2 bukan penyebab cross yang sesuai, level GUGUR.
     'patokan' = LEVEL itu sendiri (ujung body candle c1, close[c1]) --
                   dipakai sebagai acuan test1/test2 (lihat detect_snr_events).
                   Sama persis dengan 'level'.
@@ -284,18 +301,22 @@ def find_levels(df):
     Return list dict: {'type', 'level', 'patokan', 'c1', 'c2', 'c_right'}."""
     o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     n = len(df)
+    ema_fast = pd.Series(c).ewm(span=EMA_FAST, adjust=False).mean().values
+    ema_slow = pd.Series(c).ewm(span=EMA_SLOW, adjust=False).mean().values
     levels = []
     for i in range(0, n - (1 + N_RIGHT)):   # cuma perlu c1,c2 + N_RIGHT candle kanan (c3)
+        golden_cross_c2 = ema_fast[i] <= ema_slow[i] and ema_fast[i + 1] > ema_slow[i + 1]
+        death_cross_c2  = ema_fast[i] >= ema_slow[i] and ema_fast[i + 1] < ema_slow[i + 1]
         if c[i] < o[i] and c[i + 1] > o[i + 1]:          # bearish lalu bullish -> support
             S = c[i]
             right_ok = all(l[i + 2 + k] > S + 1e-9 for k in range(N_RIGHT))
-            if right_ok:
+            if right_ok and golden_cross_c2:
                 levels.append({'type': 'support', 'level': S, 'patokan': S,
                                 'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
         if c[i] > o[i] and c[i + 1] < o[i + 1]:          # bullish lalu bearish -> resistance
             R = c[i]
             right_ok = all(h[i + 2 + k] < R - 1e-9 for k in range(N_RIGHT))
-            if right_ok:
+            if right_ok and death_cross_c2:
                 levels.append({'type': 'resistance', 'level': R, 'patokan': R,
                                 'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
     return levels
@@ -794,8 +815,9 @@ def per_kind_breakdown(trades):
 def _run():
     global _phase, _results, _kind_results, _per_coin_results, _all_trades, _combined_result
     try:
-        _log_msg(f"🚀 Mulai backtest SNR (Support & Resistance murni) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
-        _log_msg(f"   Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing)  "
+        _log_msg(f"🚀 Mulai backtest SNR (Support & Resistance + EMA{EMA_FAST}/{EMA_SLOW} cross) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
+        _log_msg(f"   Syarat: c2 wajib penyebab golden/death cross searah  "
+                  f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing)  "
                   f"SL={SL_PCT*100:.2f}% fix dari entry (=1R)  "
                   f"Trailing: aktif di "
                   f"{TRAIL_ACTIVATE_R:.1f}R, jarak {TRAIL_STOP_R:.1f}R dari extreme")
@@ -959,6 +981,9 @@ def _render_html() -> bytes:
     <br>• Level terbentuk dari c1+c2 (2 candle berlawanan arah). TANPA syarat kiri lagi --
     1 candle kanan (c3) yang wick-nya tidak boleh menyentuh level. TANPA syarat wick sama
     sekali (c1/c2 boleh tidak punya wick). <b>Patokan</b> = LEVEL itu sendiri (ujung body c1).
+    <br>• <b>Syarat EMA CROSS</b>: candle c2 wajib jadi PENYEBAB cross EMA{EMA_FAST}/EMA{EMA_SLOW}
+    (dari close H1) yang searah — Support → GOLDEN CROSS di c2, Resistance → DEATH CROSS di c2.
+    Kalau tidak, level gugur dari awal.
     <br>• <b>TEST1</b>: candle PERTAMA yang wick/body-nya menyentuh ATAU melebihi patokan
     (tersentuh persis di harga patokan juga valid, tidak wajib menembus). Tidak ada syarat
     arah candle.
