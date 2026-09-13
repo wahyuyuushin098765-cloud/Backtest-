@@ -14,31 +14,27 @@ RINGKASAN STRATEGI
    Resistance: candle c1 bullish (close>open) lalu c2 bearish (close<open).
             Level = close[c1].
    Kedua arah valid kalau:
-            - KANAN: N_RIGHT candle SETELAH c1,c2 (default 2, c3 & c4) --
+            - KANAN: N_RIGHT candle SETELAH c1,c2 (default 1, c3 saja) --
               WICK-nya tidak boleh menyentuh level SAMA SEKALI.
-            - WICK: c1 DAN c2 WAJIB sama-sama punya wick sungguhan (beda
-              dari body). TIDAK ADA lagi keharusan salah satu lebih panjang
-              -- boleh acak, c1 atau c2 yang lebih panjang, bebas.
               TANPA syarat kiri sama sekali (candle sebelum c1 tidak dicek).
-   'patokan' = ujung wick yang PALING PENDEK di antara c1/c2 (tip paling
-              dekat ke level) -- dipakai sebagai acuan TEST1 di bawah.
+              TANPA syarat wick sama sekali -- c1/c2 boleh tidak punya wick
+              (wick selevel dengan ujung body juga tidak masalah).
+   'patokan' = LEVEL itu sendiri (ujung body c1, sama persis dengan 'level')
+              -- dipakai sebagai acuan TEST1 di bawah.
 
-2) TEST1 -- candle PERTAMA yang wick/body-nya MELEBIHI patokan (support:
-   low < patokan; resistance: high > patokan; harus benar2 melebihi,
-   menyentuh persis di harga patokan TIDAK dihitung), APAPUN arahnya.
-   - Kalau candle breach pertama ini SEARAH arah trade (Support->bullish,
-     Resistance->bearish) -> lanjut ke TEST2.
-   - Kalau breach pertama ini SALAH ARAH -> level GUGUR PERMANEN saat itu
-     juga -- TIDAK mencari candle breach berikutnya lagi.
+2) TEST1 -- candle PERTAMA yang wick/body-nya MENYENTUH ATAU MELEBIHI
+   patokan (support: low <= patokan; resistance: high >= patokan). Tersentuh
+   persis di harga patokan juga VALID (tidak wajib menembus). TIDAK ADA
+   syarat arah candle -- candle apapun (bullish/bearish) sah jadi TEST1.
 
-3) TEST2 -- candle TEPAT SETELAH TEST1, harus:
-   - ENGULFING SEARAH: Support (Long): ujung body TEST2 (max(open,close))
-     harus LEBIH TINGGI dari HIGH candle TEST1 (ujung atas wick TEST1).
-     Resistance (Short): ujung body TEST2 (min(open,close)) harus LEBIH
-     RENDAH dari LOW candle TEST1 (ujung bawah wick TEST1).
-   - DAN candle TEST2 juga SEARAH arah trade (sama seperti syarat TEST1).
-   Kalau salah satu gagal -> level GUGUR (hanya dicoba SEKALI, tidak
-   dicari TEST1 berikutnya lagi).
+3) TEST2 -- candle TEPAT SETELAH TEST1, harus ENGULFING SEARAH:
+   Support (Long): ujung body TEST2 (max(open,close)) harus LEBIH TINGGI
+   dari HIGH candle TEST1 (ujung atas wick TEST1).
+   Resistance (Short): ujung body TEST2 (min(open,close)) harus LEBIH
+   RENDAH dari LOW candle TEST1 (ujung bawah wick TEST1).
+   TIDAK ADA syarat arah candle TEST2 secara terpisah -- cukup memenuhi
+   syarat engulfing di atas. Kalau gagal engulfing -> level GUGUR (hanya
+   dicoba SEKALI, tidak dicari TEST1 berikutnya lagi).
 
 4) ENTRY -- MARKET, persis begitu candle TEST2 closed. entry_price = close
    candle TEST2. Arah: Support -> Long, Resistance -> Short.
@@ -262,53 +258,37 @@ def fetch_bybit_m5(symbol: str) -> pd.DataFrame:
 # DETEKSI LEVEL SUPPORT / RESISTANCE (H1)
 # ============================================================
 
-N_RIGHT = 2   # jumlah candle kanan yang harus bersih (tidak menyentuh wick) -- c3 dan c4
+N_RIGHT = 1   # jumlah candle kanan yang harus bersih (tidak menyentuh wick) -- cukup c3 saja
 
 def find_levels(df):
     """Deteksi level Support & Resistance dari candle H1 (basis body candle).
-    TANPA syarat kiri lagi -- cukup c3 & c4 (2 candle tepat setelah c1,c2)
-    yang wick-nya tidak boleh menyentuh level.
-    Syarat kanan: N_RIGHT candle SETELAH c1,c2 (c3, c4) -- WICK-nya (bukan cuma
+    TANPA syarat kiri lagi -- cukup c3 (candle tepat setelah c1,c2) yang
+    wick-nya tidak boleh menyentuh level.
+    Syarat kanan: N_RIGHT candle SETELAH c1,c2 (c3) -- WICK-nya (bukan cuma
                   body) tidak boleh menyentuh level sama sekali.
-    Syarat wick c1 vs c2 (RANDOM, tidak ada urutan lagi):
-      - c1 WAJIB punya wick sungguhan -- ujung wick c1 tidak boleh sama
-        persis dengan ujung body c1 (mis. ujung body 0.1, ujung wick harus
-        beda, misal 0.09 -- bukan sama-sama 0.1). Kalau sama (tidak ada
-        wick), level GUGUR.
-      - c2 JUGA wajib punya wick sungguhan (syarat sama seperti c1).
-      - Tidak ada lagi keharusan salah satu lebih panjang dari yang lain --
-        boleh c1 lebih panjang dari c2, atau sebaliknya.
-    'patokan' = ujung wick yang PALING PENDEK di antara c1 dan c2 (yang
-                  tipnya PALING DEKAT ke level) -- dipakai sebagai acuan
-                  test1/test2 (lihat detect_snr_events).
-                  Support -> max(low[c1], low[c2]). Resistance -> min(high[c1], high[c2]).
-    'level' tetap = body candle c1 (close[c1]) -- dipakai untuk syarat
-                  validitas candle c3 (wick tidak boleh menyentuh level ini).
+    TIDAK ADA syarat wick lagi -- c1/c2 boleh sama sekali tidak punya wick
+                  (wick selevel dengan ujung body juga tidak masalah).
+    'patokan' = LEVEL itu sendiri (ujung body candle c1, close[c1]) --
+                  dipakai sebagai acuan test1/test2 (lihat detect_snr_events).
+                  Sama persis dengan 'level'.
+    'level' = body candle c1 (close[c1]) -- dipakai untuk syarat validitas
+                  candle c3 (wick tidak boleh menyentuh level ini).
     Return list dict: {'type', 'level', 'patokan', 'c1', 'c2', 'c_right'}."""
     o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     n = len(df)
     levels = []
-    WICK_EPS = 1e-9   # beda minimum supaya wick dianggap "ada" (tidak sama dgn body)
     for i in range(0, n - (1 + N_RIGHT)):   # cuma perlu c1,c2 + N_RIGHT candle kanan (c3)
         if c[i] < o[i] and c[i + 1] > o[i + 1]:          # bearish lalu bullish -> support
             S = c[i]
             right_ok = all(l[i + 2 + k] > S + 1e-9 for k in range(N_RIGHT))
-            lower_wick_c1 = c[i] - l[i]           # wick bawah c1 (bearish): close - low
-            lower_wick_c2 = o[i + 1] - l[i + 1]   # wick bawah c2 (bullish): open - low
-            wick_ok = (lower_wick_c1 > WICK_EPS) and (lower_wick_c2 > WICK_EPS)
-            if right_ok and wick_ok:
-                patokan = max(l[i], l[i + 1])   # wick TERPENDEK (tip paling dekat ke level)
-                levels.append({'type': 'support', 'level': S, 'patokan': patokan,
+            if right_ok:
+                levels.append({'type': 'support', 'level': S, 'patokan': S,
                                 'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
         if c[i] > o[i] and c[i + 1] < o[i + 1]:          # bullish lalu bearish -> resistance
             R = c[i]
             right_ok = all(h[i + 2 + k] < R - 1e-9 for k in range(N_RIGHT))
-            upper_wick_c1 = h[i] - c[i]          # wick atas c1 (bullish): high - close
-            upper_wick_c2 = h[i + 1] - o[i + 1]  # wick atas c2 (bearish): high - open
-            wick_ok = (upper_wick_c1 > WICK_EPS) and (upper_wick_c2 > WICK_EPS)
-            if right_ok and wick_ok:
-                patokan = min(h[i], h[i + 1])   # wick TERPENDEK (tip paling dekat ke level)
-                levels.append({'type': 'resistance', 'level': R, 'patokan': patokan,
+            if right_ok:
+                levels.append({'type': 'resistance', 'level': R, 'patokan': R,
                                 'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
     return levels
 
@@ -335,27 +315,22 @@ def detect_snr_events(df):
     utk tiap level yang terbentuk. Entry = MARKET, setelah engulfing terjadi.
 
     Urutan:
-    1) Level terbentuk (find_levels): c1+c2 (2 candle berlawanan arah), c3+c4
-       bersih (wick tidak menyentuh level). 'patokan' = ujung wick TERPENDEK
-       di antara c1/c2 (tip paling dekat ke level).
-    2) TEST1: mulai scan dari candle SETELAH c3/c4, cari candle PERTAMA yang
-       wick/body-nya MELEBIHI patokan (support: low < patokan; resistance:
-       high > patokan) -- harus benar2 melebihi, bukan cuma sama persis
-       dengan harga patokan. APAPUN arahnya candle ini:
-       - SEARAH dengan arah trade (Support->bullish, Resistance->bearish)
-         -> lanjut ke TEST2.
-       - SALAH ARAH -> level GUGUR PERMANEN saat itu juga, TIDAK mencari
-         candle breach berikutnya lagi.
-    3) TEST2: candle TEPAT SETELAH candle TEST1 -- harus:
-       - ENGULFING SEARAH:
-         Support (Long): ujung body candle TEST2 (max(open,close)) harus
-         LEBIH TINGGI dari ujung ATAS wick candle TEST1 (high candle TEST1).
-         Resistance (Short): ujung body candle TEST2 (min(open,close)) harus
-         LEBIH RENDAH dari ujung BAWAH wick candle TEST1 (low candle TEST1).
-       - DAN candle TEST2 juga SEARAH dengan arah trade (sama seperti syarat
-         TEST1: Support -> bullish, Resistance -> bearish).
-       Kalau salah satu syarat TEST2 gagal -> level GUGUR (hanya dicoba
-       SEKALI, tidak dicari TEST1 berikutnya lagi).
+    1) Level terbentuk (find_levels): c1+c2 (2 candle berlawanan arah), c3
+       bersih (wick tidak menyentuh level). 'patokan' = LEVEL itu sendiri
+       (ujung body c1, sama persis dengan 'level').
+    2) TEST1: mulai scan dari candle SETELAH c3, cari candle PERTAMA yang
+       wick/body-nya MENYENTUH ATAU MELEBIHI patokan (support: low <=
+       patokan; resistance: high >= patokan) -- tersentuh persis di harga
+       patokan juga VALID, tidak wajib menembus. TIDAK ADA syarat arah
+       candle.
+    3) TEST2: candle TEPAT SETELAH candle TEST1 -- harus ENGULFING SEARAH:
+       Support (Long): ujung body candle TEST2 (max(open,close)) harus
+       LEBIH TINGGI dari ujung ATAS wick candle TEST1 (high candle TEST1).
+       Resistance (Short): ujung body candle TEST2 (min(open,close)) harus
+       LEBIH RENDAH dari ujung BAWAH wick candle TEST1 (low candle TEST1).
+       TIDAK ADA syarat arah candle TEST2 secara terpisah. Kalau gagal
+       engulfing -> level GUGUR (hanya dicoba SEKALI, tidak dicari TEST1
+       berikutnya lagi).
     4) ENTRY: MARKET, begitu candle TEST2 closed. entry_price = close candle
        TEST2, entry_ts = waktu (ts) candle TEST2.
 
@@ -376,42 +351,33 @@ def detect_snr_events(df):
         ty = lv['type']
         patokan = lv['patokan']
         c1 = lv['c1']
-        last_right_i = lv['c_right'][-1]   # c4 -- confirm
+        last_right_i = lv['c_right'][-1]   # c3 -- confirm
 
-        # TEST1: candle PERTAMA yang MELEBIHI patokan (breach), apapun arahnya.
-        # Kalau breach pertama ini SEARAH trade -> lanjut ke TEST2.
-        # Kalau breach pertama ini SALAH ARAH -> level GUGUR PERMANEN, tidak
-        # lanjut mencari candle breach berikutnya.
+        # TEST1: candle PERTAMA yang menyentuh ATAU melebihi patokan (tersentuh
+        # persis di harga patokan juga VALID, tidak wajib menembus). Tidak ada
+        # syarat arah candle lagi -- candle apapun (bullish/bearish) sah jadi
+        # TEST1, langsung lanjut ke TEST2.
         test1_i = None
         for k in range(last_right_i + 1, n - 1):   # -1: butuh k+1 (TEST2) tersedia
             if ty == 'support':
-                breach = l[k] < patokan - WICK_EPS
+                touch = l[k] <= patokan + WICK_EPS
             else:
-                breach = h[k] > patokan + WICK_EPS
-            if breach:
+                touch = h[k] >= patokan - WICK_EPS
+            if touch:
                 test1_i = k
                 break
         if test1_i is None:
             continue   # belum pernah tersentuh sampai akhir data -> tidak ada sinyal
 
-        if ty == 'support':
-            same_dir = c[test1_i] > o[test1_i]   # bullish
-        else:
-            same_dir = c[test1_i] < o[test1_i]   # bearish
-        if not same_dir:
-            continue   # breach pertama SALAH ARAH -> level gugur permanen
-
         t2 = test1_i + 1
         if ty == 'support':
             body_top_t2 = max(o[t2], c[t2])
             engulf_ok = body_top_t2 > h[test1_i] + WICK_EPS
-            t2_same_dir = c[t2] > o[t2]   # bullish
         else:
             body_bottom_t2 = min(o[t2], c[t2])
             engulf_ok = body_bottom_t2 < l[test1_i] - WICK_EPS
-            t2_same_dir = c[t2] < o[t2]   # bearish
-        if not (engulf_ok and t2_same_dir):
-            continue   # TEST2 gagal (bukan engulfing dan/atau bukan searah) -> level gugur
+        if not engulf_ok:
+            continue   # TEST2 gagal engulfing -> level gugur
 
         kind = 'SNR_SUPPORT' if ty == 'support' else 'SNR_RESISTANCE'
         direction = 'Long' if ty == 'support' else 'Short'
@@ -941,18 +907,15 @@ def _render_html() -> bytes:
   <div class="note">
     💡 <b>Support & Resistance + TEST1/TEST2 (engulfing)</b>, basis body candle H1:
     <br>• Level terbentuk dari c1+c2 (2 candle berlawanan arah). TANPA syarat kiri lagi --
-    2 candle kanan (c3 & c4) yang wick-nya tidak boleh menyentuh level.
-    <br>• Syarat wick: c1 DAN c2 wajib sama-sama punya wick sungguhan (beda dari body) --
-    tidak ada lagi keharusan salah satu lebih panjang, boleh acak. <b>Patokan</b> = ujung wick
-    yang PALING PENDEK di antara c1/c2 (tip paling dekat ke level).
-    <br>• <b>TEST1</b>: candle PERTAMA yang wick/body-nya melebihi (bukan cuma menyentuh
-    persis) patokan, apapun arahnya. Kalau breach pertama ini SEARAH trade (Support→bullish,
-    Resistance→bearish) → lanjut ke TEST2. Kalau SALAH ARAH → level GUGUR PERMANEN saat itu
-    juga (tidak mencari breach berikutnya).
-    <br>• <b>TEST2</b>: candle TEPAT SETELAH TEST1 -- harus ENGULFING SEARAH (Support: ujung
-    body TEST2 harus lebih TINGGI dari high candle TEST1. Resistance: ujung body TEST2 harus
-    lebih RENDAH dari low candle TEST1) DAN candle-nya juga harus SEARAH trade. Kalau salah
-    satu gagal, level gugur (hanya dicoba 1x).
+    1 candle kanan (c3) yang wick-nya tidak boleh menyentuh level. TANPA syarat wick sama
+    sekali (c1/c2 boleh tidak punya wick). <b>Patokan</b> = LEVEL itu sendiri (ujung body c1).
+    <br>• <b>TEST1</b>: candle PERTAMA yang wick/body-nya menyentuh ATAU melebihi patokan
+    (tersentuh persis di harga patokan juga valid, tidak wajib menembus). Tidak ada syarat
+    arah candle.
+    <br>• <b>TEST2</b>: candle TEPAT SETELAH TEST1 -- harus ENGULFING (Support: ujung body
+    TEST2 harus lebih TINGGI dari high candle TEST1. Resistance: ujung body TEST2 harus lebih
+    RENDAH dari low candle TEST1). Tidak ada syarat arah candle terpisah. Kalau gagal
+    engulfing, level gugur (hanya dicoba 1x).
     <br>• <b>ENTRY</b>: MARKET, persis begitu candle TEST2 closed (harga = close candle TEST2).
     Tiap level HANYA dipakai 1x (test1+test2 cuma dicoba sekali).
     SL fix
