@@ -147,9 +147,8 @@ SYMBOLS = [
     'SUIUSDT',        # +2.5%
     'PLUMEUSDT',      # +1.7%
     'RENDERUSDT',     # +1.1%
-    'CRVUSDT',        # +0.5%
-    'TAOUSDT',        # +0.3%
-    'DOGEUSDT',       # +0.2%
+    'CRVUSDT'       # +0.5%
+    
 ]
 
 
