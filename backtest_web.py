@@ -20,13 +20,14 @@ RINGKASAN STRATEGI
               TANPA syarat kiri sama sekali (candle sebelum c1 tidak dicek).
               TANPA syarat wick sama sekali -- c1/c2 boleh tidak punya wick
               (wick selevel dengan ujung body juga tidak masalah).
-            - EMA CROSS: candle c2 HARUS menjadi PENYEBAB cross EMA_FAST/
-              EMA_SLOW (default 4/10, dari close H1) yang searah dengan
-              arah level: Support -> GOLDEN CROSS di c2 (EMA4 <= EMA10 di
-              c1, lalu EMA4 > EMA10 di c2). Resistance -> DEATH CROSS di c2
-              (EMA4 >= EMA10 di c1, lalu EMA4 < EMA10 di c2). Kalau c2
-              bukan penyebab cross yang sesuai, level GUGUR dari awal
-              (tidak pernah terbentuk).
+            - EMA CROSS: SALAH SATU dari candle c2, c3, atau c4 HARUS
+              menjadi PENYEBAB cross EMA_FAST/EMA_SLOW (default 4/10, dari
+              close H1) yang searah dengan arah level -- tidak harus persis
+              di c2, cukup terjadi di rentang c2-c4: Support -> GOLDEN
+              CROSS (EMA4 <= EMA10 di candle sebelumnya, lalu EMA4 > EMA10
+              di candle itu). Resistance -> DEATH CROSS (kebalikannya).
+              Kalau tidak ada satupun cross yang sesuai di c2-c4, level
+              GUGUR dari awal (tidak pernah terbentuk).
    'patokan' = LEVEL itu sendiri (ujung body c1, sama persis dengan 'level')
               -- dipakai sebagai acuan TEST1 di bawah.
 
@@ -126,29 +127,14 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Hasil backtest 1 tahun (Support & Resistance + EMA4/10 cross) -- hanya
 # koin dengan ROI% > 0 yang dipakai. 22 koin sisanya (ROI negatif/breakeven
 # di bawah FLOWUSDT -0.1%) tidak diikutkan lagi.
+# Semua koin yang dipakai bot.
 SYMBOLS = [
-    'ESPORTSUSDT',    # +43.4%
-    'HBARUSDT',       # +21.3%
-    '1000BONKUSDT',   # +18.7%
-    'USUALUSDT',      # +16.8%
-    'HUSDT',          # +15.9%
-    'ICPUSDT',        # +15.3%
-    'VIRTUALUSDT',    # +13.4%
-    'ORCAUSDT',       # +11.7%
-    'FARTCOINUSDT',   # +11.3%
-    'IMXUSDT',        # +9.3%
-    'XPLUSDT',        # +6.5%
-    'LABUSDT',        # +6.1%
-    'AAVEUSDT',       # +5.9%
-    'HYPEUSDT',       # +3.9%
-    'ALGOUSDT',       # +3.4%
-    'MNTUSDT',        # +3.1%
-    'OPUSDT',         # +2.6%
-    'SUIUSDT',        # +2.5%
-    'PLUMEUSDT',      # +1.7%
-    'RENDERUSDT',     # +1.1%
-    'CRVUSDT'       # +0.5%
-    
+    'XPLUSDT', 'MNTUSDT', 'PLUMEUSDT', 'HYPEUSDT', 'BNBUSDT', 'BELUSDT', 'BERAUSDT', 'DASHUSDT',
+    'DOGEUSDT', 'USUALUSDT', 'TAOUSDT', 'ESPORTSUSDT', 'LABUSDT', 'HUSDT', 'AVAXUSDT', 'REUSDT',
+    '1000BONKUSDT', 'ORCAUSDT', 'AAVEUSDT', 'GMXUSDT', 'LTCUSDT', 'ICPUSDT', 'VIRTUALUSDT', 'CFXUSDT',
+    'UNIUSDT', 'ONDOUSDT', 'SUIUSDT', 'ALGOUSDT', 'HBARUSDT', 'EIGENUSDT', 'XRPUSDT', 'SOLUSDT',
+    'CRVUSDT', 'RENDERUSDT', 'XVGUSDT', 'SANDUSDT', 'AXSUSDT', 'IMXUSDT', 'FARTCOINUSDT', 'OPUSDT',
+    '1000PEPEUSDT', 'TIAUSDT', 'GALAUSDT', 'APEUSDT', 'FLOWUSDT',
 ]
 
 
@@ -304,14 +290,16 @@ def find_levels(df):
                   body) tidak boleh menyentuh level sama sekali.
     TIDAK ADA syarat wick lagi -- c1/c2 boleh sama sekali tidak punya wick
                   (wick selevel dengan ujung body juga tidak masalah).
-    Syarat EMA CROSS di candle c2 (EMA_FAST/EMA_SLOW, default 4/10 dari
-                  close H1): candle c2 HARUS menjadi penyebab cross yang
-                  searah dengan arah level:
-                  - Support -> GOLDEN CROSS di c2 (EMA4 dari <= EMA10 di c1
-                    jadi > EMA10 di c2).
-                  - Resistance -> DEATH CROSS di c2 (EMA4 dari >= EMA10 di
-                    c1 jadi < EMA10 di c2).
-                  Kalau c2 bukan penyebab cross yang sesuai, level GUGUR.
+    Syarat EMA CROSS di RENTANG c2-c4 (EMA_FAST/EMA_SLOW, default 4/10 dari
+                  close H1): cukup SALAH SATU dari candle c2, c3, ATAU c4
+                  yang menjadi penyebab cross yang searah dengan arah level
+                  (tidak harus persis di c2 lagi):
+                  - Support -> GOLDEN CROSS di c2/c3/c4 (EMA4 dari <= EMA10
+                    di candle sebelumnya, jadi > EMA10 di candle itu).
+                  - Resistance -> DEATH CROSS di c2/c3/c4 (EMA4 dari >=
+                    EMA10 di candle sebelumnya, jadi < EMA10 di candle itu).
+                  Kalau tidak ada satupun cross yang sesuai di c2-c4, level
+                  GUGUR.
     'patokan' = LEVEL itu sendiri (ujung body candle c1, close[c1]) --
                   dipakai sebagai acuan test1/test2 (lihat detect_snr_events).
                   Sama persis dengan 'level'.
@@ -322,20 +310,27 @@ def find_levels(df):
     n = len(df)
     ema_fast = pd.Series(c).ewm(span=EMA_FAST, adjust=False).mean().values
     ema_slow = pd.Series(c).ewm(span=EMA_SLOW, adjust=False).mean().values
+
+    def golden_cross_at(j):   # cross TEPAT di index j (dibanding j-1)
+        return ema_fast[j - 1] <= ema_slow[j - 1] and ema_fast[j] > ema_slow[j]
+
+    def death_cross_at(j):
+        return ema_fast[j - 1] >= ema_slow[j - 1] and ema_fast[j] < ema_slow[j]
+
     levels = []
-    for i in range(0, n - (1 + N_RIGHT)):   # cuma perlu c1,c2 + N_RIGHT candle kanan (c3)
-        golden_cross_c2 = ema_fast[i] <= ema_slow[i] and ema_fast[i + 1] > ema_slow[i + 1]
-        death_cross_c2  = ema_fast[i] >= ema_slow[i] and ema_fast[i + 1] < ema_slow[i + 1]
+    for i in range(0, n - 3):   # perlu c1,c2,c3,c4 (i..i+3) semua ada di dalam data
+        golden_cross_c2_c4 = any(golden_cross_at(j) for j in (i + 1, i + 2, i + 3))
+        death_cross_c2_c4  = any(death_cross_at(j) for j in (i + 1, i + 2, i + 3))
         if c[i] < o[i] and c[i + 1] > o[i + 1]:          # bearish lalu bullish -> support
             S = c[i]
             right_ok = all(l[i + 2 + k] > S + 1e-9 for k in range(N_RIGHT))
-            if right_ok and golden_cross_c2:
+            if right_ok and golden_cross_c2_c4:
                 levels.append({'type': 'support', 'level': S, 'patokan': S,
                                 'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
         if c[i] > o[i] and c[i + 1] < o[i + 1]:          # bullish lalu bearish -> resistance
             R = c[i]
             right_ok = all(h[i + 2 + k] < R - 1e-9 for k in range(N_RIGHT))
-            if right_ok and death_cross_c2:
+            if right_ok and death_cross_c2_c4:
                 levels.append({'type': 'resistance', 'level': R, 'patokan': R,
                                 'c1': i, 'c2': i + 1, 'c_right': [i + 2 + k for k in range(N_RIGHT)]})
     return levels
@@ -835,7 +830,7 @@ def _run():
     global _phase, _results, _kind_results, _per_coin_results, _all_trades, _combined_result
     try:
         _log_msg(f"🚀 Mulai backtest SNR (Support & Resistance + EMA{EMA_FAST}/{EMA_SLOW} cross) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
-        _log_msg(f"   Syarat: c2 wajib penyebab golden/death cross searah  "
+        _log_msg(f"   Syarat: c2/c3/c4 (salah satu) wajib penyebab golden/death cross searah  "
                   f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing)  "
                   f"SL={SL_PCT*100:.2f}% fix dari entry (=1R)  "
                   f"Trailing: aktif di "
@@ -1000,9 +995,9 @@ def _render_html() -> bytes:
     <br>• Level terbentuk dari c1+c2 (2 candle berlawanan arah). TANPA syarat kiri lagi --
     1 candle kanan (c3) yang wick-nya tidak boleh menyentuh level. TANPA syarat wick sama
     sekali (c1/c2 boleh tidak punya wick). <b>Patokan</b> = LEVEL itu sendiri (ujung body c1).
-    <br>• <b>Syarat EMA CROSS</b>: candle c2 wajib jadi PENYEBAB cross EMA{EMA_FAST}/EMA{EMA_SLOW}
-    (dari close H1) yang searah — Support → GOLDEN CROSS di c2, Resistance → DEATH CROSS di c2.
-    Kalau tidak, level gugur dari awal.
+    <br>• <b>Syarat EMA CROSS</b>: salah satu dari candle c2, c3, atau c4 wajib jadi PENYEBAB
+    cross EMA{EMA_FAST}/EMA{EMA_SLOW} (dari close H1) yang searah — Support → GOLDEN CROSS,
+    Resistance → DEATH CROSS. Kalau tidak ada satupun di c2-c4, level gugur dari awal.
     <br>• <b>TEST1</b>: candle PERTAMA yang wick/body-nya menyentuh ATAU melebihi patokan
     (tersentuh persis di harga patokan juga valid, tidak wajib menembus). Tidak ada syarat
     arah candle.
