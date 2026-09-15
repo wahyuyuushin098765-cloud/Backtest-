@@ -130,21 +130,13 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Hasil backtest 1 tahun (S&R + EMA cross c2-c4 + TEST1/TEST2 engulfing) --
 # hanya koin dengan WIN RATE >= 50% yang dipakai (bukan filter ROI kali ini).
 SYMBOLS = [
-    'FARTCOINUSDT',   # WR 64.4%
-    '1000BONKUSDT',   # WR 59.6%
-    'HUSDT',          # WR 58.9%
-    'USUALUSDT',      # WR 57.6%
-    'IMXUSDT',        # WR 57.1%
-    'VIRTUALUSDT',    # WR 56.6%
-    'ICPUSDT',        # WR 54.7%
-    'LABUSDT',        # WR 54.5%
-    'HBARUSDT',       # WR 53.8%
-    'OPUSDT',         # WR 52.4%
-    'ESPORTSUSDT',    # WR 52.1%
-    'UNIUSDT',        # WR 51.4%
-    'PLUMEUSDT',      # WR 51.4%
-    'CRVUSDT',        # WR 51.4%
-    'BERAUSDT',       # WR 50.9%
+       'XPLUSDT', 'MNTUSDT', 'PLUMEUSDT', 'HYPEUSDT', 'BNBUSDT', 'BELUSDT', 'BERAUSDT', 'DASHUSDT',
+    'DOGEUSDT', 'USUALUSDT', 'TAOUSDT', 'ESPORTSUSDT', 'LABUSDT', 'HUSDT', 'AVAXUSDT', 'REUSDT',
+    '1000BONKUSDT', 'ORCAUSDT', 'AAVEUSDT', 'GMXUSDT', 'LTCUSDT', 'ICPUSDT', 'VIRTUALUSDT', 'CFXUSDT',
+    'UNIUSDT', 'ONDOUSDT', 'SUIUSDT', 'ALGOUSDT', 'HBARUSDT', 'EIGENUSDT', 'XRPUSDT', 'SOLUSDT',
+    'CRVUSDT', 'RENDERUSDT', 'XVGUSDT', 'SANDUSDT', 'AXSUSDT', 'IMXUSDT', 'FARTCOINUSDT', 'OPUSDT',
+    '1000PEPEUSDT', 'TIAUSDT', 'GALAUSDT', 'APEUSDT', 'FLOWUSDT', 'ADAUSDT', 'ARBUSDT', 'ACHUSDT',
+    'ANKRUSDT', '1000FLOKIUSDT'
 ]
 
 
