@@ -53,7 +53,10 @@ RINGKASAN STRATEGI
    Kalau harga menjauh lagi >2% sebelum tersentuh, limit disarm (balik ke
    waiting, tetap hidup, bisa armed lagi kalau mendekat lagi). GTC, tidak
    ada batas waktu.
-   SL = SL_PCT (default 1% = 1R) dari harga entry, arah berlawanan dari entry.
+   SL = ADAPTIF, dipasang di ujung wick candle TEST2 (candle engulfing):
+   Long -> low candle TEST2, Short -> high candle TEST2. Kalau jarak yg
+   dihasilkan < SL_MIN_PCT (default 0.3%) dari entry, diperbesar (floor)
+   jadi SL_MIN_PCT supaya tidak kena noise/wick tipis.
    TRAILING STOP: begitu profit capai TRAIL_ACTIVATE_R (default 3R), trailing
    aktif -- SL lalu mengikuti TRAIL_STOP_R (default 1R) di belakang harga
    tertinggi/terendah yang pernah dicapai (dipantau M5), SL cuma boleh
@@ -91,7 +94,7 @@ RISK_PCT         = float(os.environ.get('RISK_PCT', '0.01'))          # risk 1% 
 FEE_ENTRY_PCT    = float(os.environ.get('FEE_ENTRY_PCT', '0.00055'))
 FEE_EXIT_PCT     = float(os.environ.get('FEE_EXIT_PCT', str(0.00055 * 3)))
 
-SL_PCT           = float(os.environ.get('SL_PCT', '0.01'))            # SL fix 1% dari entry (=1R)
+SL_MIN_PCT       = float(os.environ.get('SL_MIN_PCT', '0.003'))       # SL ADAPTIF: dipasang di wick candle TEST2 (engulfing), tapi jarak minimum 0.3% dari entry (floor kalau wick-nya kecil)
 APPROACH_PCT     = float(os.environ.get('APPROACH_PCT', '0.02'))       # limit baru AKTIF (armed) kalau harga sudah dlm radius 2% dari entry_price
 TRAIL_ACTIVATE_R = float(os.environ.get('TRAIL_ACTIVATE_R', '3.0'))    # trailing aktif begitu profit capai 3R
 TRAIL_STOP_R     = float(os.environ.get('TRAIL_STOP_R', '1.0'))       # setelah aktif, SL mengikuti 1R di belakang harga tertinggi/terendah
@@ -440,12 +443,25 @@ def detect_snr_events(df):
         # Entry LIMIT di ujung wick candle TEST1: Long -> high (ujung atas),
         # Short -> low (ujung bawah).
         entry_price = float(h[test1_i]) if direction == 'Long' else float(l[test1_i])
+        # SL ADAPTIF (menyesuaikan market, bukan fix %): dipasang di ujung
+        # wick candle TEST2 (candle engulfing) -- Long -> low candle t2
+        # (ujung bawah), Short -> high candle t2 (ujung atas). Kalau jarak
+        # SL yg dihasilkan < SL_MIN_PCT dari entry, diperbesar (floor) jadi
+        # SL_MIN_PCT supaya tidak kena noise/wick tipis.
+        if direction == 'Long':
+            sl_raw = float(l[t2])
+            min_sl_dist = entry_price * SL_MIN_PCT
+            sl_price = min(sl_raw, entry_price - min_sl_dist)   # makin jauh ke bawah = makin lebar
+        else:
+            sl_raw = float(h[t2])
+            min_sl_dist = entry_price * SL_MIN_PCT
+            sl_price = max(sl_raw, entry_price + min_sl_dist)   # makin jauh ke atas = makin lebar
         expire_idx = t2 + EXPIRE_CANDLES
         expire_ts = int(ts[expire_idx]) if expire_idx < n else None   # None = data habis, tidak bisa dicek expiry
         events.append({
             'kind': kind, 'type': ty, 'level': level, 'patokan': patokan,
             'direction': direction,
-            'entry_price': entry_price, 'ready_ts': int(ts[t2]),
+            'entry_price': entry_price, 'sl_price': sl_price, 'ready_ts': int(ts[t2]),
             'test1_ts': int(ts[test1_i]),
             'confirm_ts': int(ts[last_right_i]),
             'c1_ts': int(ts[c1]),
@@ -548,11 +564,8 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
     def open_trade(symbol, ev, entry_price, entry_ts):
         nonlocal balance, total_margin_used
         direction = ev['direction']
-        if direction == 'Short':
-            sl = entry_price * (1 + SL_PCT)
-        else:
-            sl = entry_price * (1 - SL_PCT)
-        dist = abs(entry_price - sl)   # = 1R (fix, SL_PCT)
+        sl = ev['sl_price']
+        dist = abs(entry_price - sl)   # = 1R (adaptif, wick TEST2, floor SL_MIN_PCT)
 
         risk_amount = balance * RISK_PCT
         raw_qty = risk_amount / dist if dist > 0 else 0
@@ -852,7 +865,7 @@ def _run():
         _log_msg(f"🚀 Mulai backtest SNR (Support & Resistance + EMA{EMA_FAST}/{EMA_SLOW} cross) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
         _log_msg(f"   Syarat: c2/c3/c4 (salah satu) wajib penyebab golden/death cross searah  "
                   f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing)  "
-                  f"SL={SL_PCT*100:.2f}% fix dari entry (=1R)  "
+                  f"SL=adaptif di wick TEST2 (engulfing), min {SL_MIN_PCT*100:.2f}% dari entry  "
                   f"Trailing: aktif di "
                   f"{TRAIL_ACTIVATE_R:.1f}R, jarak {TRAIL_STOP_R:.1f}R dari extreme")
 
@@ -1035,8 +1048,8 @@ def _render_html() -> bytes:
     tidak PERNAH tersentuh (baik masih menunggu maupun sudah armed) → setup GUGUR, dibuang
     permanen.
     Tiap level HANYA dipakai 1x (test1+test2 cuma dicoba sekali).
-    SL fix
-    <b>{SL_PCT*100:.2f}%</b> dari entry (=1R). <b>Trailing stop</b>: aktif begitu profit
+    SL adaptif (wick candle TEST2/engulfing), minimum
+    <b>{SL_MIN_PCT*100:.2f}%</b> dari entry (=1R). <b>Trailing stop</b>: aktif begitu profit
     capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti <b>{TRAIL_STOP_R:.1f}R</b> di
     belakang harga tertinggi/terendah yang pernah dicapai (dipantau M5). Level MATI setelah
     1x terisi (menang/kalah).
