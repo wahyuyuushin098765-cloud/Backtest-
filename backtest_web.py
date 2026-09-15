@@ -4,10 +4,8 @@ backtest_snr.py — Backtest strategi Support & Resistance + TEST1/TEST2 (engulf
 Level Support/Resistance dari 2 candle berlawanan arah (c1,c2), dikonfirmasi
 1 candle kanan bersih (c3). Setelah itu MENUNGGU harga menyentuh "patokan"
 (level itu sendiri), lalu cek candle berikutnya apakah ENGULFING. Kalau ya
--> pasang LIMIT di ujung wick candle TEST1, tunggu tersentuh. Kalau TEST2
-gagal engulfing tapi tidak break level, level tetap hidup dan dicoba lagi
-(test1/test2 baru); level mati permanen begitu di-FILL 1x (tidak ada
-re-entry) atau begitu closenya break level.
+-> pasang LIMIT di ujung wick candle TEST1, tunggu tersentuh. Tiap level
+HANYA dicoba 1x (tidak ada re-entry).
 
 RINGKASAN STRATEGI
 -------------------
@@ -44,10 +42,8 @@ RINGKASAN STRATEGI
    Resistance (Short): ujung body TEST2 (min(open,close)) harus LEBIH
    RENDAH dari LOW candle TEST1 (ujung bawah wick TEST1).
    TIDAK ADA syarat arah candle sama sekali (baik TEST1 maupun TEST2).
-   Kalau gagal engulfing TAPI closenya TIDAK break level -> level TETAP
-   HIDUP, lanjut cari TEST1 baru mulai dari candle setelah TEST2 yang gagal
-   itu (bisa dicoba berkali-kali). Level baru GUGUR PERMANEN begitu ada
-   candle yang CLOSE-nya break (menembus ke seberang) level.
+   Kalau gagal engulfing -> level GUGUR (hanya dicoba SEKALI, tidak dicari
+   TEST1 berikutnya lagi).
 
 4) ENTRY -- LIMIT, di UJUNG WICK candle TEST1: Long -> high candle TEST1
    (ujung atas). Short -> low candle TEST1 (ujung bawah). Limit ini baru
@@ -131,9 +127,24 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Hasil backtest 1 tahun (Support & Resistance + EMA4/10 cross) -- hanya
 # koin dengan ROI% > 0 yang dipakai. 22 koin sisanya (ROI negatif/breakeven
 # di bawah FLOWUSDT -0.1%) tidak diikutkan lagi.
-# Semua koin yang dipakai bot.
+# Hasil backtest 1 tahun (S&R + EMA cross c2-c4 + TEST1/TEST2 engulfing) --
+# hanya koin dengan WIN RATE >= 50% yang dipakai (bukan filter ROI kali ini).
 SYMBOLS = [
-    'ESPORTSUSDT', 'HUSDT', 'LABUSDT', '1000BONKUSDT', 'USUALUSDT', 'VIRTUALUSDT', 'FARTCOINUSDT', 'IMXUSDT', 'ICPUSDT', 'OPUSDT', 'HBARUSDT', 'BERAUSDT', 'UNIUSDT', 'PLUMEUSDT', 'CRVUSDT'
+    'FARTCOINUSDT',   # WR 64.4%
+    '1000BONKUSDT',   # WR 59.6%
+    'HUSDT',          # WR 58.9%
+    'USUALUSDT',      # WR 57.6%
+    'IMXUSDT',        # WR 57.1%
+    'VIRTUALUSDT',    # WR 56.6%
+    'ICPUSDT',        # WR 54.7%
+    'LABUSDT',        # WR 54.5%
+    'HBARUSDT',       # WR 53.8%
+    'OPUSDT',         # WR 52.4%
+    'ESPORTSUSDT',    # WR 52.1%
+    'UNIUSDT',        # WR 51.4%
+    'PLUMEUSDT',      # WR 51.4%
+    'CRVUSDT',        # WR 51.4%
+    'BERAUSDT',       # WR 50.9%
 ]
 
 
@@ -177,6 +188,7 @@ _combined_result = {
     'n_trades': 0, 'n_win': 0, 'n_loss': 0, 'wr': 0, 'total_pnl': 0, 'roi': 0,
     'total_r': 0, 'avg_r': 0, 'final_balance': INITIAL_BALANCE,
     'blocked_by_slot': 0, 'blocked_by_margin': 0, 'blocked_by_min_order': 0, 'blocked_by_invalid_sl': 0,
+    'expired_count': 0,
 }
 
 
@@ -280,6 +292,7 @@ def fetch_bybit_m5(symbol: str) -> pd.DataFrame:
 EMA_FAST = int(os.environ.get('EMA_FAST', 4))
 EMA_SLOW = int(os.environ.get('EMA_SLOW', 10))
 N_RIGHT = 1   # jumlah candle kanan yang harus bersih (tidak menyentuh wick) -- cukup c3 saja
+EXPIRE_CANDLES = 4   # level kadaluarsa kalau limit tak tersentuh dlm N candle H1 setelah TEST2
 
 def find_levels(df):
     """Deteksi level Support & Resistance dari candle H1 (basis body candle).
@@ -371,20 +384,21 @@ def detect_snr_events(df):
        Resistance (Short): ujung body candle TEST2 (min(open,close)) harus
        LEBIH RENDAH dari ujung BAWAH wick candle TEST1 (low candle TEST1).
        TIDAK ADA syarat arah candle TEST2 secara terpisah. Kalau gagal
-       engulfing TAPI close candle TEST2 TIDAK break level -> level TETAP
-       HIDUP, lanjut cari TEST1 baru mulai dari candle setelah TEST2 yang
-       gagal itu (bisa berkali-kali). Level GUGUR PERMANEN begitu ada
-       candle yang close-nya break (menembus ke seberang) level.
+       engulfing -> level GUGUR (hanya dicoba SEKALI, tidak dicari TEST1
+       berikutnya lagi).
     4) ENTRY: LIMIT, di harga UJUNG WICK candle TEST1: Long -> high candle
        TEST1 (ujung atas). Short -> low candle TEST1 (ujung bawah). Limit
        baru RESMI ARMED begitu harga M5 masuk radius APPROACH_PCT (default
-       2%) dari entry_price, lalu ditunggu sampai TERSENTUH (fill). GTC,
-       tidak ada batas waktu.
+       2%) dari entry_price, lalu ditunggu sampai TERSENTUH (fill).
+    5) KADALUARSA: kalau dalam EXPIRE_CANDLES (default 4) candle H1 SETELAH
+       TEST2, limit tidak PERNAH tersentuh (baik masih waiting maupun sudah
+       armed) -> setup GUGUR (dibuang, tidak ditunggu lagi).
 
     Return list dict:
     {'kind': 'SNR_SUPPORT'/'SNR_RESISTANCE', 'type': support/resistance,
      'level': harga body c1, 'patokan', 'direction': Long/Short,
-     'entry_price', 'ready_ts', 'test1_ts', 'confirm_ts', 'c1_ts', 'c1', 'c2'}
+     'entry_price', 'ready_ts', 'expire_ts', 'test1_ts', 'confirm_ts',
+     'c1_ts', 'c1', 'c2'}
     """
     o = df['open'].values; h = df['high'].values; l = df['low'].values; c = df['close'].values
     ts = df['ts'].values
@@ -400,57 +414,39 @@ def detect_snr_events(df):
         c1 = lv['c1']
         last_right_i = lv['c_right'][-1]   # c3 -- confirm
 
-        # TEST1/TEST2 bisa dicoba BERULANG KALI untuk level yang sama, selama
-        # belum ada candle yang BODY-nya (close) BREAK (menembus ke seberang)
-        # level. Kalau TEST2 gagal engulfing tapi tidak ada body break, level
-        # TETAP HIDUP -- lanjut cari TEST1 baru mulai dari candle SETELAH
-        # TEST2 yang gagal itu (bukan TEST2 yang gagal itu sendiri). Level
-        # baru GUGUR PERMANEN begitu ada candle yang close-nya break level.
+        # TEST1: candle PERTAMA yang menyentuh ATAU melebihi patokan (tersentuh
+        # persis di harga patokan juga VALID, tidak wajib menembus). Tidak ada
+        # syarat arah candle lagi -- candle apapun (bullish/bearish) sah jadi
+        # TEST1, langsung lanjut ke TEST2.
         test1_i = None
-        engulf_ok = False
-        scan_from = last_right_i + 1
-        while True:
-            found_i = None
-            for k in range(scan_from, n - 1):   # -1: butuh k+1 (TEST2) tersedia
-                if ty == 'support':
-                    touch = l[k] <= patokan + WICK_EPS
-                else:
-                    touch = h[k] >= patokan - WICK_EPS
-                if touch:
-                    found_i = k
-                    break
-            if found_i is None:
-                test1_i = None
-                break   # belum pernah tersentuh lagi sampai akhir data -> tidak ada sinyal
-
-            t2 = found_i + 1
+        for k in range(last_right_i + 1, n - 1):   # -1: butuh k+1 (TEST2) tersedia
             if ty == 'support':
-                body_top_t2 = max(o[t2], c[t2])
-                engulf_ok = body_top_t2 > h[found_i] + WICK_EPS
-                broke = c[t2] < level - WICK_EPS   # close TEST2 break ke bawah level
+                touch = l[k] <= patokan + WICK_EPS
             else:
-                body_bottom_t2 = min(o[t2], c[t2])
-                engulf_ok = body_bottom_t2 < l[found_i] - WICK_EPS
-                broke = c[t2] > level + WICK_EPS   # close TEST2 break ke atas level
-
-            if engulf_ok:
-                test1_i = found_i
-                break   # TEST2 sukses engulfing -> lanjut ke ENTRY
-            if broke:
-                test1_i = None
-                break   # body TEST2 break level -> level gugur PERMANEN
-            # TEST2 gagal engulfing tapi TIDAK break -> level tetap hidup,
-            # cari TEST1 baru mulai dari candle setelah TEST2 yang gagal ini.
-            scan_from = t2 + 1
-
+                touch = h[k] >= patokan - WICK_EPS
+            if touch:
+                test1_i = k
+                break
         if test1_i is None:
-            continue
+            continue   # belum pernah tersentuh sampai akhir data -> tidak ada sinyal
+
+        t2 = test1_i + 1
+        if ty == 'support':
+            body_top_t2 = max(o[t2], c[t2])
+            engulf_ok = body_top_t2 > h[test1_i] + WICK_EPS
+        else:
+            body_bottom_t2 = min(o[t2], c[t2])
+            engulf_ok = body_bottom_t2 < l[test1_i] - WICK_EPS
+        if not engulf_ok:
+            continue   # TEST2 gagal engulfing -> level gugur
 
         kind = 'SNR_SUPPORT' if ty == 'support' else 'SNR_RESISTANCE'
         direction = 'Long' if ty == 'support' else 'Short'
         # Entry LIMIT di ujung wick candle TEST1: Long -> high (ujung atas),
         # Short -> low (ujung bawah).
         entry_price = float(h[test1_i]) if direction == 'Long' else float(l[test1_i])
+        expire_idx = t2 + EXPIRE_CANDLES
+        expire_ts = int(ts[expire_idx]) if expire_idx < n else None   # None = data habis, tidak bisa dicek expiry
         events.append({
             'kind': kind, 'type': ty, 'level': level, 'patokan': patokan,
             'direction': direction,
@@ -458,6 +454,7 @@ def detect_snr_events(df):
             'test1_ts': int(ts[test1_i]),
             'confirm_ts': int(ts[last_right_i]),
             'c1_ts': int(ts[c1]),
+            'expire_ts': expire_ts,
             'c1': lv['c1'], 'c2': lv['c2'],
         })
 
@@ -655,13 +652,18 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
 
         # 2) limit live simbol ini: waiting (belum dlm radius 2%) -> armed
         #    (sudah dlm radius 2%, limit resmi terpasang) -> tersentuh (fill).
-        #    GTC, tidak ada expiry/invalidasi.
+        #    KADALUARSA: kalau now_ts >= expire_ts (EXPIRE_CANDLES candle H1
+        #    setelah TEST2) dan belum pernah tersentuh -> setup gugur, dibuang.
         cp = coins[symbol]
         live_idxs = live_levels_by_symbol.get(symbol)
         if live_idxs:
             still_live = []
             for idx in live_idxs:
                 ev = cp['events'][idx]
+                expire_ts = ev.get('expire_ts')
+                if expire_ts is not None and now_ts >= expire_ts:
+                    nonlocal_blocks['expired'] += 1
+                    continue   # kadaluarsa -> dibuang, tidak pernah dicoba lagi
                 entry_price = ev['entry_price']
                 st = level_state[(symbol, idx)]
                 dist_pct = abs(close_p - entry_price) / entry_price
@@ -684,7 +686,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
                         still_live.append(idx)
             live_levels_by_symbol[symbol] = still_live
 
-    nonlocal_blocks = {'slot': 0, 'margin': 0, 'min_order': 0, 'invalid_sl': 0}
+    nonlocal_blocks = {'slot': 0, 'margin': 0, 'min_order': 0, 'invalid_sl': 0, 'expired': 0}
 
     # ── TIMELINE EFISIEN via K-WAY MERGE (pointer index, bukan searchsorted) ──
     # Tiap simbol punya pointer int ke posisi candle M5 berikutnya yg BELUM
@@ -759,6 +761,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
     blocked_by_margin = nonlocal_blocks['margin']
     blocked_by_min_order = nonlocal_blocks['min_order']
     blocked_by_invalid_sl = nonlocal_blocks['invalid_sl']
+    expired_count = nonlocal_blocks['expired']
 
     n_trades = len(trades)
     n_win = sum(1 for t in trades if t['pnl_usd'] > 0)
@@ -775,6 +778,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
         'final_balance': balance, 'roi': roi,
         'blocked_by_slot': blocked_by_slot, 'blocked_by_margin': blocked_by_margin,
         'blocked_by_min_order': blocked_by_min_order, 'blocked_by_invalid_sl': blocked_by_invalid_sl,
+        'expired_count': expired_count,
     }
 
 
@@ -901,6 +905,7 @@ def _run():
                 'blocked_by_margin': result['blocked_by_margin'],
                 'blocked_by_min_order': result['blocked_by_min_order'],
                 'blocked_by_invalid_sl': result['blocked_by_invalid_sl'],
+                'expired_count': result['expired_count'],
             })
             _results[:] = per_symbol_breakdown(result['trades'])
             _kind_results[:] = per_kind_breakdown(result['trades'])
@@ -1024,17 +1029,17 @@ def _render_html() -> bytes:
     arah candle.
     <br>• <b>TEST2</b>: candle TEPAT SETELAH TEST1 -- harus ENGULFING (Support: ujung body
     TEST2 harus lebih TINGGI dari high candle TEST1. Resistance: ujung body TEST2 harus lebih
-    RENDAH dari low candle TEST1). Tidak ada syarat arah candle terpisah. Kalau gagal engulfing
-    TAPI close-nya TIDAK break level, level TETAP HIDUP -- lanjut cari TEST1 baru (bisa
-    berkali-kali). Level gugur PERMANEN hanya kalau ada candle yang close-nya break level.
+    RENDAH dari low candle TEST1). Tidak ada syarat arah candle terpisah. Kalau gagal
+    engulfing, level gugur (hanya dicoba 1x).
     <br>• <b>ENTRY</b>: LIMIT di UJUNG WICK candle TEST1 (Long → high candle TEST1, Short →
     low candle TEST1). Limit baru RESMI ARMED begitu harga M5 masuk radius
     <b>{APPROACH_PCT*100:.1f}%</b> dari entry_price, lalu ditunggu sampai TERSENTUH (fill).
     Kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}% sebelum tersentuh, limit disarm (balik
-    menunggu, tetap hidup). GTC, tidak ada batas waktu.
-    Level tetap hidup untuk test1/test2 berulang kali selama belum ada
-    body (close) candle yang break level; sekali FILLED, level mati (tidak
-    re-entry).
+    menunggu, tetap hidup).
+    <br>• <b>KADALUARSA</b>: kalau dalam <b>{EXPIRE_CANDLES}</b> candle H1 setelah TEST2, limit
+    tidak PERNAH tersentuh (baik masih menunggu maupun sudah armed) → setup GUGUR, dibuang
+    permanen.
+    Tiap level HANYA dipakai 1x (test1+test2 cuma dicoba sekali).
     SL fix
     <b>{SL_PCT*100:.2f}%</b> dari entry (=1R). <b>Trailing stop</b>: aktif begitu profit
     capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti <b>{TRAIL_STOP_R:.1f}R</b> di
@@ -1042,7 +1047,8 @@ def _render_html() -> bytes:
     1x terisi (menang/kalah).
     <br>⚙️ Risk {RISK_PCT*100:.0f}% dari balance (compounding). Slot maksimum: {_fmt_max_concurrent()}.
     Sinyal terblokir — slot: {cr.get('blocked_by_slot',0)}, margin: {cr.get('blocked_by_margin',0)},
-    min order: {cr.get('blocked_by_min_order',0)}.
+    min order: {cr.get('blocked_by_min_order',0)}. Kadaluarsa (limit tak tersentuh
+    {EXPIRE_CANDLES} candle): {cr.get('expired_count',0)}.
     <br>Unduh semua trade: <a href="/trades.csv">/trades.csv</a> &nbsp;|&nbsp;
     Log mentah: <a href="/logs">/logs</a>
   </div>
