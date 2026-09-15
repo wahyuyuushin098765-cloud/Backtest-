@@ -4,8 +4,10 @@ backtest_snr.py — Backtest strategi Support & Resistance + TEST1/TEST2 (engulf
 Level Support/Resistance dari 2 candle berlawanan arah (c1,c2), dikonfirmasi
 1 candle kanan bersih (c3). Setelah itu MENUNGGU harga menyentuh "patokan"
 (level itu sendiri), lalu cek candle berikutnya apakah ENGULFING. Kalau ya
--> pasang LIMIT di ujung wick candle TEST1, tunggu tersentuh. Tiap level
-HANYA dicoba 1x (tidak ada re-entry).
+-> pasang LIMIT di ujung wick candle TEST1, tunggu tersentuh. Kalau TEST2
+gagal engulfing tapi tidak break level, level tetap hidup dan dicoba lagi
+(test1/test2 baru); level mati permanen begitu di-FILL 1x (tidak ada
+re-entry) atau begitu closenya break level.
 
 RINGKASAN STRATEGI
 -------------------
@@ -42,8 +44,10 @@ RINGKASAN STRATEGI
    Resistance (Short): ujung body TEST2 (min(open,close)) harus LEBIH
    RENDAH dari LOW candle TEST1 (ujung bawah wick TEST1).
    TIDAK ADA syarat arah candle sama sekali (baik TEST1 maupun TEST2).
-   Kalau gagal engulfing -> level GUGUR (hanya dicoba SEKALI, tidak dicari
-   TEST1 berikutnya lagi).
+   Kalau gagal engulfing TAPI closenya TIDAK break level -> level TETAP
+   HIDUP, lanjut cari TEST1 baru mulai dari candle setelah TEST2 yang gagal
+   itu (bisa dicoba berkali-kali). Level baru GUGUR PERMANEN begitu ada
+   candle yang CLOSE-nya break (menembus ke seberang) level.
 
 4) ENTRY -- LIMIT, di UJUNG WICK candle TEST1: Long -> high candle TEST1
    (ujung atas). Short -> low candle TEST1 (ujung bawah). Limit ini baru
@@ -367,8 +371,10 @@ def detect_snr_events(df):
        Resistance (Short): ujung body candle TEST2 (min(open,close)) harus
        LEBIH RENDAH dari ujung BAWAH wick candle TEST1 (low candle TEST1).
        TIDAK ADA syarat arah candle TEST2 secara terpisah. Kalau gagal
-       engulfing -> level GUGUR (hanya dicoba SEKALI, tidak dicari TEST1
-       berikutnya lagi).
+       engulfing TAPI close candle TEST2 TIDAK break level -> level TETAP
+       HIDUP, lanjut cari TEST1 baru mulai dari candle setelah TEST2 yang
+       gagal itu (bisa berkali-kali). Level GUGUR PERMANEN begitu ada
+       candle yang close-nya break (menembus ke seberang) level.
     4) ENTRY: LIMIT, di harga UJUNG WICK candle TEST1: Long -> high candle
        TEST1 (ujung atas). Short -> low candle TEST1 (ujung bawah). Limit
        baru RESMI ARMED begitu harga M5 masuk radius APPROACH_PCT (default
@@ -394,31 +400,51 @@ def detect_snr_events(df):
         c1 = lv['c1']
         last_right_i = lv['c_right'][-1]   # c3 -- confirm
 
-        # TEST1: candle PERTAMA yang menyentuh ATAU melebihi patokan (tersentuh
-        # persis di harga patokan juga VALID, tidak wajib menembus). Tidak ada
-        # syarat arah candle lagi -- candle apapun (bullish/bearish) sah jadi
-        # TEST1, langsung lanjut ke TEST2.
+        # TEST1/TEST2 bisa dicoba BERULANG KALI untuk level yang sama, selama
+        # belum ada candle yang BODY-nya (close) BREAK (menembus ke seberang)
+        # level. Kalau TEST2 gagal engulfing tapi tidak ada body break, level
+        # TETAP HIDUP -- lanjut cari TEST1 baru mulai dari candle SETELAH
+        # TEST2 yang gagal itu (bukan TEST2 yang gagal itu sendiri). Level
+        # baru GUGUR PERMANEN begitu ada candle yang close-nya break level.
         test1_i = None
-        for k in range(last_right_i + 1, n - 1):   # -1: butuh k+1 (TEST2) tersedia
-            if ty == 'support':
-                touch = l[k] <= patokan + WICK_EPS
-            else:
-                touch = h[k] >= patokan - WICK_EPS
-            if touch:
-                test1_i = k
-                break
-        if test1_i is None:
-            continue   # belum pernah tersentuh sampai akhir data -> tidak ada sinyal
+        engulf_ok = False
+        scan_from = last_right_i + 1
+        while True:
+            found_i = None
+            for k in range(scan_from, n - 1):   # -1: butuh k+1 (TEST2) tersedia
+                if ty == 'support':
+                    touch = l[k] <= patokan + WICK_EPS
+                else:
+                    touch = h[k] >= patokan - WICK_EPS
+                if touch:
+                    found_i = k
+                    break
+            if found_i is None:
+                test1_i = None
+                break   # belum pernah tersentuh lagi sampai akhir data -> tidak ada sinyal
 
-        t2 = test1_i + 1
-        if ty == 'support':
-            body_top_t2 = max(o[t2], c[t2])
-            engulf_ok = body_top_t2 > h[test1_i] + WICK_EPS
-        else:
-            body_bottom_t2 = min(o[t2], c[t2])
-            engulf_ok = body_bottom_t2 < l[test1_i] - WICK_EPS
-        if not engulf_ok:
-            continue   # TEST2 gagal engulfing -> level gugur
+            t2 = found_i + 1
+            if ty == 'support':
+                body_top_t2 = max(o[t2], c[t2])
+                engulf_ok = body_top_t2 > h[found_i] + WICK_EPS
+                broke = c[t2] < level - WICK_EPS   # close TEST2 break ke bawah level
+            else:
+                body_bottom_t2 = min(o[t2], c[t2])
+                engulf_ok = body_bottom_t2 < l[found_i] - WICK_EPS
+                broke = c[t2] > level + WICK_EPS   # close TEST2 break ke atas level
+
+            if engulf_ok:
+                test1_i = found_i
+                break   # TEST2 sukses engulfing -> lanjut ke ENTRY
+            if broke:
+                test1_i = None
+                break   # body TEST2 break level -> level gugur PERMANEN
+            # TEST2 gagal engulfing tapi TIDAK break -> level tetap hidup,
+            # cari TEST1 baru mulai dari candle setelah TEST2 yang gagal ini.
+            scan_from = t2 + 1
+
+        if test1_i is None:
+            continue
 
         kind = 'SNR_SUPPORT' if ty == 'support' else 'SNR_RESISTANCE'
         direction = 'Long' if ty == 'support' else 'Short'
@@ -998,14 +1024,17 @@ def _render_html() -> bytes:
     arah candle.
     <br>• <b>TEST2</b>: candle TEPAT SETELAH TEST1 -- harus ENGULFING (Support: ujung body
     TEST2 harus lebih TINGGI dari high candle TEST1. Resistance: ujung body TEST2 harus lebih
-    RENDAH dari low candle TEST1). Tidak ada syarat arah candle terpisah. Kalau gagal
-    engulfing, level gugur (hanya dicoba 1x).
+    RENDAH dari low candle TEST1). Tidak ada syarat arah candle terpisah. Kalau gagal engulfing
+    TAPI close-nya TIDAK break level, level TETAP HIDUP -- lanjut cari TEST1 baru (bisa
+    berkali-kali). Level gugur PERMANEN hanya kalau ada candle yang close-nya break level.
     <br>• <b>ENTRY</b>: LIMIT di UJUNG WICK candle TEST1 (Long → high candle TEST1, Short →
     low candle TEST1). Limit baru RESMI ARMED begitu harga M5 masuk radius
     <b>{APPROACH_PCT*100:.1f}%</b> dari entry_price, lalu ditunggu sampai TERSENTUH (fill).
     Kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}% sebelum tersentuh, limit disarm (balik
     menunggu, tetap hidup). GTC, tidak ada batas waktu.
-    Tiap level HANYA dipakai 1x (test1+test2 cuma dicoba sekali).
+    Level tetap hidup untuk test1/test2 berulang kali selama belum ada
+    body (close) candle yang break level; sekali FILLED, level mati (tidak
+    re-entry).
     SL fix
     <b>{SL_PCT*100:.2f}%</b> dari entry (=1R). <b>Trailing stop</b>: aktif begitu profit
     capai <b>{TRAIL_ACTIVATE_R:.1f}R</b>, lalu SL mengikuti <b>{TRAIL_STOP_R:.1f}R</b> di
