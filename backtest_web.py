@@ -41,9 +41,12 @@ RINGKASAN STRATEGI
    dari HIGH candle TEST1 (ujung atas wick TEST1).
    Resistance (Short): ujung body TEST2 (min(open,close)) harus LEBIH
    RENDAH dari LOW candle TEST1 (ujung bawah wick TEST1).
+   SYARAT TAMBAHAN: BODY candle TEST2 (|close-open|) harus lebih BESAR
+   (ukuran) daripada BODY candle TEST1 -- wick TIDAK dihitung sama sekali
+   di syarat ini, murni perbandingan ukuran body.
    TIDAK ADA syarat arah candle sama sekali (baik TEST1 maupun TEST2).
-   Kalau gagal engulfing -> level GUGUR (hanya dicoba SEKALI, tidak dicari
-   TEST1 berikutnya lagi).
+   Kalau gagal engulfing atau body TEST2 tidak lebih besar dari body TEST1
+   -> level GUGUR (hanya dicoba SEKALI, tidak dicari TEST1 berikutnya lagi).
 
 4) ENTRY -- LIMIT, di UJUNG WICK candle TEST1: Long -> high candle TEST1
    (ujung atas). Short -> low candle TEST1 (ujung bawah). Limit ini baru
@@ -437,6 +440,14 @@ def detect_snr_events(df):
             engulf_ok = body_bottom_t2 < l[test1_i] - WICK_EPS
         if not engulf_ok:
             continue   # TEST2 gagal engulfing -> level gugur
+
+        # Syarat tambahan: BODY candle TEST2 harus lebih BESAR (secara ukuran)
+        # daripada BODY candle TEST1 -- wick tidak dihitung sama sekali,
+        # murni |close-open| candle TEST2 vs |close-open| candle TEST1.
+        body_size_t1 = abs(c[test1_i] - o[test1_i])
+        body_size_t2 = abs(c[t2] - o[t2])
+        if not (body_size_t2 > body_size_t1 + WICK_EPS):
+            continue   # body TEST2 tidak lebih besar dari body TEST1 -> level gugur
 
         kind = 'SNR_SUPPORT' if ty == 'support' else 'SNR_RESISTANCE'
         direction = 'Long' if ty == 'support' else 'Short'
@@ -864,7 +875,7 @@ def _run():
     try:
         _log_msg(f"🚀 Mulai backtest SNR (Support & Resistance + EMA{EMA_FAST}/{EMA_SLOW} cross) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
         _log_msg(f"   Syarat: c2/c3/c4 (salah satu) wajib penyebab golden/death cross searah  "
-                  f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing)  "
+                  f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing, body TEST2>body TEST1)  "
                   f"SL=adaptif di wick TEST2 (engulfing), min {SL_MIN_PCT*100:.2f}% dari entry  "
                   f"Trailing: aktif di "
                   f"{TRAIL_ACTIVATE_R:.1f}R, jarak {TRAIL_STOP_R:.1f}R dari extreme")
@@ -1037,8 +1048,9 @@ def _render_html() -> bytes:
     arah candle.
     <br>• <b>TEST2</b>: candle TEPAT SETELAH TEST1 -- harus ENGULFING (Support: ujung body
     TEST2 harus lebih TINGGI dari high candle TEST1. Resistance: ujung body TEST2 harus lebih
-    RENDAH dari low candle TEST1). Tidak ada syarat arah candle terpisah. Kalau gagal
-    engulfing, level gugur (hanya dicoba 1x).
+    RENDAH dari low candle TEST1) DAN body candle TEST2 harus lebih BESAR (ukuran, wick tidak
+    dihitung) daripada body candle TEST1. Tidak ada syarat arah candle terpisah. Kalau gagal
+    salah satu syarat, level gugur (hanya dicoba 1x).
     <br>• <b>ENTRY</b>: LIMIT di UJUNG WICK candle TEST1 (Long → high candle TEST1, Short →
     low candle TEST1). Limit baru RESMI ARMED begitu harga M5 masuk radius
     <b>{APPROACH_PCT*100:.1f}%</b> dari entry_price, lalu ditunggu sampai TERSENTUH (fill).
