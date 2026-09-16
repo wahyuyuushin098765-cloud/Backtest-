@@ -290,7 +290,7 @@ def fetch_bybit_m5(symbol: str) -> pd.DataFrame:
 EMA_FAST = int(os.environ.get('EMA_FAST', 4))
 EMA_SLOW = int(os.environ.get('EMA_SLOW', 10))
 N_RIGHT = 1   # jumlah candle kanan yang harus bersih (tidak menyentuh wick) -- cukup c3 saja
-EXPIRE_CANDLES = 4   # level kadaluarsa kalau limit tak tersentuh dlm N candle H1 setelah TEST2
+EXPIRE_CANDLES = 10   # level kadaluarsa kalau limit tak tersentuh dlm N candle H1 setelah TEST2
 
 def find_levels(df):
     """Deteksi level Support & Resistance dari candle H1 (basis body candle).
