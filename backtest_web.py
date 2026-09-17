@@ -464,8 +464,13 @@ def detect_snr_events(df):
             sl_raw = float(h[t2])
             min_sl_dist = entry_price * SL_MIN_PCT
             sl_price = max(sl_raw, entry_price + min_sl_dist)   # makin jauh ke atas = makin lebar
-        expire_idx = t2 + EXPIRE_CANDLES
-        expire_ts = int(ts[expire_idx]) if expire_idx < n else None   # None = data habis, tidak bisa dicek expiry
+        # expire_ts dihitung dari WAKTU (ts candle TEST2 + EXPIRE_CANDLES jam
+        # H1 dalam ms), BUKAN dari index array data (ts[t2+N]). Kalau dari
+        # index, event yg TEST2-nya ada di beberapa candle terakhir dari
+        # rentang backtest bisa dapat expire_ts None -> tidak pernah dicek
+        # expire, bikin statistik expired_count meleset di ujung periode.
+        H1_MS = 3600 * 1000
+        expire_ts = int(ts[t2]) + EXPIRE_CANDLES * H1_MS
         events.append({
             'kind': kind, 'type': ty, 'level': level, 'patokan': patokan,
             'direction': direction,
