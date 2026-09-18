@@ -101,7 +101,7 @@ SL_MIN_PCT       = float(os.environ.get('SL_MIN_PCT', '0.003'))       # SL ADAPT
 APPROACH_PCT     = float(os.environ.get('APPROACH_PCT', '0.02'))       # limit baru AKTIF (armed) kalau harga sudah dlm radius 2% dari entry_price
 TRAIL_ACTIVATE_R = float(os.environ.get('TRAIL_ACTIVATE_R', '3.0'))    # trailing aktif begitu profit capai 3R
 TRAIL_STOP_R     = float(os.environ.get('TRAIL_STOP_R', '1.0'))       # setelah aktif, SL mengikuti 1R di belakang harga tertinggi/terendah
-ENABLE_TEST3     = os.environ.get('ENABLE_TEST3', 'false').lower() == 'true'   # NONAKTIF (default): entry TETAP di TEST1 sampai expire, tidak pernah pindah ke TEST3
+ENABLE_TEST3     = os.environ.get('ENABLE_TEST3', 'true').lower() == 'true'   # AKTIF (default): entry pindah ke wick TEST3 kalau TEST1 blm fill 1 candle H1 setelah TEST2
 
 LEVERAGE           = float(os.environ.get('LEVERAGE', '50'))
 MARGIN_USAGE_CAP    = float(os.environ.get('MARGIN_USAGE_CAP', '0.90'))
