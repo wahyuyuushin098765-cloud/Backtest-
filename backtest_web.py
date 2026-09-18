@@ -140,22 +140,20 @@ SYMBOLS = [
     
    
     
-    # Koin Kategori Ecosystem / Layer-1 & 2 Murah
-    'FTMUSDT', 'GRTUSDT', 'CHZUSDT', 'MINAUSDT', 'RONUSDT', 
-    'ONEUSDT', 'CELOUSDT', 'ROSEUSDT', 'ZILUSDT', 'ANKRUSDT',
     
-    # Koin Kategori DeFi / Web3 Alternatif
-    'JUPUSDT', 'RAYUSDT', 'WOOUSDT', '1INCHUSDT', 'BATUSDT', 
-    'ZRXUSDT', 'LRCUSDT', 'BALUSDT', 'KAVAUSDT', 'KNCUSDT',
+    # Koin Kategori L1/L2 & Web3 Baru / Alternatif Murah
+    'STGUSDT', 'GLMRUSDT', 'ASTRUSDT', 'IOTXUSDT', 'USTCUSDT',
+    'QTUMUSDT', 'FISUSDT', 'POLUSDT', 'CKBUSDT', 'IMXUSDT',
+    'OMUSDT', 'SKLUSDT', 'POWRUSDT', 'DENTUSDT', 'KSMUSDT',
+    'SPELLUSDT', 'CELRUSDT', 'XVGUSDT', 'GALAUSDT', 'RVNUSDT',
     
-    # Meme Coins & Komunitas Bernilai Kecil
-    'PEOPLEUSDT', '10000LADYSUSDT', 'MEMEUSDT', 'BOMEUSDT', 'MYROUSDT', 
-    'CATUSDT', 'TURBOUSDT', 'POPCATUSDT', 'MEWUSDT', 'BRETTUSDT',
+    # Meme Coins & Token Komunitas Terjangkau Lainnya
+    'DOGEUSDT', 'SHIBUSDT', 'FLOKIUSDT', 'BONKUSDT', 'PEPEUSDT',
+    'WENUSDT', 'PEOPLEUSDT', 'SLERFUSDT', 'CoqInuUSDT', 'BABYDOGEUSDT',
     
-    # Koin Infrastruktur & Pendatang Baru Bybit Perpetual
-    'AEVOUSDT', 'ALTUSDT', 'STRKUSDT', 'NTRNUSDT', 'API3USDT', 
-    'STORJUSDT', 'OCEANUSDT', 'HOTUSDT', 'GTCUSDT', 'RENUSDT'
-
+    # DeFi, Infrastruktur & AI Low-Nominal
+    'ZETAMARKETUSDT', 'NYANUSDT', 'PRIMEUSDT', 'SAFEUSDT', 'GFIUSDT',
+    'VELOUSDT', 'OXTUSDT', 'IOUSDT', 'SCAUSDT', 'SGRUSDT'
 
 ]
 
