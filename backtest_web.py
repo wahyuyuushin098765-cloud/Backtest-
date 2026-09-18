@@ -101,6 +101,7 @@ SL_MIN_PCT       = float(os.environ.get('SL_MIN_PCT', '0.003'))       # SL ADAPT
 APPROACH_PCT     = float(os.environ.get('APPROACH_PCT', '0.02'))       # limit baru AKTIF (armed) kalau harga sudah dlm radius 2% dari entry_price
 TRAIL_ACTIVATE_R = float(os.environ.get('TRAIL_ACTIVATE_R', '3.0'))    # trailing aktif begitu profit capai 3R
 TRAIL_STOP_R     = float(os.environ.get('TRAIL_STOP_R', '1.0'))       # setelah aktif, SL mengikuti 1R di belakang harga tertinggi/terendah
+ENABLE_TEST3     = os.environ.get('ENABLE_TEST3', 'false').lower() == 'true'   # NONAKTIF (default): entry TETAP di TEST1 sampai expire, tidak pernah pindah ke TEST3
 
 LEVERAGE           = float(os.environ.get('LEVERAGE', '50'))
 MARGIN_USAGE_CAP    = float(os.environ.get('MARGIN_USAGE_CAP', '0.90'))
@@ -136,23 +137,15 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Hasil backtest 1 tahun (S&R + EMA cross c2-c4 + TEST1/TEST2 engulfing) --
 # hanya koin dengan WIN RATE >= 50% yang dipakai (bukan filter ROI kali ini).
 SYMBOLS = [
-    
-    
-   
-    
-    
-    
-    '1000BONKUSDT', 'PYTHUSDT', 'LABUSDT', 'USUALUSDT', 'ETHFIUSDT', 
-    'BLURUSDT', 'PLUMEUSDT', 'AEVOUSDT', 'HBARUSDT', 'PENDLEUSDT', 
-    'WUSDT', 'BERAUSDT', 'CRVUSDT', 'ICPUSDT', 'IMXUSDT', 
-    '1000FLOKIUSDT', 'ACHUSDT', 'ADAUSDT', 'OPUSDT', 'IOTAUSDT', 
-    'MASKUSDT', 'FARTCOINUSDT', 'JUPUSDT', 'ENAUSDT', 'WIFUSDT', 
-    'ESPORTSUSDT', 'HUSDT', 'DYDXUSDT', 'VIRTUALUSDT', 'BATUSDT', 
-    'LRCUSDT', 'BOMEUSDT', 'POPCATUSDT', 'WOOUSDT', 'STORJUSDT', 
-    'ROSEUSDT', 'STRKUSDT', 'MEWUSDT', 'IOUSDT', 'POWRUSDT', 
-    'IOTXUSDT', 'POLUSDT', 'CKBUSDT', 'ASTRUSDT'
-
-
+    'PENDLEUSDT', 'PYTHUSDT', 'BLURUSDT', '1000BONKUSDT', 'WUSDT',
+    'USUALUSDT', 'ETHFIUSDT', 'LABUSDT', 'IOTAUSDT', '1000FLOKIUSDT',
+    'HBARUSDT', 'PLUMEUSDT', 'BERAUSDT', 'MASKUSDT', 'ESPORTSUSDT',
+    'IMXUSDT', 'CRVUSDT', 'ACHUSDT', 'FARTCOINUSDT', 'AEVOUSDT',
+    'ICPUSDT', 'ENAUSDT', 'ADAUSDT', 'WIFUSDT', 'DYDXUSDT',
+    'BATUSDT', 'LRCUSDT', 'IOUSDT', 'BOMEUSDT', 'OPUSDT',
+    'POPCATUSDT', 'WOOUSDT', 'STORJUSDT', 'ROSEUSDT', 'POWRUSDT',
+    'JUPUSDT', 'HUSDT', 'STRKUSDT', 'IOTXUSDT', 'MEWUSDT',
+    'VIRTUALUSDT', 'POLUSDT', 'CKBUSDT', 'ASTRUSDT'
 ]
 
 
@@ -729,7 +722,7 @@ def run_combined_backtest(coins: dict, m5_data: dict) -> dict:
                 ev = cp['events'][idx]
                 st = level_state[(symbol, idx)]
 
-                if (not st['used_t3'] and ev.get('entry_price_t3') is not None
+                if (ENABLE_TEST3 and not st['used_t3'] and ev.get('entry_price_t3') is not None
                         and now_ts >= ev['test3_ts']):
                     st['used_t3'] = True
                     t3_price = ev['entry_price_t3']
@@ -946,7 +939,8 @@ def _run():
     try:
         _log_msg(f"🚀 Mulai backtest SNR (Support & Resistance + EMA{EMA_FAST}/{EMA_SLOW} cross) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
         _log_msg(f"   Syarat: c2/c3/c4 (salah satu) wajib penyebab golden/death cross searah  "
-                  f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing, body TEST2>body TEST1; pindah ke wick TEST3 kalau blm fill 1 candle H1 stlh TEST2)  "
+                  f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing, body TEST2>body TEST1)  "
+                  f"TEST3 {'AKTIF -- pindah ke wick TEST3 kalau blm fill 1 candle H1 stlh TEST2' if ENABLE_TEST3 else 'NONAKTIF (entry tetap TEST1 sampai expire)'}  "
                   f"SL=adaptif di wick TEST2 (engulfing), min {SL_MIN_PCT*100:.2f}% dari entry  "
                   f"Trailing: aktif di "
                   f"{TRAIL_ACTIVATE_R:.1f}R, jarak {TRAIL_STOP_R:.1f}R dari extreme")
@@ -1127,12 +1121,12 @@ def _render_html() -> bytes:
     <b>{APPROACH_PCT*100:.1f}%</b> dari entry_price, lalu ditunggu sampai TERSENTUH (fill).
     Kalau menjauh lagi &gt;{APPROACH_PCT*100:.1f}% sebelum tersentuh, limit disarm (balik
     menunggu, tetap hidup).
-    <br>• <b>TEST3 (entry cadangan)</b>: kalau limit TEST1 BELUM tersentuh sampai 1 candle
+    <br>• <b>TEST3 (entry cadangan)</b> [{'AKTIF' if ENABLE_TEST3 else 'NONAKTIF'}]: kalau limit TEST1 BELUM tersentuh sampai 1 candle
     H1 setelah TEST2 closed, entry DIPINDAH ke ujung wick candle TEST3 (Long → low candle
     TEST3, Short → high candle TEST3 -- kebalikan arah TEST1). Status di-reset (perlu
     re-armed dari radius {APPROACH_PCT*100:.1f}% lagi), dan KADALUARSA dihitung ulang dari
     waktu TEST3. Kalau entry TEST3 berada di sisi salah dari SL, TEST3 dianggap tidak valid
-    dan tetap pakai TEST1.
+    dan tetap pakai TEST1.{'' if ENABLE_TEST3 else ' (Fitur ini sedang DIMATIKAN di run ini -- entry tetap di TEST1 sampai expire.)'}
     <br>• <b>KADALUARSA</b>: kalau dalam <b>{EXPIRE_CANDLES}</b> candle H1 setelah TEST2 (atau
     setelah TEST3, kalau entry sudah dipindah), limit
     tidak PERNAH tersentuh (baik masih menunggu maupun sudah armed) → setup GUGUR, dibuang
