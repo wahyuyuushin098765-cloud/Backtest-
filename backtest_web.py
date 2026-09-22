@@ -41,12 +41,16 @@ RINGKASAN STRATEGI
    dari HIGH candle TEST1 (ujung atas wick TEST1).
    Resistance (Short): ujung body TEST2 (min(open,close)) harus LEBIH
    RENDAH dari LOW candle TEST1 (ujung bawah wick TEST1).
-   SYARAT TAMBAHAN: BODY candle TEST2 (|close-open|) harus lebih BESAR
+   SYARAT TAMBAHAN #1: BODY candle TEST2 (|close-open|) harus lebih BESAR
    (ukuran) daripada BODY candle TEST1 -- wick TIDAK dihitung sama sekali
    di syarat ini, murni perbandingan ukuran body.
+   SYARAT TAMBAHAN #2: BODY candle TEST2 harus lebih BESAR daripada TOTAL
+   WICK candle TEST2 itu sendiri (wick atas + wick bawah) -- memastikan
+   candle TEST2 benar-benar candle "solid" (body dominan), bukan candle
+   dengan body kecil tapi wick panjang di kedua sisi.
    TIDAK ADA syarat arah candle sama sekali (baik TEST1 maupun TEST2).
-   Kalau gagal engulfing atau body TEST2 tidak lebih besar dari body TEST1
-   -> level GUGUR (hanya dicoba SEKALI, tidak dicari TEST1 berikutnya lagi).
+   Kalau gagal salah satu syarat di atas -> level GUGUR (hanya dicoba
+   SEKALI, tidak dicari TEST1 berikutnya lagi).
 
 4) ENTRY -- LIMIT, di UJUNG WICK candle TEST1: Long -> high candle TEST1
    (ujung atas). Short -> low candle TEST1 (ujung bawah). Limit ini baru
@@ -137,12 +141,15 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Hasil backtest 1 tahun (S&R + EMA cross c2-c4 + TEST1/TEST2 engulfing) --
 # hanya koin dengan WIN RATE >= 50% yang dipakai (bukan filter ROI kali ini).
 SYMBOLS = [
-    '1000BONKUSDT', 'BATUSDT', 'PYTHUSDT', 'ETHFIUSDT', 'LABUSDT', 
-    'USUALUSDT', 'PLUMEUSDT', 'AEVOUSDT', 'HBARUSDT', 'BLURUSDT', 
-    'CRVUSDT', 'ICPUSDT', 'BOMEUSDT', 'IMXUSDT', 'BERAUSDT', 
-    'POPCATUSDT', 'STORJUSDT', 'FARTCOINUSDT', 'ENAUSDT', 'WIFUSDT', 
-    'MEWUSDT'
-
+    'PENDLEUSDT', 'PYTHUSDT', 'BLURUSDT', '1000BONKUSDT', 'WUSDT',
+    'USUALUSDT', 'ETHFIUSDT', 'LABUSDT', 'IOTAUSDT', '1000FLOKIUSDT',
+    'HBARUSDT', 'PLUMEUSDT', 'BERAUSDT', 'MASKUSDT', 'ESPORTSUSDT',
+    'IMXUSDT', 'CRVUSDT', 'ACHUSDT', 'FARTCOINUSDT', 'AEVOUSDT',
+    'ICPUSDT', 'ENAUSDT', 'ADAUSDT', 'WIFUSDT', 'DYDXUSDT',
+    'BATUSDT', 'LRCUSDT', 'IOUSDT', 'BOMEUSDT', 'OPUSDT',
+    'POPCATUSDT', 'WOOUSDT', 'STORJUSDT', 'ROSEUSDT', 'POWRUSDT',
+    'JUPUSDT', 'HUSDT', 'STRKUSDT', 'IOTXUSDT', 'MEWUSDT',
+    'VIRTUALUSDT', 'POLUSDT', 'CKBUSDT', 'ASTRUSDT'
 ]
 
 
@@ -454,6 +461,16 @@ def detect_snr_events(df):
         body_size_t2 = abs(c[t2] - o[t2])
         if not (body_size_t2 > body_size_t1 + WICK_EPS):
             continue   # body TEST2 tidak lebih besar dari body TEST1 -> level gugur
+
+        # Syarat tambahan lagi: BODY candle TEST2 harus lebih BESAR daripada
+        # TOTAL WICK candle TEST2 itu sendiri (wick atas + wick bawah) --
+        # memastikan candle TEST2 benar-benar candle "solid" (body dominan),
+        # bukan candle dengan body kecil tapi wick panjang di kedua sisi.
+        body_top = max(o[t2], c[t2])
+        body_bottom = min(o[t2], c[t2])
+        wick_total_t2 = (h[t2] - body_top) + (body_bottom - l[t2])
+        if not (body_size_t2 > wick_total_t2 + WICK_EPS):
+            continue   # body TEST2 tidak lebih besar dari total wick-nya sendiri -> level gugur
 
         kind = 'SNR_SUPPORT' if ty == 'support' else 'SNR_RESISTANCE'
         direction = 'Long' if ty == 'support' else 'Short'
@@ -936,7 +953,7 @@ def _run():
     try:
         _log_msg(f"🚀 Mulai backtest SNR (Support & Resistance + EMA{EMA_FAST}/{EMA_SLOW} cross) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
         _log_msg(f"   Syarat: c2/c3/c4 (salah satu) wajib penyebab golden/death cross searah  "
-                  f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing, body TEST2>body TEST1)  "
+                  f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing, body TEST2>body TEST1, body TEST2>wick TEST2)  "
                   f"TEST3 {'AKTIF -- pindah ke wick TEST3 kalau blm fill 1 candle H1 stlh TEST2' if ENABLE_TEST3 else 'NONAKTIF (entry tetap TEST1 sampai expire)'}  "
                   f"SL=adaptif di wick TEST2 (engulfing), min {SL_MIN_PCT*100:.2f}% dari entry  "
                   f"Trailing: aktif di "
@@ -1111,8 +1128,9 @@ def _render_html() -> bytes:
     <br>• <b>TEST2</b>: candle TEPAT SETELAH TEST1 -- harus ENGULFING (Support: ujung body
     TEST2 harus lebih TINGGI dari high candle TEST1. Resistance: ujung body TEST2 harus lebih
     RENDAH dari low candle TEST1) DAN body candle TEST2 harus lebih BESAR (ukuran, wick tidak
-    dihitung) daripada body candle TEST1. Tidak ada syarat arah candle terpisah. Kalau gagal
-    salah satu syarat, level gugur (hanya dicoba 1x).
+    dihitung) daripada body candle TEST1 DAN body candle TEST2 harus lebih BESAR daripada
+    TOTAL WICK candle TEST2 itu sendiri (candle TEST2 harus "solid", body dominan). Tidak ada
+    syarat arah candle terpisah. Kalau gagal salah satu syarat, level gugur (hanya dicoba 1x).
     <br>• <b>ENTRY</b>: LIMIT di UJUNG WICK candle TEST1 (Long → high candle TEST1, Short →
     low candle TEST1). Limit baru RESMI ARMED begitu harga M5 masuk radius
     <b>{APPROACH_PCT*100:.1f}%</b> dari entry_price, lalu ditunggu sampai TERSENTUH (fill).
