@@ -35,6 +35,11 @@ RINGKASAN STRATEGI
    patokan (support: low <= patokan; resistance: high >= patokan). Tersentuh
    persis di harga patokan juga VALID (tidak wajib menembus). TIDAK ADA
    syarat arah candle -- candle apapun (bullish/bearish) sah jadi TEST1.
+   SYARAT TAMBAHAN: wick TERPANJANG candle TEST1 (wick atas atau wick bawah,
+   mana yg lebih besar) harus lebih PANJANG daripada body candle TEST1
+   (|close-open|) -- kalau candle yg menyentuh patokan body-nya justru
+   dominan, candle itu BUKAN TEST1 yg valid, dicari candle berikutnya yg
+   menyentuh patokan.
 
 3) TEST2 -- candle TEPAT SETELAH TEST1, harus ENGULFING:
    Support (Long): ujung body TEST2 (max(open,close)) harus LEBIH TINGGI
@@ -141,7 +146,15 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 # Hasil backtest 1 tahun (S&R + EMA cross c2-c4 + TEST1/TEST2 engulfing) --
 # hanya koin dengan WIN RATE >= 50% yang dipakai (bukan filter ROI kali ini).
 SYMBOLS = [
-    '1000BONKUSDT', 'PYTHUSDT', 'PENDLEUSDT', 'LABUSDT', 'POWRUSDT', 'USUALUSDT', 'POPCATUSDT', 'HUSDT', 'IOUSDT', 'STORJUSDT', 'LRCUSDT', 'CRVUSDT', '1000FLOKIUSDT', 'PLUMEUSDT', 'ETHFIUSDT', 'ACHUSDT', 'ICPUSDT', 'BERAUSDT', 'AEVOUSDT', 'ADAUSDT', 'HBARUSDT', 'ROSEUSDT', 'BLURUSDT', 'FARTCOINUSDT', 'ESPORTSUSDT', 'DYDXUSDT', 'WIFUSDT', 'BOMEUSDT', 'IOTAUSDT', 'IMXUSDT', 'JUPUSDT', 'STRKUSDT', 'WUSDT', 'IOTXUSDT', 'ENAUSDT', 'VIRTUALUSDT', 'MEWUSDT', 'ASTRUSDT'
+    'PENDLEUSDT', 'PYTHUSDT', 'BLURUSDT', '1000BONKUSDT', 'WUSDT',
+    'USUALUSDT', 'ETHFIUSDT', 'LABUSDT', 'IOTAUSDT', '1000FLOKIUSDT',
+    'HBARUSDT', 'PLUMEUSDT', 'BERAUSDT', 'MASKUSDT', 'ESPORTSUSDT',
+    'IMXUSDT', 'CRVUSDT', 'ACHUSDT', 'FARTCOINUSDT', 'AEVOUSDT',
+    'ICPUSDT', 'ENAUSDT', 'ADAUSDT', 'WIFUSDT', 'DYDXUSDT',
+    'BATUSDT', 'LRCUSDT', 'IOUSDT', 'BOMEUSDT', 'OPUSDT',
+    'POPCATUSDT', 'WOOUSDT', 'STORJUSDT', 'ROSEUSDT', 'POWRUSDT',
+    'JUPUSDT', 'HUSDT', 'STRKUSDT', 'IOTXUSDT', 'MEWUSDT',
+    'VIRTUALUSDT', 'POLUSDT', 'CKBUSDT', 'ASTRUSDT'
 ]
 
 
@@ -424,15 +437,29 @@ def detect_snr_events(df):
         # persis di harga patokan juga VALID, tidak wajib menembus). Tidak ada
         # syarat arah candle lagi -- candle apapun (bullish/bearish) sah jadi
         # TEST1, langsung lanjut ke TEST2.
+        # SYARAT TAMBAHAN: wick TERPANJANG candle TEST1 (mana yg lebih besar
+        # antara wick atas dan wick bawah) harus lebih PANJANG daripada body
+        # candle TEST1 (|close-open|) -- kalau candle yg menyentuh patokan
+        # body-nya justru dominan (wick pendek di kedua sisi), candle itu
+        # BUKAN TEST1 yg valid, lanjut cari candle berikutnya yg menyentuh.
         test1_i = None
         for k in range(last_right_i + 1, n - 1):   # -1: butuh k+1 (TEST2) tersedia
             if ty == 'support':
                 touch = l[k] <= patokan + WICK_EPS
             else:
                 touch = h[k] >= patokan - WICK_EPS
-            if touch:
-                test1_i = k
-                break
+            if not touch:
+                continue
+            body_top_k = max(o[k], c[k])
+            body_bottom_k = min(o[k], c[k])
+            body_size_k = abs(c[k] - o[k])
+            wick_upper_k = h[k] - body_top_k
+            wick_lower_k = body_bottom_k - l[k]
+            wick_longest_k = max(wick_upper_k, wick_lower_k)
+            if not (wick_longest_k > body_size_k + WICK_EPS):
+                continue   # wick terpanjang tdk lebih besar dari body -> bukan TEST1 valid, cari candle berikutnya
+            test1_i = k
+            break
         if test1_i is None:
             continue   # belum pernah tersentuh sampai akhir data -> tidak ada sinyal
 
@@ -945,7 +972,7 @@ def _run():
     try:
         _log_msg(f"🚀 Mulai backtest SNR (Support & Resistance + EMA{EMA_FAST}/{EMA_SLOW} cross) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
         _log_msg(f"   Syarat: c2/c3/c4 (salah satu) wajib penyebab golden/death cross searah  "
-                  f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing, body TEST2>body TEST1, body TEST2>wick TEST2)  "
+                  f"Entry=LIMIT di ujung wick TEST1 (armed dlm radius {APPROACH_PCT*100:.1f}%, setelah TEST1+TEST2 engulfing, wick TEST1>body TEST1, body TEST2>body TEST1, body TEST2>wick TEST2)  "
                   f"TEST3 {'AKTIF -- pindah ke wick TEST3 kalau blm fill 1 candle H1 stlh TEST2' if ENABLE_TEST3 else 'NONAKTIF (entry tetap TEST1 sampai expire)'}  "
                   f"SL=adaptif di wick TEST2 (engulfing), min {SL_MIN_PCT*100:.2f}% dari entry  "
                   f"Trailing: aktif di "
@@ -1116,7 +1143,9 @@ def _render_html() -> bytes:
     Resistance → DEATH CROSS. Kalau tidak ada satupun di c2-c4, level gugur dari awal.
     <br>• <b>TEST1</b>: candle PERTAMA yang wick/body-nya menyentuh ATAU melebihi patokan
     (tersentuh persis di harga patokan juga valid, tidak wajib menembus). Tidak ada syarat
-    arah candle.
+    arah candle. Syarat tambahan: wick TERPANJANG candle TEST1 (atas atau bawah) harus lebih
+    besar daripada body candle TEST1 -- kalau tidak, candle itu dilewati, dicari candle
+    berikutnya yang menyentuh patokan.
     <br>• <b>TEST2</b>: candle TEPAT SETELAH TEST1 -- harus ENGULFING (Support: ujung body
     TEST2 harus lebih TINGGI dari high candle TEST1. Resistance: ujung body TEST2 harus lebih
     RENDAH dari low candle TEST1) DAN body candle TEST2 harus lebih BESAR (ukuran, wick tidak
