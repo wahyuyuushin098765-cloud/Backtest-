@@ -189,6 +189,8 @@ _results    = []
 _kind_results = []
 _per_coin_results = []   # list dict: {symbol, n_trades, n_win, wr, total_r, final_balance, roi}
 _all_trades = []
+_monthly_results = []   # list dict: {month, start_balance, end_balance, profit_usd, growth_pct, n_trades, wr}
+_avg_monthly_growth = 0.0   # rata-rata growth_pct antar bulan yg ada trade
 _combined_result = {
     'n_trades': 0, 'n_win': 0, 'n_loss': 0, 'wr': 0, 'total_pnl': 0, 'roi': 0,
     'total_r': 0, 'avg_r': 0, 'final_balance': INITIAL_BALANCE,
@@ -923,25 +925,46 @@ def per_symbol_breakdown(trades):
     return rows
 
 
-def per_kind_breakdown(trades):
-    """Breakdown performa per JENIS level: SNR_SUPPORT / SNR_RESISTANCE."""
-    by_kind = {}
-    for t in trades:
-        k = t.get('kind', '?')
-        d = by_kind.setdefault(k, {'n': 0, 'win': 0, 'total_r': 0.0, 'total_pnl': 0.0})
-        d['n'] += 1
-        if t['pnl_usd'] > 0:
-            d['win'] += 1
-        d['total_r'] += t['r_mult']
-        d['total_pnl'] += t['pnl_usd']
+def monthly_breakdown(trades, initial_balance):
+    """Breakdown balance & pertumbuhan PER BULAN (basis waktu WIB, sesuai
+    exit_ts tiap trade -- trade dihitung masuk bulan closed-nya, bukan
+    bulan open-nya). Tiap baris: balance awal bulan (= balance akhir bulan
+    sebelumnya, atau initial_balance utk bulan pertama), balance akhir
+    bulan, profit $ bulan itu, pertumbuhan % bulan itu (relatif thd balance
+    AWAL bulan itu -- ini yg dibandingkan dgn "profit 10%/bulan" ala
+    investasi), jumlah trade & WR bulan itu. Bulan tanpa trade SAMA SEKALI
+    tidak dimasukkan (balance tidak berubah, tidak relevan ditampilkan).
+    Di akhir, hitung rata-rata pertumbuhan %/bulan (mean sederhana antar
+    bulan yang ADA trade -- bukan CAGR, supaya konsisten dgn cara umum
+    orang menyebut "rata-rata X%/bulan" meski fluktuatif)."""
+    if not trades:
+        return [], 0.0
+    trades_sorted = sorted(trades, key=lambda t: t['exit_ts'])
+    by_month = {}   # 'YYYY-MM' -> list of trades
+    for t in trades_sorted:
+        dt = datetime.fromtimestamp(int(t['exit_ts']) / 1000, tz=timezone.utc) + timedelta(hours=7)
+        key = dt.strftime('%Y-%m')
+        by_month.setdefault(key, []).append(t)
+
     rows = []
-    for k, d in by_kind.items():
-        wr = d['win'] / d['n'] * 100 if d['n'] else 0
-        rows.append({'kind': k, 'n': d['n'], 'win': d['win'], 'wr': wr,
-                     'total_r': d['total_r'], 'total_pnl': d['total_pnl']})
-    order = {'SNR_SUPPORT': 0, 'SNR_RESISTANCE': 1}
-    rows.sort(key=lambda r: order.get(r['kind'], 99))
-    return rows
+    running_balance = initial_balance
+    for month_key in sorted(by_month.keys()):
+        month_trades = by_month[month_key]
+        start_balance = running_balance
+        end_balance = month_trades[-1]['balance_after']
+        profit_usd = end_balance - start_balance
+        growth_pct = (profit_usd / start_balance * 100) if start_balance > 0 else 0.0
+        n = len(month_trades)
+        win = sum(1 for t in month_trades if t['pnl_usd'] > 0)
+        wr = win / n * 100 if n else 0
+        rows.append({
+            'month': month_key, 'start_balance': start_balance, 'end_balance': end_balance,
+            'profit_usd': profit_usd, 'growth_pct': growth_pct, 'n_trades': n, 'wr': wr,
+        })
+        running_balance = end_balance
+
+    avg_growth_pct = sum(r['growth_pct'] for r in rows) / len(rows) if rows else 0.0
+    return rows, avg_growth_pct
 
 
 # ============================================================
@@ -950,6 +973,7 @@ def per_kind_breakdown(trades):
 
 def _run():
     global _phase, _results, _kind_results, _per_coin_results, _all_trades, _combined_result
+    global _monthly_results, _avg_monthly_growth
     try:
         _log_msg(f"🚀 Mulai backtest SNR (Support & Resistance + EMA{EMA_FAST}/{EMA_SLOW} cross) — {len(SYMBOLS)} koin, {BACKTEST_START_DATE} s/d {BACKTEST_END_DATE}")
         _log_msg(f"   Syarat: c2/c3/c4 (salah satu) wajib penyebab golden/death cross searah  "
@@ -1008,6 +1032,9 @@ def _run():
             _results[:] = per_symbol_breakdown(result['trades'])
             _kind_results[:] = per_kind_breakdown(result['trades'])
             _per_coin_results[:] = per_coin_rows
+            monthly_rows, avg_growth = monthly_breakdown(result['trades'], INITIAL_BALANCE)
+            _monthly_results[:] = monthly_rows
+            _avg_monthly_growth = avg_growth
             _phase = 'done'
 
         _log_msg(f"✅ SELESAI. {result['n_trades']} trade, WR {result['wr']:.1f}%, "
@@ -1036,6 +1063,8 @@ def _render_html() -> bytes:
         results_cp = list(_results)
         kind_cp = list(_kind_results)
         per_coin_cp = list(_per_coin_results)
+        monthly_cp = list(_monthly_results)
+        avg_monthly_growth_cp = _avg_monthly_growth
         log_cp = list(_log[-300:])
 
     log_html = '\n'.join(l for l in log_cp)
@@ -1071,6 +1100,16 @@ def _render_html() -> bytes:
             <td>{r['wr']:.1f}%</td><td class="{cls}">{r['total_r']:+.2f}</td>
             <td>${r['final_balance']:.2f}</td>
             <td class="{cls}">{r['roi']:+.1f}%</td></tr>'''
+
+    monthly_rows_html = ''
+    for r in monthly_cp:
+        cls = 'pos' if r['profit_usd'] >= 0 else 'neg'
+        monthly_rows_html += f'''<tr>
+            <td>{r['month']}</td><td>{r['n_trades']}</td><td>{r['wr']:.1f}%</td>
+            <td>${r['start_balance']:.2f}</td><td>${r['end_balance']:.2f}</td>
+            <td class="{cls}">${r['profit_usd']:+.2f}</td>
+            <td class="{cls}">{r['growth_pct']:+.1f}%</td></tr>'''
+    avg_growth_cls = 'pos' if avg_monthly_growth_cp >= 0 else 'neg'
 
     return f'''<!DOCTYPE html>
 <html lang="id">
@@ -1159,6 +1198,17 @@ def _render_html() -> bytes:
     <br>Unduh semua trade: <a href="/trades.csv">/trades.csv</a> &nbsp;|&nbsp;
     Log mentah: <a href="/logs">/logs</a>
   </div>
+
+  <h2>Pertumbuhan Balance per Bulan (simulasi gabungan, 1 balance bersama)</h2>
+  <div class="note">
+    Rata-rata pertumbuhan: <b class="{avg_growth_cls}">{avg_monthly_growth_cp:+.1f}% / bulan</b>
+    (mean sederhana antar bulan yang ada trade, bukan CAGR -- fluktuatif per bulan, lihat tabel di bawah).
+  </div>
+  <table>
+    <tr><th>Bulan</th><th>N Trade</th><th>WR%</th><th>Balance Awal</th><th>Balance Akhir</th>
+        <th>Profit</th><th>Pertumbuhan%</th></tr>
+    {monthly_rows_html}
+  </table>
 
   <h2>Ringkasan per Jenis Level (simulasi gabungan)</h2>
   <table>
