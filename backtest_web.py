@@ -925,6 +925,27 @@ def per_symbol_breakdown(trades):
     return rows
 
 
+def per_kind_breakdown(trades):
+    """Breakdown performa per JENIS level: SNR_SUPPORT / SNR_RESISTANCE."""
+    by_kind = {}
+    for t in trades:
+        k = t.get('kind', '?')
+        d = by_kind.setdefault(k, {'n': 0, 'win': 0, 'total_r': 0.0, 'total_pnl': 0.0})
+        d['n'] += 1
+        if t['pnl_usd'] > 0:
+            d['win'] += 1
+        d['total_r'] += t['r_mult']
+        d['total_pnl'] += t['pnl_usd']
+    rows = []
+    for k, d in by_kind.items():
+        wr = d['win'] / d['n'] * 100 if d['n'] else 0
+        rows.append({'kind': k, 'n': d['n'], 'win': d['win'], 'wr': wr,
+                     'total_r': d['total_r'], 'total_pnl': d['total_pnl']})
+    order = {'SNR_SUPPORT': 0, 'SNR_RESISTANCE': 1}
+    rows.sort(key=lambda r: order.get(r['kind'], 99))
+    return rows
+
+
 def monthly_breakdown(trades, initial_balance):
     """Breakdown balance & pertumbuhan PER BULAN (basis waktu WIB, sesuai
     exit_ts tiap trade -- trade dihitung masuk bulan closed-nya, bukan
